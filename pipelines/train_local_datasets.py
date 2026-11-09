@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Train one shared FreeArtGS model per object using all calibrated cameras."""
+"""Train one shared FreeArtGS model per object using selected calibrated cameras (default: all)."""
 import argparse
 import errno
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -98,10 +99,21 @@ def run_stage(config_path, log, stage):
                    cwd=REPO_ROOT, stdout=log, stderr=subprocess.STDOUT, check=True)
 
 
+def camera_argument(value):
+    match = re.fullmatch(r"(?:cam_?)?(\d+)", value)
+    if not match:
+        raise argparse.ArgumentTypeError("Use a camera ID such as cam_001, cam001 or 001")
+    return f"cam_{int(match[1]):03d}"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--datasets", type=Path, default=DEFAULT_DATASETS_ROOT, help="Read-only raw source datasets.")
-    parser.add_argument("--all-cameras", action="store_true", help="All cameras are used together by default.")
+    camera_selection = parser.add_mutually_exclusive_group()
+    camera_selection.add_argument("--all-cameras", action="store_true", help="All cameras are used together by default.")
+    camera_selection.add_argument("--cameras", nargs="+", type=camera_argument,
+                                  help="Use only these cameras, e.g. cam_001 cam_002 (also cam001 or 001). "
+                                       "Select at least two; default: all cameras.")
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--object", help="Optional raw object folder name to train.")
     selection.add_argument("--objects", nargs="+", help="Train exactly these raw object folder names, in order.")
@@ -116,11 +128,17 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Validate calibration and data without writing or training.")
     parser.add_argument("--evaluate-joint-axis", action="store_true", help="Compare the trained joint axis to GT and report error in degrees.")
     parser.add_argument("--visualize-results", action="store_true",
-                        help="Make all-camera videos with estimated axes; also evaluate joint GT when available.")
+                        help="Make videos for the selected cameras with estimated axes; also evaluate joint GT when available.")
     parser.add_argument("--reuse-tracking", action="store_true", help="Reuse matching prepared camera sequences; recompute ICP if poses have missing timestamp slots.")
     parser.add_argument("--skip-completed", action="store_true",
                         help="Skip successful jobs with final checkpoint, exports and any requested GT reports/videos present.")
     args = parser.parse_args()
+    if args.cameras is not None:
+        if len(args.cameras) != len(set(args.cameras)):
+            parser.error("Camera selection contains duplicate IDs")
+        if len(args.cameras) < 2:
+            parser.error("Multi-view training requires at least two selected cameras")
+        args.cameras = sorted(args.cameras)
     args.frame_intervals = normalize_frame_intervals(args.frame_intervals)
     if args.iterations < 1 or args.frame_stride < 1 or (args.max_frames is not None and args.max_frames < 2):
         parser.error("Iterations/stride must be positive and max-frames must be at least two")
@@ -152,15 +170,24 @@ def main():
         raise ValueError("The output target must be outside the raw source object folders")
     print(f"All generated data and runtime caches: {outputs_root}", flush=True)
     existing_results = []
-    if (selected_names or args.skip_completed or args.frame_intervals) and (log_root / "summary.json").is_file():
+    if (selected_names or args.skip_completed or args.frame_intervals or args.cameras) and (log_root / "summary.json").is_file():
         existing_results = json.loads((log_root / "summary.json").read_text())
     records = {row["job"]: row for row in existing_results}
     jobs = []
     skipped = 0
     for scene in scenes:
+        cameras = sorted(p.name for p in (scene / "rgb").iterdir() if p.is_dir())
+        if args.cameras:
+            missing = sorted(set(args.cameras) - set(cameras))
+            if missing:
+                raise ValueError(f"Selected cameras not found in {scene}: {', '.join(missing)}; "
+                                 f"available: {', '.join(cameras)}")
+            cameras = args.cameras
         evaluate_axis = args.evaluate_joint_axis or (
             args.visualize_results and (scene / "pointcloud/joint_metadata.json").is_file())
         name = f"{scene.name}_multiview"
+        if args.cameras:
+            name += "_cams" + "-".join(camera.removeprefix("cam_") for camera in cameras)
         if args.frame_intervals:
             name += "_i" + "_".join(f"{start}-{end}" for start, end in args.frame_intervals)
         if args.max_frames is not None or args.frame_stride != 1:
@@ -172,10 +199,9 @@ def main():
             continue
         if evaluate_axis:
             load_gt_axis(scene)
-        cameras = sorted(p.name for p in (scene / "rgb").iterdir() if p.is_dir())
         if len(cameras) < 2:
             raise ValueError(f"Multi-view training requires at least two cameras: {scene}")
-        poses = calibration_poses(scene)
+        poses = calibration_poses(scene, cameras)
         if any(camera not in poses for camera in cameras):
             raise ValueError(f"Missing COLMAP extrinsics in {scene}")
         options = []
@@ -215,6 +241,7 @@ def main():
                 opt.overwrite = True
             options.append((camera, camera_name, opt))
         print(f"  {name}: {len(cameras)} cameras will train one shared model", flush=True)
+        print(f"    Selected cameras: {', '.join(cameras)}", flush=True)
         jobs.append((scene, name, options))
     print(f"Batch selection: {len(jobs)} jobs to run, {skipped} completed jobs skipped", flush=True)
     if args.dry_run:
@@ -232,7 +259,7 @@ def main():
     log_root.mkdir(parents=True, exist_ok=True)
     results = []
     previous_results = []
-    if selected_names or args.skip_completed or args.frame_intervals:
+    if selected_names or args.skip_completed or args.frame_intervals or args.cameras:
         selected_jobs = {name for _, name, _ in jobs}
         previous_results = [row for row in existing_results
                             if row["job"] not in selected_jobs]
@@ -288,7 +315,8 @@ def main():
                 config_path.write_text(yaml.safe_dump(config, sort_keys=False))
                 run_stage(config_path, log, "--reconstruction_only")
             result = dict(job=name, status="passed", training_completed=True,
-                          reconstruction_quality_validated=False, cameras=len(options), log=str(log_path))
+                          reconstruction_quality_validated=False, cameras=len(options),
+                          camera_names=[camera for camera, _, _ in options], log=str(log_path))
             final_output = outputs_root / name / "splatfacto-art"
             evaluate_axis = args.evaluate_joint_axis or (
                 args.visualize_results and (scene / "pointcloud/joint_metadata.json").is_file())

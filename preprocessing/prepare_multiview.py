@@ -10,11 +10,13 @@ from nerfstudio.data.utils.colmap_parsing_utils import read_images_text
 from preprocessing.compare_cam_motion import compute_metrics
 
 
-def calibration_poses(scene):
+def calibration_poses(scene, cameras=None):
     images_path = scene / "colmap/sparse/0/images.txt"
     poses = {}
     for image in read_images_text(images_path).values():
         camera = Path(image.name).parts[0]
+        if cameras is not None and camera not in cameras:
+            continue
         w2c = np.eye(4)
         w2c[:3, :3] = image.qvec2rotmat()
         w2c[:3, 3] = image.tvec
@@ -40,8 +42,8 @@ def prepare_multiview(scene, camera_datasets, output):
     scene, output = Path(scene).resolve(), Path(output).resolve()
     if output == scene or output in scene.parents:
         raise ValueError("Multi-view output must not replace the raw scene")
-    calibrations = calibration_poses(scene)
     cameras = sorted(camera_datasets)
+    calibrations = calibration_poses(scene, cameras)
     if len(cameras) < 2:
         raise ValueError("Joint multi-view training requires at least two cameras")
     frames = {}

@@ -181,6 +181,39 @@ per training stage:
 bash pipelines/train_local_datasets.sh --object USB_100109 --iterations 10 --max-frames 8 --frame-stride 8
 ```
 
+## Select cameras
+
+All available cameras are used by default; `--all-cameras` explicitly selects
+that same behavior. To use only cameras 001 and 002:
+
+```bash
+bash /home/samuelemara/FreeArtGS/pipelines/train_local_datasets.sh \
+  --datasets "/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real" \
+  --outputs-root "/media/samuelemara/Extreme SSD/Samuele/results_09_11_26/freeart_real" \
+  --object final_red_fridge_episode_000000 \
+  --cameras cam_001 cam_002 \
+  --visualize-results --skip-completed
+```
+
+`--cameras cam001 002` is equivalent. IDs are normalized to `cam_XXX`, sorted,
+and must name at least two distinct cameras available in every selected object.
+Unknown or duplicate cameras fail before training. Do not combine `--cameras`
+with `--all-cameras`. Add `--dry-run` to check selected inputs without writing
+files or training. Combine with `--objects` and `--frame-intervals` as needed.
+
+Only selected cameras supply RGB-D data, segmentation, tracking, motion
+initialization, Gaussian training, evaluation and debug-video panels. Calibration
+poses are checked for those cameras. Raw camera files are preserved.
+
+Explicit camera selections get separate names, for example
+`final_red_fridge_episode_000000_multiview_cams001-002`; frame intervals and
+stride/frame-limit suffixes follow this suffix. Camera order and aliases do not
+change the name. Full-camera results retain their existing names when
+`--cameras` is omitted. Tracking reuse and completion checks use the selected
+run's paths; full-camera checkpoints/tracking are not reused automatically.
+The batch summary records `camera_names`, and `multiview.json` lists only the
+selected observations.
+
 ## Select frame intervals
 
 Use `--frame-intervals START:END [START:END ...]` to reconstruct from one or more

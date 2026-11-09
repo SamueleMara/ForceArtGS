@@ -158,6 +158,72 @@ class DatasetLoadingTest(unittest.TestCase):
             "1 1 0 0 0 0 0 0 7 cam_000/frame_000000.png\n\n"
             "2 1 0 0 0 -0.2 0 0 42 cam_001/frame_000000.png\n\n")
 
+    def add_third_camera(self):
+        path = self.scene / "metadata/cameras.json"
+        meta = json.loads(path.read_text())
+        meta["cameras"].append(dict(self.camera, name="cam_002"))
+        path.write_text(json.dumps(meta))
+        for folder in ("rgb", "depth_npy", "mask"):
+            shutil.copytree(self.scene / folder / "cam_000", self.scene / folder / "cam_002")
+        with (self.scene / "colmap/sparse/0/images.txt").open("a") as stream:
+            stream.write("3 1 0 0 0 -0.4 0 0 42 cam_002/frame_000000.png\n\n")
+
+    def test_default_camera_selection_still_uses_all_views(self):
+        self.add_second_camera()
+        self.add_third_camera()
+        for flags in ([], ["--all-cameras"]):
+            with self.subTest(flags=flags), \
+                 patch.object(sys, "argv", ["batch", "--datasets", str(self.root), "--dry-run", *flags]), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                batch.main()
+            self.assertIn("scene_multiview: 3 cameras", output.getvalue())
+            self.assertIn("Selected cameras: cam_000, cam_001, cam_002", output.getvalue())
+        self.assertFalse((self.root / "outputs").exists())
+
+    def test_camera_selection_rejects_unknown_duplicate_and_single_views(self):
+        self.add_second_camera()
+        for flags, error in ((["--cameras", "cam000", "cam_000"], SystemExit),
+                             (["--cameras", "001"], SystemExit),
+                             (["--cameras", "oops", "001"], SystemExit),
+                             (["--all-cameras", "--cameras", "000", "001"], SystemExit),
+                             (["--cameras", "000", "002"], ValueError)):
+            with self.subTest(flags=flags), \
+                 patch.object(sys, "argv", ["batch", "--datasets", str(self.root), "--dry-run", *flags]), \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(error):
+                    batch.main()
+        self.assertFalse((self.root / "outputs").exists())
+
+    def test_camera_subset_reuse_and_assembly_exclude_unselected_data(self):
+        datasets = self.make_tracked_multiview()
+        self.add_third_camera()
+        # Excluded camera has invalid depth and moves; neither may affect this subset.
+        (self.scene / "depth_npy/cam_002/frame_000001.npy").unlink()
+        with (self.scene / "colmap/sparse/0/images.txt").open("a") as stream:
+            stream.write("4 1 0 0 0 -0.5 0 0 42 cam_002/frame_000001.png\n\n")
+        with self.assertRaisesRegex(ValueError, "moving"):
+            calibration_poses(self.scene)
+        self.make_completed_result()
+        name = "scene_multiview_cams000-001_i0-1"
+        prepared = self.root / "outputs/work/datasets"
+        prepared.mkdir(parents=True)
+        for camera, data in datasets.items():
+            data.rename(prepared / f"{name}_{camera.replace('_', '')}")
+        argv = ["batch", "--datasets", str(self.root), "--iterations", "10", "--cameras", "cam001", "000",
+                "--frame-intervals", "0:1", "--reuse-tracking", "--skip-completed"]
+        with patch.object(sys, "argv", argv), patch("torch.cuda.is_available", return_value=True), \
+             patch.object(batch.subprocess, "run", return_value=subprocess.CompletedProcess(["bash"], 0)) as run, \
+             contextlib.redirect_stdout(io.StringIO()):
+            batch.main()
+        self.assertEqual(run.call_count, 1)
+        self.assertIn("--reconstruction_only", run.call_args.args[0])
+        manifest = json.loads((prepared / name / "multiview.json").read_text())
+        self.assertEqual(manifest["cameras"], ["cam_000", "cam_001"])
+        self.assertEqual([r["camera_name"] for r in manifest["frames"]], ["cam_000", "cam_001"] * 2)
+        rows = json.loads((self.root / "outputs/batch_logs/summary.json").read_text())
+        self.assertEqual([r["job"] for r in rows], ["scene_multiview", name])
+        self.assertEqual(rows[-1]["camera_names"], ["cam_000", "cam_001"])
+
     def test_fov_and_explicit_intrinsics(self):
         k = camera_intrinsics(self.camera)
         self.assertAlmostEqual(k[1, 1], 6 / (2 * np.tan(np.pi / 8)))

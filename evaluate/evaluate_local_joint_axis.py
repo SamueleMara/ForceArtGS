@@ -86,7 +86,7 @@ def align_prediction(scene, manifest, articulation, cameras):
         raise ValueError("No exported cameras available to align the predicted joint axis")
     if len({Path(row["file_path"]).name for row in cameras}) != len(cameras):
         raise ValueError("Exported camera observations must have unique filenames")
-    calibrated = calibration_poses(scene)
+    calibrated = calibration_poses(scene, {view["camera_name"] for view in views.values()})
     alignment = None
     translation = None
     camera_errors = []

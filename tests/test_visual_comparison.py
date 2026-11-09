@@ -67,6 +67,10 @@ class VisualComparisonTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             scene, dataset, results, _ = self.prediction_fixture(root)
+            # An unused moving camera must not enter alignment or debug rendering.
+            with (scene / "colmap/sparse/0/images.txt").open("a") as stream:
+                stream.write("3 1 0 0 0 2 0 0 3 cam_002/frame_000000.png\n\n"
+                             "4 1 0 0 0 3 0 0 3 cam_002/frame_000001.png\n\n")
             out = root / "debug"
             with patch.object(sys, "argv", ["visualize", "--scene", str(scene), "--dataset", str(dataset),
                                             "--results", str(results), "--output-dir", str(out)]), \
@@ -76,6 +80,7 @@ class VisualComparisonTest(unittest.TestCase):
             self.assertFalse(info["gt_available"])
             self.assertEqual(info["video"], "motion_axis_debug.mp4")
             self.assertEqual(info["timestamps"], 2)
+            self.assertEqual(info["cameras"], ["cam_000", "cam_001"])
             self.assertEqual(encode.call_count, 2)
             self.assertIn(str(out / "motion_axis_debug.mp4"), encode.call_args_list[0].args[0])
             image = np.asarray(Image.open(out / "comparison_00000.png"))

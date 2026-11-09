@@ -125,7 +125,7 @@ def main():
             if not path.is_file():
                 raise FileNotFoundError(f"Missing saved checkpoint render: {path}")
     report, states = comparison_annotations(scene, dataset, results, manifest)
-    poses = calibration_poses(scene)
+    poses = calibration_poses(scene, cameras)
     out = args.output_dir.resolve() if args.output_dir else results / "comparison"
     out.mkdir(parents=True, exist_ok=True)
     font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
