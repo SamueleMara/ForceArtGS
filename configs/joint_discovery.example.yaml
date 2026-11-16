@@ -1,0 +1,34 @@
+# Opt-in calibrated joint-aware Phase 1 (estimotion_2part/joint_discovery).
+# Omitting this section, or mode: legacy, leaves the existing FreeArtGS pipeline unchanged.
+joint_discovery:
+  mode: calibrated_joint_aware     # legacy | calibrated_joint_aware
+  cameras: [cam_001, cam_002]      # cam_000 only as an explicit stress test (calibration disagreement)
+  fixed_calibration: true          # physical camera poses are never optimized
+  hypotheses: [prismatic, revolute]
+  keep_static_and_unknown: true
+  allow_partial_tracks: true
+  enable_visual_2d: true
+  enable_depth: true
+  enable_appearance: false         # diagnostic only in this version
+  enable_coarse_renderer: false    # level-V2 Gaussian feedback not implemented
+  enable_tcp_contact: false        # S3: enable after a vision-only baseline exists
+  enable_force_selection: false    # S4
+  enable_contact_surface_fit: false
+  require_calibrated_wrench: true
+  no_oracle_labels: true
+  output_subdir: joint_discovery
+  noise:
+    sigma_px: 1.0
+    sigma_depth_m0: 0.002
+    sigma_depth_m2: 0.004
+    calibrate_from_static_core: true
+  fit:
+    max_tracks_per_camera: 1500
+    em_iterations: 4
+    n_seeds: 5
+    seed: 0
+  comparison:
+    heldout_time_fraction: 0.20
+    selection: heldout_predictive
+    allow_ambiguous: true
+    z_threshold: 2.0

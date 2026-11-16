@@ -35,6 +35,24 @@ This repository contains the official implementation of [FreeArtGS: Articulated 
   <img src="docs/pipeline.png" alt="Overview of FreeArtGS" width="90%">
 </p>
 
+## ForceArtGS (this fork)
+
+ForceArtGS is a research fork of [FreeArtGS](https://github.com/FreeArtGS/FreeArtGS). All credit
+for the original method and code goes to its authors (above). The fork adds real robot RGB-D
+tooling (calibrated multi-camera recordings, EE/TCP and wrench export, contact diagnostics) and
+an **opt-in** calibrated joint-aware Phase 1:
+[`estimotion_2part/joint_discovery/`](estimotion_2part/joint_discovery/README.md).
+
+* It fits static, prismatic and revolute hypotheses with exact SE(3) joint kinematics, one
+  shared joint trajectory across fixed calibrated cameras, and persistent support for partial
+  tracks.
+* It selects the joint type by held-out prediction and may abstain (`ambiguous/unobservable`).
+* It treats the robot TCP as a sliding contact point and the wrench as separate, gated physical
+  evidence.
+
+The default (`joint_discovery.mode: legacy`) keeps the original pipeline unchanged. Results and
+limitations are in [`docs/joint_discovery_phase1.md`](docs/joint_discovery_phase1.md).
+
 
 ## Installation
 
@@ -538,3 +556,31 @@ Common controls: `A/D` step backward/forward, `R` reset, `M` toggle the moving p
 - [x] Release evaluation scripts.
 - [x] Release visualization tools.
 - [ ] Release the pipeline config and scripts for real data.
+
+### RGB-D direction as the final preparation step
+
+After real mask generation/correction rebuilds both endpoint COLMAP models,
+`samuele/colmap_masking.py` calls Sapien's `scripts/choose_rgbd_direction.py`.
+Synthetic Sapien preparation also finishes with that check. Each scene receives
+`metadata/direction/summary.json`, `per_frame.csv`, and `coverage.png`. The
+recommendation compares masked valid-depth pixels in the first/last 10% of
+frames, prefers metric depth NPYs, and requires complete camera/frame sets.
+An exact nonzero tie keeps forward order; no valid endpoint depth produces no
+recommendation and a failure. Reports describe coverage, not training accuracy,
+and do not reorder the dataset or start training.
+
+Run the final step alone across all synthetic camera counts/profiles and real
+`final_*_episode_*` scenes:
+
+```bash
+/home/samuelemara/miniconda3/envs/grounded-sam2/bin/python -B \
+  /home/samuelemara/Joint3DGS/Sapien/scripts/choose_rgbd_direction.py \
+  --root "/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output" \
+  --subset synthetic real-final --resume
+```
+
+Use `--subset synthetic` or `--subset real-final` for one collection. Add
+`--dry-run` for layout checks without writing. The command only computes reports;
+it does not rerun conversion, masking, rendering, or reconstruction. `--resume`
+reuses reports when mask/depth filenames, sizes, modification times, endpoint
+fraction, and algorithm version match; changed inputs trigger recounting.
