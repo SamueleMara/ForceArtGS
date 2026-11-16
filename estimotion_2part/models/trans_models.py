@@ -11,6 +11,12 @@ from estimotion_2part.models.loss import (
     projection_matching_loss,
 )
 
+
+def _audit_trace_enabled():
+    """Audit tracing switch (samuele/debug_audit/trace.py); False unless FREEARTGS_TRACE_ROOT is set."""
+    import os
+    return bool(os.environ.get("FREEARTGS_TRACE_ROOT"))
+
 class TrajectoryDataset(Dataset):
     def __init__(self, source_points, target_points, w_ids, T_ids, knn_idx=None):
         self.source_points = source_points
@@ -159,6 +165,20 @@ class Trans(nn.Module):
         else:
             return transformed[:, :3], None  # Return transformed points and None for reprojected points
 
+    # --- parameterization-neutral accessors (legacy free 4x4 matrices) ---------------------------
+    def transform_parameters(self):
+        return [self.T1, self.T2]
+
+    def set_transforms_trainable(self, trainable):
+        self.T1.requires_grad = trainable
+        self.T2.requires_grad = trainable
+
+    def assign_transform(self, index, T1, T2):
+        """Overwrite transform ``index`` (only used when ``transform_reinit_apply`` is enabled)."""
+        with torch.no_grad():
+            self.T1.data[index] = T1.to(device=self.T1.device, dtype=self.T1.dtype)
+            self.T2.data[index] = T2.to(device=self.T2.device, dtype=self.T2.dtype)
+
     def forward_components(self, x, w_id, T_id):
         """
         Return per-transform predictions and selected weights in addition to blended prediction.
@@ -186,7 +206,107 @@ class Trans(nn.Module):
         transformed_T2 = torch.bmm(T2_batch, xh).squeeze(-1)[..., :3]
         blended = (1 - w_selected.unsqueeze(1)) * transformed_T1 + w_selected.unsqueeze(1) * transformed_T2
         return transformed_T1, transformed_T2, w_selected, blended
-    
+
+
+def _hat(v):
+    """(..., 3) -> (..., 3, 3) skew-symmetric matrices."""
+    z = torch.zeros_like(v[..., 0])
+    return torch.stack([
+        torch.stack([z, -v[..., 2], v[..., 1]], dim=-1),
+        torch.stack([v[..., 2], z, -v[..., 0]], dim=-1),
+        torch.stack([-v[..., 1], v[..., 0], z], dim=-1),
+    ], dim=-2)
+
+
+def se3_exp(xi):
+    """Exp: se(3) -> SE(3).  ``xi`` (..., 6) = (rho, phi): translation part, rotation vector.
+
+    Computed as the matrix exponential of the 4x4 twist, which is exact, differentiable and
+    well defined at ``phi = 0``; the rotation block is in SO(3) up to floating-point rounding.
+    """
+    twist = torch.zeros(xi.shape[:-1] + (4, 4), dtype=xi.dtype, device=xi.device)
+    twist[..., :3, :3] = _hat(xi[..., 3:])
+    twist[..., :3, 3] = xi[..., :3]
+    return torch.linalg.matrix_exp(twist)
+
+
+def project_to_se3(T):
+    """Nearest rigid transform (rotation by SVD, det +1) for initialisations given as 4x4 matrices."""
+    T = torch.as_tensor(T)
+    U, _, Vh = torch.linalg.svd(T[..., :3, :3])
+    d = torch.sign(torch.linalg.det(U @ Vh))
+    D = torch.diag_embed(torch.stack([torch.ones_like(d), torch.ones_like(d), d], dim=-1))
+    out = torch.zeros_like(T)
+    out[..., :3, :3] = U @ D @ Vh
+    out[..., :3, 3] = T[..., :3, 3]
+    out[..., 3, 3] = 1.0
+    return out
+
+
+class RigidTrans(Trans):
+    """Two-part model whose transforms are rigid during optimisation (``transform_parameterization: se3``).
+
+    T_k = C Exp(xi_k) C^-1 T_init,k  with  C = translation(pivot),  xi_k in R^6.
+
+    ``T_init`` is a buffer (the existing rigid initialisation, unchanged); only ``xi`` is optimised,
+    so every iterate is in SE(3).  The pivot (centroid of the window's source points) only
+    conditions the rotation coordinates; it does not restrict the motion.  ``T1``/``T2`` are
+    read-only properties with the legacy (num_T, 4, 4) layout so losses, priors and exports are
+    unchanged.
+    """
+
+    def __init__(self, num_points, num_T, init_weights=None, init_T1=None, init_T2=None, cam_K=None,
+                 device="cuda", pivot=None):
+        nn.Module.__init__(self)
+        self.weight = self._initialize_weights(num_points, init_weights, device)
+        T1, T2 = Trans._initialize_transform_matrices(self, num_T, init_T1, init_T2, device)
+        self.register_buffer("T1_init", project_to_se3(T1.detach().to(device=device, dtype=torch.float32)))
+        self.register_buffer("T2_init", project_to_se3(T2.detach().to(device=device, dtype=torch.float32)))
+        self.xi1 = nn.Parameter(torch.zeros(num_T, 6, device=device))
+        self.xi2 = nn.Parameter(torch.zeros(num_T, 6, device=device))
+        pivot = torch.zeros(3) if pivot is None else torch.as_tensor(pivot).reshape(3)
+        self.register_buffer("pivot", pivot.to(device=device, dtype=torch.float32))
+        self.cam_K = torch.tensor(cam_K, dtype=torch.float32, device=device)
+
+    def _compose(self, xi, T_init):
+        E = se3_exp(xi)
+        C = torch.eye(4, device=xi.device, dtype=xi.dtype).expand_as(E).clone()
+        C[..., :3, 3] = self.pivot
+        C_inv = C.clone()
+        C_inv[..., :3, 3] = -self.pivot
+        return C @ E @ C_inv @ T_init
+
+    @property
+    def T1(self):
+        return self._compose(self.xi1, self.T1_init)
+
+    @property
+    def T2(self):
+        return self._compose(self.xi2, self.T2_init)
+
+    def transform_parameters(self):
+        return [self.xi1, self.xi2]
+
+    def set_transforms_trainable(self, trainable):
+        self.xi1.requires_grad = trainable
+        self.xi2.requires_grad = trainable
+
+    def assign_transform(self, index, T1, T2):
+        with torch.no_grad():
+            self.T1_init[index] = project_to_se3(T1.to(device=self.T1_init.device, dtype=torch.float32))
+            self.T2_init[index] = project_to_se3(T2.to(device=self.T2_init.device, dtype=torch.float32))
+            self.xi1.data[index] = 0.0
+            self.xi2.data[index] = 0.0
+
+
+def make_trans(parameterization="matrix", pivot=None, **kwargs):
+    """``matrix``: legacy free 4x4 matrices (default, unchanged).  ``se3``: rigid ``RigidTrans``."""
+    if parameterization in (None, "matrix"):
+        return Trans(**kwargs)
+    if parameterization == "se3":
+        return RigidTrans(pivot=pivot, **kwargs)
+    raise ValueError(f"Unknown transform_parameterization: {parameterization!r} (expected 'matrix' or 'se3')")
+
 
 class Optimizer:
     def __init__(self, model, weight_lr, transform_lr, args=None, max_epoch=1000):
@@ -194,7 +314,7 @@ class Optimizer:
         self.max_epoch = max_epoch
         self.optimizer = torch.optim.Adam([
             {'params': [model.weight], 'lr': weight_lr},
-            {'params': [model.T1, model.T2], 'lr': transform_lr}
+            {'params': model.transform_parameters(), 'lr': transform_lr}
         ])
         
         use_scheduler = getattr(args, 'use_scheduler', True)
@@ -419,7 +539,12 @@ class TransformLossComputer:
         knn_idx=None,
         neighbor_w=None,
         valid_init_idx=None,
+        extra_loss=None,
     ):
+        """``extra_loss``: optional, already-weighted prior term (Phase B seed / Phase C contact).
+
+        ``None`` leaves the baseline total unchanged; ``main_loss`` never includes it.
+        """
         main_loss = self._compute_main_loss(
             pred_t1, pred_t2, w_sel, blended, target_points, source_points
         )
@@ -449,5 +574,12 @@ class TransformLossComputer:
             + self.w_s * smooth_reg
             + self.w_init * init_reg
         )
+        if extra_loss is not None:
+            total_loss = total_loss + extra_loss
+        if _audit_trace_enabled():   # audit only: detached references, read by the solver's trace hook
+            self._trace_terms = dict(main=main_loss.detach(), projection=projection_loss.detach(),
+                                     entropy=entropy_reg.detach(), smooth=smooth_reg.detach(), init=init_reg.detach(),
+                                     extra=None if extra_loss is None else extra_loss.detach(), total=total_loss.detach(),
+                                     weights=dict(w_p=self.w_p, w_m=self.w_m, w_e=self.w_e, w_s=self.w_s, w_init=self.w_init))
         return total_loss, main_loss
             

@@ -8,6 +8,7 @@ import numpy as np
 from samuele.convert_standard_to_freeart import camera_intrinsics, load_camera_entry
 from nerfstudio.data.utils.colmap_parsing_utils import read_images_text
 from preprocessing.compare_cam_motion import compute_metrics
+from samuele.debug_audit import trace as _trace
 
 
 def calibration_poses(scene, cameras=None):
@@ -38,7 +39,26 @@ def camera_in_part_frame(calibration, reference_calibration, reference_part_pose
     return reference_calibration @ relative @ np.linalg.inv(reference_calibration) @ calibration
 
 
-def prepare_multiview(scene, camera_datasets, output):
+def _owned_or_report_only(output, scene):
+    provenance = output / "multiview.json"
+    if provenance.exists():
+        return json.loads(provenance.read_text())["source_scene"] == str(scene)
+    return {p.name for p in output.iterdir()} <= {"multiview_quality.json"}
+
+
+class UnresolvedReferenceError(RuntimeError):
+    """No camera's moving-part motion is supported by independent RGB-D evidence."""
+
+
+def prepare_multiview(scene, camera_datasets, output, reference_selection="motion", on_unresolved="raise"):
+    """``reference_selection``: ``motion`` (legacy: largest motion-score gap) or ``quality``
+    (preprocessing/multiview_quality.py).  With ``quality`` and no supported camera,
+    ``on_unresolved="raise"`` stops after writing ``multiview_quality.json``; ``"flag"`` keeps the
+    legacy choice but records ``reference_status: unresolved`` in the manifest."""
+    if reference_selection not in ("motion", "quality"):
+        raise ValueError(f"reference_selection must be 'motion' or 'quality', got {reference_selection!r}")
+    if on_unresolved not in ("raise", "flag"):
+        raise ValueError(f"on_unresolved must be 'raise' or 'flag', got {on_unresolved!r}")
     scene, output = Path(scene).resolve(), Path(output).resolve()
     if output == scene or output in scene.parents:
         raise ValueError("Multi-view output must not replace the raw scene")
@@ -98,18 +118,57 @@ def prepare_multiview(scene, camera_datasets, output):
         bool(pose_validity[name][assignments[name]["moving_part"]][0]),
         assignments[name]["valid_pose_counts"][assignments[name]["moving_part"]],
         abs(np.diff(assignments[name]["motion_scores"])[0])))
+    quality = None
+    if reference_selection == "quality":
+        from preprocessing.multiview_quality import camera_quality, select_reference, write_report
+        stems_by_camera = {camera: [row["output_stem"] for row in frames[camera]] for camera in cameras}
+        if len({tuple(v) for v in stems_by_camera.values()}) != 1:
+            raise ValueError("quality-based selection needs identical output stems across cameras")
+        report = camera_quality({camera: Path(camera_datasets[camera]) for camera in cameras},
+                                stems_by_camera[cameras[0]], calibrations,
+                                {camera: assignments[camera]["moving_part"] for camera in cameras},
+                                {camera: pose_validity[camera][assignments[camera]["moving_part"]] for camera in cameras})
+        selected, status, reasons = select_reference(report)
+        if output.exists() and not _owned_or_report_only(output, scene):
+            raise ValueError(f"Refusing to overwrite an unrelated dataset: {output}")
+        output.mkdir(parents=True, exist_ok=True)
+        write_report(output / "multiview_quality.json", report, selected, status, reasons, legacy_reference=reference)
+        quality = dict(status=status, selected=selected, legacy_motion_reference=reference, reasons=reasons,
+                       report="multiview_quality.json")
+        if status == "unresolved" and on_unresolved == "raise":
+            raise UnresolvedReferenceError(
+                f"No camera's moving-part motion is supported by independent RGB-D evidence; see "
+                f"{output / 'multiview_quality.json'} (legacy rule would have chosen {reference})")
+        if selected is not None:
+            reference = selected
     # Independent two-part tracking can mislabel static surfaces when the moving part is occluded.
     reference_motion = pose_sequences[reference][assignments[reference]["moving_part"]]
     moving_poses = {camera: camera_in_part_frame(calibrations[camera], calibrations[reference], reference_motion)
                     for camera in cameras}
+    if _trace.enabled():
+        _trace.event("multiview_reference", local_file="preprocessing/prepare_multiview.py", function="prepare_multiview",
+                     coordinate_frame="world (COLMAP images.txt), OpenCV camera axes",
+                     transform_direction="calibration: physical camera-to-world; moving_poses: VIRTUAL camera-to-part-canonical",
+                     value=dict(cameras=cameras, reference=reference, reference_selection=reference_selection,
+                                assignments=assignments, quality_status=None if quality is None else quality["status"],
+                                pose_validity={c: [[bool(x) for x in v] for v in pose_validity[c]] for c in cameras}),
+                     arrays={**{f"T_physical_camera_{c}": calibrations[c] for c in cameras},
+                             **{f"T_part_camera_virtual_{c}": moving_poses[c] for c in cameras},
+                             "reference_motion_global_poses": reference_motion})
     manifest = {"source_scene": str(scene), "cameras": cameras, "reference_camera": reference,
                 "initialization_method": "independent_camera_segmentation_single_view_motion",
                 "part_consistency_validated": False,
                 "num_timestamps": len(source_stems), "part_assignments": assignments,
                 "calibration_images": str(scene / "colmap/sparse/0/images.txt"), "frames": []}
+    if quality is not None:
+        manifest["reference_selection"] = reference_selection
+        manifest["reference_status"] = quality["status"]
+        manifest["reference_quality"] = quality
     if output.exists():
         provenance = output / "multiview.json"
-        if not provenance.exists() or json.loads(provenance.read_text())["source_scene"] != str(scene):
+        if quality is not None and _owned_or_report_only(output, scene):
+            pass  # owned, or only the quality report written above
+        elif not provenance.exists() or json.loads(provenance.read_text())["source_scene"] != str(scene):
             raise ValueError(f"Refusing to overwrite an unrelated dataset: {output}")
     for directory in ("images", "images_ori", "masks", "mask_0", "mask_1", "depth"):
         (output / directory).mkdir(parents=True, exist_ok=True)

@@ -24,6 +24,7 @@ from mpl_toolkits.mplot3d import Axes3D
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+from samuele.debug_audit import trace as _trace
 
 from utils.pipeline_config import (
     apply_section_to_args,
@@ -847,7 +848,10 @@ def build_pose_graph(args, point_clouds, tensor_point_clouds=None):
     max_corr = args.voxel_size * 2.0
     last_good_idx = 0 if valid_mask[0] else -1
 
+    _trace_on = _trace.enabled()
     for curr_idx in tqdm(range(1, n), desc="Local Map Odometry"):
+        _attempts = [] if _trace_on else None
+        _fallback = None
         curr_pcd = point_clouds[curr_idx]
         curr_pcd_t = tensor_point_clouds[curr_idx] if tensor_point_clouds is not None else curr_pcd
         curr_pose = global_poses[curr_idx - 1].copy()
@@ -949,6 +953,13 @@ def build_pose_graph(args, point_clouds, tensor_point_clouds=None):
                         motion_history_r,
                         args,
                     )
+                    if _attempts is not None:
+                        _attempts.append(dict(retry=retry, init_kind=("constant_velocity", "previous_pose", "ransac")[min(retry, 2)],
+                                              init_pose=np.asarray(init_guess).tolist(), result_pose=np.asarray(curr_pose).tolist(),
+                                              fitness=float(fit), inlier_rmse=float(rmse), init_fitness=float(init_fit_local),
+                                              init_rmse=float(init_rmse_local), fit_not_worse_than_init=bool(fit_not_worse_than_init),
+                                              plausible=bool(is_plausible), step_translation=float(curr_t), step_rotation_deg=float(curr_r),
+                                              good_fitness=bool(is_good_registration(fit))))
 
                     if is_good_registration(fit) and is_plausible and fit_not_worse_than_init:
                         is_success = True
@@ -991,6 +1002,7 @@ def build_pose_graph(args, point_clouds, tensor_point_clouds=None):
                     and cv_init_pose is not None
                     and cv_init_rel_from_ref is not None
                 ):
+                    _fallback = "constant_velocity_init"
                     curr_pose = cv_init_pose
                     rel_from_ref = cv_init_rel_from_ref
                     curr_t = 0.0 if cv_init_t is None else cv_init_t
@@ -1057,6 +1069,7 @@ def build_pose_graph(args, point_clouds, tensor_point_clouds=None):
                     if is_good_registration(prev_fit) and prev_is_plausible and prev_fit_not_worse_than_init:
                         prev_edge_is_verified = True
                         if not is_success:
+                            _fallback = "prev_edge"
                             curr_pose = global_poses[curr_idx - 1] @ np.linalg.inv(prev_rel)
                             rel_from_ref = relative_transform_from_global_poses(
                                 global_poses[ref_idx], curr_pose
@@ -1092,6 +1105,7 @@ def build_pose_graph(args, point_clouds, tensor_point_clouds=None):
                 cprint(f"[LocalMap] {curr_idx} INVALID (empty local map)", "cyan")
 
         if not is_success:
+            _fallback = "hold_last_good_pose" if last_good_idx >= 0 else "identity"
             if last_good_idx >= 0:
                 curr_pose = global_poses[last_good_idx].copy()
                 ref_idx = last_good_idx
@@ -1102,6 +1116,17 @@ def build_pose_graph(args, point_clouds, tensor_point_clouds=None):
                 rel_from_ref = np.eye(4)
 
         global_poses.append(curr_pose)
+        if _trace_on:
+            _trace.event("icp_frame", local_file="icp/color_icp_gpu.py", function="build_pose_graph",
+                         coordinate_frame="camera_optical of the first frame (pose-graph node frame)",
+                         transform_direction="global_pose[t] as stored in global_poses (see execution_graph.md)",
+                         value=dict(frame_index=int(curr_idx), ref_idx=int(ref_idx), local_map=[int(i) for i in local_indices],
+                                    points=int(pcd_num_points(curr_pcd)), success=bool(is_success), valid=bool(valid_mask[curr_idx]),
+                                    fallback=_fallback, attempts=_attempts, final_fitness=float(fit), final_rmse=float(rmse),
+                                    cv_init_fitness=None if cv_init_fit is None else float(cv_init_fit),
+                                    ref_edge_verified=bool(ref_edge_is_verified), prev_edge_verified=bool(prev_edge_is_verified),
+                                    voxel_size=float(args.voxel_size), max_corr=float(max_corr),
+                                    pose=np.asarray(curr_pose).tolist()))
 
         rel_prev = relative_transform_from_global_poses(global_poses[curr_idx - 1], global_poses[curr_idx])
         odom_transforms.append(rel_prev)
@@ -1198,6 +1223,14 @@ def build_pose_graph(args, point_clouds, tensor_point_clouds=None):
         )
 
     optimized_poses = [node.pose for node in pose_graph.nodes]
+    if _trace.enabled():
+        _trace.event("icp_pose_graph", local_file="icp/color_icp_gpu.py", function="build_pose_graph",
+                     coordinate_frame="camera_optical of the first frame",
+                     value=dict(global_opt=bool(args.global_opt), loop_interval=getattr(args, "loop_interval", None),
+                                num_edges=len(pose_graph.edges),
+                                uncertain_edges=int(sum(bool(e.uncertain) for e in pose_graph.edges)),
+                                valid=[bool(v) for v in valid_mask]),
+                     arrays=dict(frontend_poses=np.stack(global_poses), optimized_poses=np.stack(optimized_poses)))
     return odom_transforms, optimized_poses, valid_mask
 
 
@@ -1226,7 +1259,8 @@ def process_sequence(base_dir, point_clouds, args, set_idx, cam_K, height, width
     tensor_point_clouds = [_to_tensor_pcd(pcd, ICP_T_DEVICE) for pcd in point_clouds]
 
     # Unified processing using build_pose_graph
-    transforms, global_poses, valid_mask = build_pose_graph(args, point_clouds, tensor_point_clouds=tensor_point_clouds)
+    with _trace.context(part_id=int(set_idx)):
+        transforms, global_poses, valid_mask = build_pose_graph(args, point_clouds, tensor_point_clouds=tensor_point_clouds)
 
     # Save relative transforms and global poses
     np.save(os.path.join(base_dir, f"relative_transforms_{set_idx}.npy"), np.array(transforms))

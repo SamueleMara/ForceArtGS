@@ -99,6 +99,98 @@ def run_stage(config_path, log, stage):
                    cwd=REPO_ROOT, stdout=log, stderr=subprocess.STDOUT, check=True)
 
 
+CONTACT_PHASE_FLAGS = ("tcp_supervision_enabled", "moving_prompt_enabled", "contact_surface_enabled")
+
+
+def load_tracking_overrides(path):
+    """Opt-in TCP/contact phase overrides (docs/tcp_contact_tracking.md); None keeps the baseline."""
+    if path is None:
+        return None
+    overrides = yaml.safe_load(Path(path).read_text()) or {}
+    unknown = set(overrides) - {"tracking", "tcp_contact_evidence", "contact_moving_prompts", "force_contact"}
+    if unknown:
+        raise ValueError(f"Unknown tracking-override sections: {sorted(unknown)}")
+    tracking = overrides.get("tracking", {}) or {}
+    evidence = overrides.get("tcp_contact_evidence", {}) or {}
+    for key in ("contact_file", "tool_geometry", "pose_archive", "parquet_python", "calibration_map"):
+        if key == "contact_file" and str(evidence.get(key, "")).lower() == "force":
+            continue  # generated from the recorded wrench at preparation time
+        if evidence.get(key) and not Path(evidence[key]).expanduser().exists():
+            raise FileNotFoundError(f"tcp_contact_evidence.{key} not found: {evidence[key]}")
+    if (tracking.get("moving_prompt_enabled") or tracking.get("contact_surface_enabled")) and not evidence.get("contact_file"):
+        raise ValueError("Phases B/C need tcp_contact_evidence.contact_file: a JSON/CSV path, or 'force' to derive "
+                         "contact automatically from the recorded wrench")
+    if tracking.get("tcp_supervision_enabled") and not evidence.get("contact_file"):
+        print("NOTE: no contact source; Phase A does not need one (contact state is uncertain everywhere)", flush=True)
+    if tracking.get("moving_prompt_enabled"):
+        prompts = overrides.get("contact_moving_prompts", {}) or {}
+        missing = [k for k in ("search_radius_m", "depth_margin_m") if not prompts.get(k)]
+        if missing:
+            raise ValueError(f"moving_prompt_enabled needs contact_moving_prompts.{missing} set explicitly")
+    return overrides
+
+
+def export_force_contact(scene, output_dir, evidence, options):
+    """Automatic contact annotations from the recorded wrench (needs a Python with polars/pyarrow)."""
+    python = Path(evidence["parquet_python"]).expanduser() if evidence.get("parquet_python") else Path(sys.executable)
+    command = [str(python), "-B", str(REPO_ROOT / "samuele/export_force_contact_annotations.py"),
+               "--scene", str(scene), "--output", str(output_dir)]
+    flags = dict(baseline_duration_s="--baseline-duration-s", contact_z="--contact-z", absent_z="--absent-z",
+                 min_contact_duration_s="--min-contact-duration-s", tool_mass_kg="--tool-mass-kg",
+                 max_uncompensated_rotation_deg="--max-uncompensated-rotation-deg", corrections="--corrections")
+    unknown = set(options) - set(flags) - {"baseline_frames"}
+    if unknown:
+        raise ValueError(f"Unknown force_contact options: {sorted(unknown)}")
+    for key, flag in flags.items():
+        if options.get(key) is not None:
+            command += [flag, str(Path(options[key]).expanduser() if key == "corrections" else options[key])]
+    if options.get("baseline_frames") is not None:
+        command += ["--baseline-frames", *(str(int(v)) for v in options["baseline_frames"])]
+    subprocess.run(command, check=True)
+    annotations = Path(output_dir) / "contact_annotations.json"
+    summary = json.loads((Path(output_dir) / "contact_summary.json").read_text())
+    print(f"Force contact annotations: {summary['counts_rgbd']} (RGB-D frames), intervals {summary['intervals']}")
+    return annotations
+
+
+def prepare_contact_artifacts(scene, camera_input_dir, overrides):
+    """Build tcp_contact (and Phase B seeds) inside the converted input; preprocess copies metadata."""
+    from samuele.tcp_contact_evidence import load_aligned_tcp, save_tcp_contact
+    tracking = overrides.get("tracking", {}) or {}
+    if not any(tracking.get(flag) for flag in CONTACT_PHASE_FLAGS):
+        return
+    evidence = overrides.get("tcp_contact_evidence", {}) or {}
+    path = lambda key: Path(evidence[key]).expanduser() if evidence.get(key) else None
+    geometry = tracking.get("tool_contact_geometry") or evidence.get("tool_geometry")
+    contact_file = path("contact_file")
+    if str(evidence.get("contact_file", "")).lower() == "force":
+        contact_file = export_force_contact(scene, camera_input_dir / "metadata/force_contact", evidence,
+                                            overrides.get("force_contact", {}) or {})
+    sequence = load_aligned_tcp(scene, camera_input_dir, contact_source=contact_file,
+                                tool_geometry=Path(geometry).expanduser() if geometry else None,
+                                pose_archive=path("pose_archive"), parquet_python=path("parquet_python"),
+                                calibration_map=path("calibration_map"))
+    save_tcp_contact(sequence, camera_input_dir / "metadata/tcp_contact", forbidden_roots=[scene])
+    if tracking.get("moving_prompt_enabled"):
+        from samuele.contact_moving_part_prompts import generate, write_outputs
+        prompts_cfg = overrides["contact_moving_prompts"]
+        prompts, report = generate(camera_input_dir, camera_input_dir / "metadata/tcp_contact",
+                                   search_radius_m=float(prompts_cfg["search_radius_m"]),
+                                   depth_margin_m=float(prompts_cfg["depth_margin_m"]),
+                                   max_positive=int(prompts_cfg.get("max_positive", 5)),
+                                   tool_exclusion_radius_m=prompts_cfg.get("tool_exclusion_radius_m"),
+                                   tool_exclusion_start_m=prompts_cfg.get("tool_exclusion_start_m"))
+        write_outputs(prompts, report, camera_input_dir / "metadata", camera_input_dir)
+
+
+def apply_tracking_overrides(config_path, overrides):
+    if not overrides or not overrides.get("tracking"):
+        return
+    config = yaml.safe_load(Path(config_path).read_text())
+    config.setdefault("tracking", {}).update(overrides["tracking"])
+    Path(config_path).write_text(yaml.safe_dump(config, sort_keys=False))
+
+
 def camera_argument(value):
     match = re.fullmatch(r"(?:cam_?)?(\d+)", value)
     if not match:
@@ -132,7 +224,15 @@ def main():
     parser.add_argument("--reuse-tracking", action="store_true", help="Reuse matching prepared camera sequences; recompute ICP if poses have missing timestamp slots.")
     parser.add_argument("--skip-completed", action="store_true",
                         help="Skip successful jobs with final checkpoint, exports and any requested GT reports/videos present.")
+    parser.add_argument("--tracking-overrides", type=Path,
+                        help="Opt-in YAML with tracking:/tcp_contact_evidence:/contact_moving_prompts: sections for the "
+                             "robot-TCP contact phases (see configs/tcp_contact_tracking.example.yaml). "
+                             "Job names get a _<file stem> suffix so ablations do not collide.")
+    parser.add_argument("--multiview-reference-selection", choices=("motion", "quality"), default="motion",
+                        help="motion: legacy largest-motion reference camera; quality: RGB-D motion-quality evaluation "
+                             "(preprocessing/multiview_quality.py), which stops when no camera is independently supported.")
     args = parser.parse_args()
+    overrides = load_tracking_overrides(args.tracking_overrides)
     if args.cameras is not None:
         if len(args.cameras) != len(set(args.cameras)):
             parser.error("Camera selection contains duplicate IDs")
@@ -192,6 +292,8 @@ def main():
             name += "_i" + "_".join(f"{start}-{end}" for start, end in args.frame_intervals)
         if args.max_frames is not None or args.frame_stride != 1:
             name += f"_f{args.max_frames or 'all'}_s{args.frame_stride}"
+        if args.tracking_overrides is not None:
+            name += f"_{args.tracking_overrides.stem}"
         if args.skip_completed and result_is_complete(records.get(name), outputs_root / name / "splatfacto-art",
                                                       args.iterations, evaluate_axis, args.visualize_results):
             print(f"SKIP {name}: completed results verified", flush=True)
@@ -287,6 +389,7 @@ def main():
                             raise ValueError(f"Prepared tracking does not match selected raw frames: {data}")
                         print(f"REUSING tracking: {data}", flush=True)
                         maybe_write_config(opt, camera_name, load_camera_entry(scene, camera))
+                        apply_tracking_overrides(opt.write_config, overrides)
                         rerun_icp = False
                         for part in (0, 1):
                             path = data / f"global_poses_{part}.npy"
@@ -295,6 +398,9 @@ def main():
                     else:
                         opt.dry_run = False
                         convert(opt)
+                        if overrides is not None:
+                            prepare_contact_artifacts(scene, opt.output.expanduser().resolve(), overrides)
+                            apply_tracking_overrides(opt.write_config, overrides)
                         run_stage(opt.write_config, log, "--preprocess_only")
                         run_stage(opt.write_config, log, "--tracking_only")
                         rerun_icp = True
@@ -305,7 +411,7 @@ def main():
                 ensure_free_space(outputs_root)
                 require_source(scene)
                 dataset = prepared_root / name
-                prepare_multiview(scene, camera_data, dataset)
+                prepare_multiview(scene, camera_data, dataset, reference_selection=args.multiview_reference_selection)
                 config = yaml.safe_load(options[0][2].write_config.read_text())
                 config["paths"]["object_name"] = name
                 config["multiview"] = {"enabled": True}

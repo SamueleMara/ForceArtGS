@@ -236,7 +236,28 @@ def pass_segmentation_map(
     last_trajectory_mask_t = trajectory_mask_list_t[-1].to(dtype=torch.float32)
     return seg_map_list_t, trajectory_mask_list_t, last_seg_map_t, last_trajectory_mask_t
 
-def initialize_part_segmentation(single_image_dict, method='kmeans'):
+def apply_part_seed_map(weight_map, valid_mask, seed_map):
+    """Consolidate prompt-supported moving-object seed pixels into one existing cluster.
+
+    K-means labels carry no static/moving identity, so the seeds are put into the cluster
+    that already holds most of them (no inversion by fiat).  Which tracking branch is moving
+    is resolved later from observed motion.  Returns (weight_map, info).
+    """
+    seeds = np.asarray(seed_map, dtype=bool) & np.asarray(valid_mask, dtype=bool)
+    count = int(seeds.sum())
+    if count == 0:
+        return weight_map, dict(status="skipped", reason="no_seed_inside_object_mask", seed_pixels=0)
+    high = int((weight_map[seeds] >= 0.5).sum())
+    if 2 * high == count:
+        return weight_map, dict(status="skipped", reason="seed_cluster_tie", seed_pixels=count)
+    value = 0.8 if 2 * high > count else 0.2
+    changed = int((weight_map[seeds] != value).sum())
+    weight_map = weight_map.copy()
+    weight_map[seeds] = value
+    return weight_map, dict(status="applied", seed_pixels=count, seed_cluster_value=value, relabelled_pixels=changed)
+
+
+def initialize_part_segmentation(single_image_dict, method='kmeans', seed_map=None, seed_report=None):
     """
     Initialize part segmentation for images.
     
@@ -359,7 +380,16 @@ def initialize_part_segmentation(single_image_dict, method='kmeans'):
         
     else:
         raise ValueError(f"Unknown initialization method: {method}")
-    
+
+    if seed_map is not None:
+        if method != 'kmeans':
+            info = dict(status="skipped", reason=f"seed maps only refine kmeans initialisation, not {method!r}")
+        else:
+            weight_map, info = apply_part_seed_map(weight_map, mask.astype(bool), seed_map)
+        print(f"Part seed map: {info}")
+        if seed_report is not None:
+            seed_report.update(info)
+
     # Count pixels in each part
     part1_count = np.sum((weight_map < 0.5) & mask)
     part2_count = np.sum((weight_map >= 0.5) & mask)

@@ -32,6 +32,8 @@ from tracking.tracker_toolkit import Alltracker, Tracker
 from estimotion_2part.process_part_segment import convert_trajs_to_segmentation_map, _resize_feature_to_hw_torch
 from estimotion_2part.utils.vis import visualize_seg_map_list
 from estimotion_2part.utils.eval import check_segmentation_consistency
+from estimotion_2part.tracking_prior_hooks import WindowPriors, run_phase_a
+from samuele.debug_audit import trace as _trace
 
 
 def _resize_feature_to_rgb(first_frame, device):
@@ -51,7 +53,8 @@ def _blend_segmap_inplace(first_frame_seg_map_torch, filled_frame_seg_map, valid
     ) * 0.5
 
 
-def merge_trajectories(args, pair_trajectories, pair_point_seg_weights, pair_point_indices, t1_map, t2_map, first_frame, first_frame_seg_map=None, factor=1.0, global_progress: float = 1.0):
+def merge_trajectories(args, pair_trajectories, pair_point_seg_weights, pair_point_indices, t1_map, t2_map, first_frame, first_frame_seg_map=None, factor=1.0, global_progress: float = 1.0,
+                       prior_builder=None):
     """
     Merge trajectories from multiple windows with joint optimization of segmentation weights.
     
@@ -111,6 +114,8 @@ def merge_trajectories(args, pair_trajectories, pair_point_seg_weights, pair_poi
         else:
             first_frame_weights = torch.empty((0,), dtype=first_frame_seg_map.dtype, device=first_frame_seg_map.device)
 
+    seed_term, contact_term = (None, None) if prior_builder is None else prior_builder(point_keys, device)
+
     # Joint optimization of all point segmentation weights and transformation matrices
     optimized_weights, optimized_transform_t1, optimized_transform_t2 = joint_optimize_segmentation_and_transforms(
         args,
@@ -122,7 +127,12 @@ def merge_trajectories(args, pair_trajectories, pair_point_seg_weights, pair_poi
         first_frame_weights,
         factor,
         global_progress=global_progress,
+        seed_term=seed_term,
+        contact_term=contact_term,
     )
+    if prior_builder is not None:
+        prior_builder.joint_infos = dict(seed=None if seed_term is None else seed_term.info,
+                                         contact=None if contact_term is None else contact_term.info)
     
     # Update point weights
     for point_idx, point_key in enumerate(point_keys):
@@ -132,16 +142,46 @@ def merge_trajectories(args, pair_trajectories, pair_point_seg_weights, pair_poi
     return point_trajectory_dict, optimized_transform_t1, optimized_transform_t2
 
 
-def process_single_window(args, tracker: Tracker, window_image_loader, max_window_size, window_index, current_frame, segmentation_maps, valid_seg_masks, total_frames):
+def process_single_window(args, tracker: Tracker, window_image_loader, max_window_size, window_index, current_frame, segmentation_maps, valid_seg_masks, total_frames,
+                          tcp_context=None):
     window_output_dir = os.path.join(args.output_dir, f"window_{window_index:05d}")
     os.makedirs(window_output_dir, exist_ok=True)
     first_frame = dict(window_image_loader[0])
 
+    with torch.inference_mode():
+        trajectory_maps, visibility_maps = tracker.get_track_maps(window_image_loader.data)
+    duplicated_last = len(window_image_loader) > max_window_size
+    if tcp_context is not None and tcp_context.phase_a:
+        # Phase A sees the RAW dense maps before object masking; the TCP never enters object tracks.
+        window_image_loader, max_window_size, trajectory_maps, visibility_maps = run_phase_a(
+            args, tracker, tcp_context, window_image_loader, max_window_size, current_frame, duplicated_last,
+            trajectory_maps, visibility_maps, window_output_dir)
+        duplicated_last = len(window_image_loader) > max_window_size
+    priors = None
+    if tcp_context is not None and (tcp_context.phase_b or tcp_context.phase_c):
+        priors = WindowPriors(args, tcp_context, current_frame, max_window_size, duplicated_last)
+
     t1_map = np.eye(4)[None, None, :, :].repeat(max_window_size, axis=0).repeat(max_window_size, axis=1)
     t2_map = t1_map.copy()
     with torch.inference_mode():
-        trajectory_maps, visibility_maps = tracker.get_track_maps(window_image_loader.data)
         coords_4d = tracker.get_4d_traj_maps(window_image_loader.data, trajectory_maps, visibility_maps)
+    _trace_window = dict(window_id=int(window_index), window_start_seq=int(current_frame),
+                         window_seq_frames=[int(current_frame + i) for i in range(int(coords_4d.shape[1]))],
+                         duplicated_last=bool(duplicated_last)) if _trace.enabled() else None
+    if _trace_window is not None:
+        # Frozen 2D tracks of every frame-0 object pixel (eroded mask), for offline depth-lifting
+        # counterfactuals; dense flow of background pixels is not stored.
+        with torch.inference_mode():
+            m0 = torch.from_numpy(np.asarray(window_image_loader.data["masks_eroded"][0])).to(trajectory_maps.device) > 0
+            ys, xs = torch.where(m0)
+            _trace.event("window_2d_tracks", local_file="estimotion_2part/track_2part.py", function="process_single_window",
+                         coordinate_frame="image_pixels (u right, v down) of the resized tracking images", units="px",
+                         value=dict(_trace_window, cam_K=np.asarray(window_image_loader.data["cam_K"]).tolist(),
+                                    image_hw=[int(trajectory_maps.shape[-2]), int(trajectory_maps.shape[-1])]),
+                         arrays=dict(y0=ys, x0=xs, uv=trajectory_maps[0][:, :, ys, xs].permute(2, 0, 1),
+                                     visconf=visibility_maps[0][:, :, ys, xs].permute(2, 0, 1),
+                                     z_bilinear=coords_4d[0][:, 2, ys, xs].permute(1, 0),
+                                     in_mask=coords_4d[0][:, 4, ys, xs].permute(1, 0)))
 
     with torch.no_grad():
         if first_frame.get("features", None) is not None:
@@ -164,6 +204,9 @@ def process_single_window(args, tracker: Tracker, window_image_loader, max_windo
         save_dir = os.path.join(window_output_dir, f"{window_size-1}")
         last_idx = min(window_size - 1, max(0, T_effective - 1))
         coords_subset = coords_4d[:, [0, last_idx], :, :, :]
+        _pair_ctx = _trace.context(**(dict(_trace_window or {}, pair_k=int(last_idx), seq_frame_a=int(current_frame),
+                                           seq_frame_b=int(current_frame + last_idx))))
+        _pair_ctx.__enter__()
         trajectories, point_indices, _, filter_ratio, filtered_count = tracker.get_visible_trajectories(args, coords_subset)
 
         if filter_ratio > filter_ratio_threshold:
@@ -176,6 +219,7 @@ def process_single_window(args, tracker: Tracker, window_image_loader, max_windo
 
         global_frame_idx = current_frame + last_idx
         global_progress = float(global_frame_idx + 1) / max(1, total_frames)
+        seed_term, contact_term = (None, None) if priors is None else priors.pair_terms(point_indices, last_idx, coords_4d.device)
         transform_t1, transform_t2, final_point_seg_weights, _ = solve_window_transformations(
             args,
             trajectories,
@@ -186,11 +230,34 @@ def process_single_window(args, tracker: Tracker, window_image_loader, max_windo
             valid_seg_masks_torch,
             factor,
             global_progress=global_progress,
+            seed_term=seed_term,
+            contact_term=contact_term,
         )
 
+        solved_t2 = transform_t2
+        _solved = (transform_t1, transform_t2, final_point_seg_weights) if _trace_window is not None else None
         final_point_seg_weights, transform_t1, transform_t2 = check_segmentation_consistency(
             final_point_seg_weights, point_indices, segmentation_maps_torch, valid_seg_masks_torch, transform_t1, transform_t2
         )
+        if _solved is not None:
+            _trace.event("pair_solution", local_file="estimotion_2part/track_2part.py", function="process_single_window",
+                         coordinate_frame="camera_optical",
+                         transform_direction="maps frame seq_frame_a points to seq_frame_b points",
+                         value=dict(labels_swapped=bool(transform_t1 is solved_t2),
+                                    T1_solved=_trace.to_numpy(_solved[0]).tolist(), T2_solved=_trace.to_numpy(_solved[1]).tolist(),
+                                    T1=_trace.to_numpy(transform_t1).tolist(), T2=_trace.to_numpy(transform_t2).tolist(),
+                                    T1_rigidity=_trace.matrix_rigidity(transform_t1), T2_rigidity=_trace.matrix_rigidity(transform_t2),
+                                    num_points=int(trajectories.shape[0])),
+                         arrays=dict(y=point_indices[0], x=point_indices[1], xyz=trajectories,
+                                     init_weights=init_point_seg_weights.reshape(-1),
+                                     solved_weights=_solved[2].reshape(-1), final_weights=final_point_seg_weights.reshape(-1)))
+        _pair_ctx.__exit__(None, None, None)
+        if priors is not None:
+            if transform_t1 is solved_t2:  # labels reversed: keep the physical moving branch
+                for term in (seed_term, contact_term):
+                    if term is not None:
+                        term.swap_labels()
+            priors.record_pair()
 
         pair_trajectories.append(trajectories)
         pair_point_seg_weights.append(final_point_seg_weights.reshape(-1))
@@ -234,11 +301,22 @@ def process_single_window(args, tracker: Tracker, window_image_loader, max_windo
         first_frame_seg_map=first_frame_seg_map_torch,
         factor=factor,
         global_progress=window_global_progress,
+        prior_builder=priors,
     )
+    if priors is not None:
+        priors.write(window_output_dir)
 
     cprint(f"  Merged {len(point_trajectory_dict)} consistent trajectories across {len(pair_trajectories) + 1} windows", "blue")
 
     np.savez(os.path.join(window_output_dir, 'optimized_transformations.npz'), T1=optimized_t1, T2=optimized_t2)
+    if _trace_window is not None:
+        _trace.event("window_merged", local_file="estimotion_2part/track_2part.py", function="process_single_window",
+                     coordinate_frame="camera_optical",
+                     transform_direction="T[k-1] maps window frame 0 points to window frame k points (k = 1..)",
+                     value=dict(_trace_window, frame_indices=window_frame_indices,
+                                T1_rigidity=[_trace.matrix_rigidity(m) for m in optimized_t1],
+                                T2_rigidity=[_trace.matrix_rigidity(m) for m in optimized_t2]),
+                     arrays=dict(T1=optimized_t1, T2=optimized_t2))
 
     seg_map_list_t, trajectory_mask_list_t, next_seg_map, next_valid_seg_mask = pass_segmentation_map(
         args,
@@ -296,6 +374,17 @@ def slide_window_tracking(args, cfg, tracker: Tracker, image_loader: ImageLoader
     max_resolution = max(image_loader.data["rgbs"][0].shape[0], image_loader.data["rgbs"][0].shape[1]) // args.downscale_factor
     image_loader, _, _ = image_loader.resize(max_resolution)
 
+    # Optional TCP/contact priors (Phases A/B/C).  Loaded once, aligned to the pingpong sequence.
+    tcp_context = None
+    if any(getattr(args, flag, False) for flag in ("tcp_supervision_enabled", "moving_prompt_enabled",
+                                                   "contact_surface_enabled", "contact_multiview_refine_enabled")):
+        from estimotion_2part.prior_context import TrackingPriorContext
+        num_original = len([f for f in os.listdir(os.path.join(args.input_dir, "images_ori"))
+                            if f.endswith((".png", ".jpg"))])
+        tcp_context = TrackingPriorContext(args, image_loader, args.input_dir, num_original)
+        tcp_context.write_report(args.output_dir)
+        cprint(f"Tracking priors enabled: A={tcp_context.phase_a} B={tcp_context.phase_b} C={tcp_context.phase_c}", "magenta")
+
     cprint(f"Resized image shape: {image_loader.rgbs[0].shape}", "green")
     scale_obj, projection_normalizer = estimate_global_geometry_stats(image_loader)
     args.scale_obj = scale_obj
@@ -312,7 +401,13 @@ def slide_window_tracking(args, cfg, tracker: Tracker, image_loader: ImageLoader
 
     if segmentation_maps is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        segmentation_maps_np = initialize_part_segmentation(image_loader[0], method=args.init_method)
+        seed_map0 = tcp_context.seed_map(0) if tcp_context is not None and tcp_context.phase_b else None
+        seed_init_report = {}
+        segmentation_maps_np = initialize_part_segmentation(image_loader[0], method=args.init_method,
+                                                            seed_map=seed_map0, seed_report=seed_init_report)
+        if tcp_context is not None and tcp_context.phase_b:
+            tcp_context.report["seed_initialisation"] = seed_init_report or dict(status="skipped", reason="no_seed_at_frame_0")
+            tcp_context.write_report(args.output_dir)
         segmentation_maps = torch.from_numpy(segmentation_maps_np).to(device=device, dtype=torch.float32)
         valid_seg_mask = (segmentation_maps > 0).to(dtype=torch.float32)
 
@@ -328,7 +423,8 @@ def slide_window_tracking(args, cfg, tracker: Tracker, image_loader: ImageLoader
         if len(window_image_loader) == 2:
             window_image_loader = window_image_loader.duplicate_last_frame()
 
-        len_window, next_seg_map, next_valid_seg_mask = process_single_window(args, tracker, window_image_loader, max_window_size, window_index, current_frame, segmentation_maps, valid_seg_mask, total_frames)
+        len_window, next_seg_map, next_valid_seg_mask = process_single_window(args, tracker, window_image_loader, max_window_size, window_index, current_frame, segmentation_maps, valid_seg_mask, total_frames,
+                                                                              tcp_context=tcp_context)
 
         segmentation_maps = next_seg_map
         valid_seg_mask = next_valid_seg_mask
@@ -337,6 +433,12 @@ def slide_window_tracking(args, cfg, tracker: Tracker, image_loader: ImageLoader
             current_frame = max_window_end
         else:
             current_frame += len_window - 1
+
+    if tcp_context is not None and tcp_context.phase_a:
+        from tracking.tcp_track_supervision import aggregate_reports
+        cprint(f"Phase A TCP summary: {aggregate_reports(args.output_dir)}", "magenta")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Dynamic Tracking with Transformation Solving")
     parser.add_argument("--config", type=str, default=None, help="Path to pipeline config YAML")

@@ -10,9 +10,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from samuele.debug_audit import trace as _trace
 from estimotion_2part.utils.vis import visualize_part_initialization
 from estimotion_2part.models.trans_models import (
     Trans,
+    RigidTrans,
+    make_trans,
     Optimizer,
     TransformLossComputer,
 )
@@ -297,10 +300,23 @@ def init_part_trans(trajs, point_seg_weights, save_dir=None, max_iter=5):
 
     return T1_current, T2_current
 
-def reinit_part_trans(transform_net, trajs, save_dir=None, epoch=None, factor=1.0):
+def reinit_part_trans(transform_net, trajs, save_dir=None, epoch=None, factor=1.0, apply=False):
         """
         use init_part_trans to update T1 and T2 in transform_net based on current weights
+
+        Legacy behaviour (``apply=False``, matrix parameterization): the two ``.data`` assignments
+        below write into temporary views, so the transforms are *not* changed (kept verbatim for
+        bit-identical results).  ``apply=True`` (``transform_reinit_apply``) writes the
+        re-initialisation through ``assign_transform``; with the rigid parameterization and
+        ``apply=False`` the (ineffective) computation is skipped.
         """
+        if apply or isinstance(transform_net, RigidTrans):
+            if not apply:
+                return None, None
+            with torch.no_grad():
+                T1_reinit, T2_reinit = init_part_trans(trajs, torch.sigmoid(transform_net.weight).flatten(), None)
+                transform_net.assign_transform(0, T1_reinit, T2_reinit)
+            return T1_reinit, T2_reinit
         with torch.no_grad():
             current_weights = torch.sigmoid(transform_net.weight).flatten()
             
@@ -319,10 +335,24 @@ def reinit_part_trans(transform_net, trajs, save_dir=None, epoch=None, factor=1.
             
             return T1_reinit, T2_reinit
         
-def joint_reinit_part_trans(transform_net, all_trajectories_for_reinit, save_dir=None):
+def joint_reinit_part_trans(transform_net, all_trajectories_for_reinit, save_dir=None, apply=False):
         """
         Reinitialize the transform matrix for each frame pair during joint optimization.
+
+        Legacy behaviour (``apply=False``): called without ``save_dir``, so nothing is computed or
+        written (kept verbatim).  ``apply=True`` re-initialises every pair through ``assign_transform``.
         """
+        if apply:
+            with torch.no_grad():
+                current_weights = torch.sigmoid(transform_net.weight).flatten()
+                for frame_pair_id, traj_data_list in all_trajectories_for_reinit.items():
+                    if frame_pair_id >= transform_net.T1.shape[0]:
+                        continue
+                    trajs = torch.stack([d['traj'].to(dtype=torch.float32) for d in traj_data_list], dim=0)
+                    weights = torch.stack([current_weights[d['point_idx']] for d in traj_data_list])
+                    T1_reinit, T2_reinit = init_part_trans(trajs, weights.to(trajs.device), None)
+                    transform_net.assign_transform(frame_pair_id, T1_reinit, T2_reinit)
+            return
         with torch.no_grad():
             current_weights = torch.sigmoid(transform_net.weight).flatten()
             
@@ -362,7 +392,72 @@ def joint_reinit_part_trans(transform_net, all_trajectories_for_reinit, save_dir
     
                             
 
-def solve_window_transformations(args, trajectories, init_point_seg_weights, point_indices, save_dir, first_frame, valid_seg_masks=None, factor=1.0, global_progress: float = 1.0):
+def _prior_extra_loss(seed_term, contact_term, transform_net, info_sink=None):
+    """Sum of optional Phase B / Phase C terms; None when both are inactive."""
+    extra = None
+    if seed_term is not None:
+        seed_loss = seed_term.loss(transform_net.weight)
+        if seed_loss is not None:
+            extra = seed_loss
+            if info_sink is not None:
+                info_sink["L_seed"] = float(seed_loss.detach())
+    if contact_term is not None:
+        contact_loss, contact_info = contact_term.loss(transform_net.T1, transform_net.T2)
+        if contact_loss is not None:
+            extra = contact_loss if extra is None else extra + contact_loss
+            if info_sink is not None:
+                info_sink["L_contact"] = contact_info.get("L_contact")
+                info_sink["L_contact_weighted"] = float(contact_loss.detach())
+    return extra
+
+
+def _prepare_prior_terms(seed_term, contact_term, transform_net, source_points, target_points, T_id, w_id=None,
+                         point_source_points=None):
+    """Resolve the moving branch (B first, then C inherits or resolves from motion)."""
+    with torch.no_grad():
+        T1_samples = transform_net.T1[T_id]
+        T2_samples = transform_net.T2[T_id]
+        weights = torch.sigmoid(transform_net.weight).reshape(-1)
+    if seed_term is not None:
+        seed_term.resolve(source_points, target_points, T1_samples, T2_samples, sample_point_idx=w_id)
+    if contact_term is not None:
+        if seed_term is not None and seed_term.branch is not None:
+            contact_term.inherited_branch = seed_term.branch
+        canonical_source = source_points if point_source_points is None else point_source_points
+        contact_term.prepare(transform_net.T1.detach(), transform_net.T2.detach(), canonical_source, weights)
+
+
+def _rebuild_contact(contact_term, transform_net, canonical_source):
+    if contact_term is not None and contact_term.branch is not None:
+        with torch.no_grad():
+            contact_term.rebuild(canonical_source, torch.sigmoid(transform_net.weight).reshape(-1))
+
+
+
+def _trace_snapshot(snaps, tag, epoch, transform_net, loss_computer=None):
+    """Audit: raw T1/T2 and loss terms (weighted and unweighted) at this point of the fit."""
+    if snaps is None:
+        return
+    with torch.no_grad():
+        T1 = _trace.to_numpy(transform_net.T1[0])
+        T2 = _trace.to_numpy(transform_net.T2[0])
+        w = _trace.to_numpy(torch.sigmoid(transform_net.weight).flatten())
+    terms = getattr(loss_computer, "_trace_terms", None) if loss_computer is not None else None
+    rec = dict(tag=tag, epoch=int(epoch), T1=T1.tolist(), T2=T2.tolist(),
+               T1_rigidity=_trace.matrix_rigidity(T1), T2_rigidity=_trace.matrix_rigidity(T2),
+               weight_mean=float(w.mean()) if w.size else None, weight_frac_part2=float((w > 0.5).mean()) if w.size else None)
+    if terms is not None:
+        W = terms["weights"]
+        unweighted = {k: (None if terms[k] is None else float(terms[k])) for k in
+                      ("main", "projection", "entropy", "smooth", "init", "extra", "total")}
+        weighted = dict(main=W["w_m"] * unweighted["main"], projection=W["w_p"] * unweighted["projection"],
+                        entropy=W["w_e"] * unweighted["entropy"], smooth=W["w_s"] * unweighted["smooth"],
+                        init=W["w_init"] * unweighted["init"], extra=unweighted["extra"])
+        rec.update(loss_unweighted=unweighted, loss_weighted=weighted, loss_weights={k: float(v) for k, v in W.items()})
+    snaps.append(rec)
+
+def solve_window_transformations(args, trajectories, init_point_seg_weights, point_indices, save_dir, first_frame, valid_seg_masks=None, factor=1.0, global_progress: float = 1.0,
+                                 seed_term=None, contact_term=None):
     """
     Solve transformations for a set of trajectories using TransNet.
     Args:
@@ -397,7 +492,9 @@ def solve_window_transformations(args, trajectories, init_point_seg_weights, poi
         save_dir,
     )
 
-    transform_net = Trans(
+    transform_net = make_trans(
+        getattr(args, "transform_parameterization", "matrix"),
+        pivot=trajs_tensor[:, 0, :3].mean(dim=0),
         num_points=trajs_tensor.shape[0],
         num_T=1,
         init_weights=init_point_seg_weights_np,
@@ -406,6 +503,9 @@ def solve_window_transformations(args, trajectories, init_point_seg_weights, poi
         cam_K=cam_K,
         device=device,
     ).to(device)
+    reinit_apply = bool(getattr(args, "transform_reinit_apply", False))
+    _snaps = [] if _trace.enabled() else None
+    _trace_snapshot(_snaps, "init", -1, transform_net)
 
     source_points = trajs_tensor[:, 0, :]
     target_points = trajs_tensor[:, 1, :]
@@ -439,8 +539,7 @@ def solve_window_transformations(args, trajectories, init_point_seg_weights, poi
     
 
     # First stage: optimize segmentation weights only.
-    transform_net.T1.requires_grad = False
-    transform_net.T2.requires_grad = False
+    transform_net.set_transforms_trainable(False)
 
     init_weights_tensor = init_point_seg_weights_tensor
     loss_computer = TransformLossComputer(
@@ -475,6 +574,8 @@ def solve_window_transformations(args, trajectories, init_point_seg_weights, poi
             neighbor_w=neighbor_w,
             valid_init_idx=valid_init_idx,
         )
+        if _snaps is not None and epoch in (0, seg_epochs - 1):
+            _trace_snapshot(_snaps, "seg_stage", epoch, transform_net, loss_computer)
         total_loss.backward()
         optimizer.step()
         pbar.set_postfix({
@@ -482,19 +583,29 @@ def solve_window_transformations(args, trajectories, init_point_seg_weights, poi
         })
         pbar.update(1)
 
+    # Optional priors: resolve the moving branch from the unconstrained fit before use.
+    if seed_term is not None or contact_term is not None:
+        _prepare_prior_terms(seed_term, contact_term, transform_net, source_points, target_points, T_id)
+
     # Second stage: joint optimization with transforms unfrozen.
-    transform_net.T1.requires_grad = True
-    transform_net.T2.requires_grad = True
+    transform_net.set_transforms_trainable(True)
     optimizer = Optimizer(transform_net, weight_lr=args.lr_w * factor, transform_lr=args.lr_T * factor, args=args)
 
     epoch_loss_list = []
+    prior_log = {}
 
     for epoch in range(args.solve_window_epochs):
         if epoch > 0 and epoch % 50 == 0 and epoch < 1000:
-            reinit_part_trans(transform_net, trajs_tensor, save_dir, epoch, factor)
+            _trace_snapshot(_snaps, "before_reinit", epoch, transform_net)
+            reinit_part_trans(transform_net, trajs_tensor, save_dir, epoch, factor, apply=reinit_apply)
+            _trace_snapshot(_snaps, "after_reinit", epoch, transform_net)
+            _rebuild_contact(contact_term, transform_net, source_points)
 
         optimizer.zero_grad()
         pred_T1, pred_T2, w_sel, blended = transform_net.forward_components(source_points, w_id, T_id)
+        extra_loss = None
+        if seed_term is not None or contact_term is not None:
+            extra_loss = _prior_extra_loss(seed_term, contact_term, transform_net, prior_log)
         total_loss, main_loss = loss_computer.compute_total_loss(
             pred_t1=pred_T1,
             pred_t2=pred_T2,
@@ -507,7 +618,10 @@ def solve_window_transformations(args, trajectories, init_point_seg_weights, poi
             knn_idx=knn_idx,
             neighbor_w=neighbor_w,
             valid_init_idx=valid_init_idx,
+            extra_loss=extra_loss,
         )
+        if _snaps is not None and (epoch % 50 == 0 or epoch == args.solve_window_epochs - 1):
+            _trace_snapshot(_snaps, "joint_stage", epoch, transform_net, loss_computer)
         total_loss.backward()
         optimizer.step()
 
@@ -523,11 +637,26 @@ def solve_window_transformations(args, trajectories, init_point_seg_weights, poi
         last_loss = avg_epoch_loss
     pbar.close()
 
+    if _snaps is not None:
+        _trace_snapshot(_snaps, "final", args.solve_window_epochs, transform_net)
+        _trace.event("solver_trace", local_file="estimotion_2part/solve_transformation.py",
+                     function="solve_window_transformations", coordinate_frame="camera_optical",
+                     transform_direction="frame_a_points_to_frame_b_points (source = trajectories[:,0], target = trajectories[:,1])",
+                     value=dict(snapshots=_snaps, parameterization=getattr(args, "transform_parameterization", "matrix"),
+                                reinit_apply=reinit_apply, num_points=int(trajs_tensor.shape[0]),
+                                seg_epochs=int(seg_epochs), joint_epochs=int(args.solve_window_epochs)),
+                     arrays=dict(init_weights=init_point_seg_weights_tensor,
+                                 final_weights=torch.sigmoid(transform_net.weight).detach().flatten()))
     with torch.no_grad():
         w_final = torch.sigmoid(transform_net.weight)
         T1_final = transform_net.T1[0].detach().cpu().numpy()
         T2_final = transform_net.T2[0].detach().cpu().numpy()
         final_point_seg_weights = w_final.flatten()
+    if contact_term is not None:
+        contact_term.finalize(transform_net.T1.detach(), transform_net.T2.detach())
+        contact_term.info["L_visual_final"] = float(last_loss)
+    if seed_term is not None:
+        seed_term.info.update({k: v for k, v in prior_log.items() if k == "L_seed"})
 
     if getattr(args, "debug", False) and save_dir and os.path.exists(os.path.dirname(save_dir)):
         init_save_dir = os.path.join(save_dir, 'part_init.png')
@@ -758,9 +887,14 @@ def compute_neighbors_from_feature_map(feature, rgb, point_indices, device, args
 
     return knn_idx, neighbor_w
 
-def joint_optimize_segmentation_and_transforms(args, point_trajectory_dict, all_transforms1, all_transforms2, device, cam_K, first_frame_weights=None, factor=1.0, global_progress: float = 1.0):
+def joint_optimize_segmentation_and_transforms(args, point_trajectory_dict, all_transforms1, all_transforms2, device, cam_K, first_frame_weights=None, factor=1.0, global_progress: float = 1.0,
+                                               seed_term=None, contact_term=None):
     """
     Joint optimization (no batching version). Optimize all points in a single forward per epoch.
+
+    Optional ``seed_term`` (per point key) and ``contact_term`` (one row per transform
+    ``T_id``, i.e. window frame ``T_id + 1``) add Phase B / Phase C priors; when the final
+    weights are reversed to match the first frame, their moving-branch identity is flipped.
     """
     point_keys = list(point_trajectory_dict.keys())
     if first_frame_weights is not None:
@@ -803,7 +937,9 @@ def joint_optimize_segmentation_and_transforms(args, point_trajectory_dict, all_
     T_id = point_to_frame_indices[:, 1].contiguous()
 
     num_points = len(point_keys)
-    transform_net = Trans(
+    transform_net = make_trans(
+        getattr(args, "transform_parameterization", "matrix"),
+        pivot=source_points_tensor.mean(dim=0) if source_points_tensor.shape[0] else None,
         num_points=num_points,
         num_T=num_T,
         init_weights=np.array(init_weights),
@@ -812,6 +948,7 @@ def joint_optimize_segmentation_and_transforms(args, point_trajectory_dict, all_
         cam_K=cam_K,
         device=device,
     ).to(device)
+    reinit_apply = bool(getattr(args, "transform_reinit_apply", False))
 
     # KNN (feature based if available)
     knn_idx = None
@@ -859,12 +996,26 @@ def joint_optimize_segmentation_and_transforms(args, point_trajectory_dict, all_
         invalid_loss_mode="l1",
     )
 
+    point_source_points = None
+    prior_log = {}
+    if seed_term is not None or contact_term is not None:
+        # Reference-frame (window frame 0) 3D position of each point key, aligned with weights.
+        point_source_points = torch.stack(
+            [point_trajectory_dict[key]["trajectories"][0][0, :3].to(device=device, dtype=torch.float32)
+             for key in point_keys], dim=0) if point_keys else torch.empty((0, 3), device=device)
+        _prepare_prior_terms(seed_term, contact_term, transform_net, source_points_tensor, target_points_tensor,
+                             T_id, w_id=w_id, point_source_points=point_source_points)
+
     for epoch in range(epochs):
         if epoch > 0 and epoch % 100 == 0 and epoch < 2000:
-            joint_reinit_part_trans(transform_net, all_trajectories_for_reinit)
+            joint_reinit_part_trans(transform_net, all_trajectories_for_reinit, apply=reinit_apply)
+            _rebuild_contact(contact_term, transform_net, point_source_points)
 
         optimizer.zero_grad()
         pred_T1, pred_T2, w_sel, blended = transform_net.forward_components(source_points_tensor, w_id, T_id)
+        extra_loss = None
+        if seed_term is not None or contact_term is not None:
+            extra_loss = _prior_extra_loss(seed_term, contact_term, transform_net, prior_log)
         total_loss, main_loss = loss_computer.compute_total_loss(
             pred_t1=pred_T1,
             pred_t2=pred_T2,
@@ -877,6 +1028,7 @@ def joint_optimize_segmentation_and_transforms(args, point_trajectory_dict, all_
             knn_idx=knn_idx,
             neighbor_w=neighbor_w,
             valid_init_idx=None,
+            extra_loss=extra_loss,
         )
         total_loss.backward()
         optimizer.step()
@@ -892,8 +1044,13 @@ def joint_optimize_segmentation_and_transforms(args, point_trajectory_dict, all_
 
     with torch.no_grad():
         final_weights = torch.sigmoid(transform_net.weight).cpu().numpy().flatten()
-        final_T1 = transform_net.T1.cpu().numpy()
-        final_T2 = transform_net.T2.cpu().numpy()
+        final_T1 = transform_net.T1.detach().cpu().numpy()
+        final_T2 = transform_net.T2.detach().cpu().numpy()
+    if contact_term is not None:
+        contact_term.finalize(transform_net.T1.detach(), transform_net.T2.detach())
+        contact_term.info["L_visual_final"] = float(main_loss.item()) if epochs > 0 else None
+    if seed_term is not None:
+        seed_term.info.update({k: v for k, v in prior_log.items() if k == "L_seed"})
 
     if first_frame_weights is not None:
         ref_weights_tensor = first_frame_weights.to(device=device, dtype=torch.float32)
@@ -904,5 +1061,8 @@ def joint_optimize_segmentation_and_transforms(args, point_trajectory_dict, all_
             print("Reversing segmentation weights to match first frame reference.", 'yellow')
             final_weights = 1 - final_weights
             final_T1, final_T2 = final_T2, final_T1
+            for term in (seed_term, contact_term):
+                if term is not None:
+                    term.swap_labels()
 
     return final_weights, final_T1, final_T2

@@ -16,6 +16,7 @@ if str(TRACKING_DIR) not in sys.path:
     sys.path.insert(0, str(TRACKING_DIR))
 
 from termcolor import cprint
+from samuele.debug_audit import trace as _trace
 from utils.utils import count_parameters
 import alltracker.utils.saveload
 import alltracker.utils.basic
@@ -122,6 +123,10 @@ class Tracker:
         combined_visibility = visibility & in_mask_from_coords
         always_visible = torch.all(combined_visibility, dim=0)  # Shape: (H, W)
         y_indices, x_indices = torch.where(always_visible)
+        _tr = {} if _trace.enabled() else None   # audit trace (read-only copies; no behaviour change)
+        if _tr is not None:
+            _tr.update(vis_all=torch.all(visibility, dim=0), mask_all=torch.all(in_mask_from_coords, dim=0),
+                       mask_frame0=in_mask_from_coords[0], cand_y=y_indices, cand_x=x_indices)
 
         if y_indices.numel() == 0:
             empty_xyz = coords_4d.new_zeros((0, T, 3))
@@ -141,6 +146,9 @@ class Tracker:
             dim=1,
         )
 
+        if _tr is not None:
+            _tr.update(depth_in_range=all_in_range, cand_z=depth_values,
+                       cand_finite=torch.isfinite(depth_values).all(dim=1))
         y_indices = y_indices[all_in_range]
         x_indices = x_indices[all_in_range]
         coords_points = coords_points[all_in_range]
@@ -151,18 +159,37 @@ class Tracker:
         filter_ratio = 0.0
         filtered_count = int(trajectories.shape[0])
 
+        part_aware = getattr(args, "track_filter_mode", "global") == "part_aware"
+        part_weights = None
         # Add spatial-distance filtering; keep this robust without early returns or exceptions.
-        if trajectories.shape[0] > 0 and T >= 2:
+        if trajectories.shape[0] > 0 and T >= 2 and part_aware:
+            # Two rigid hypotheses instead of the global 2-sigma displacement filter
+            # (tracking/part_aware_track_filter.py); the density filter below is unchanged.
+            from tracking.part_aware_track_filter import part_aware_filter
             original_count = int(trajectories.shape[0])
+            keep_pa, part_weights, pa_info = part_aware_filter(trajectories[:, [0, -1], :3])
+            cprint(f"  Part-aware filter: {pa_info.get('candidates')} -> {pa_info.get('kept', original_count)} "
+                   f"({pa_info.get('hypotheses')} motions, {pa_info.get('ambiguous', 0)} ambiguous)", "yellow")
+            if keep_pa.any():
+                trajectories = trajectories[keep_pa]
+                y_indices = y_indices[keep_pa]
+                x_indices = x_indices[keep_pa]
+                part_weights = part_weights[keep_pa]
+        if trajectories.shape[0] > 0 and T >= 2:
+            if not part_aware:
+                original_count = int(trajectories.shape[0])
             # Mean adjacent-frame 3D displacement for each trajectory.
             delta_xyz = trajectories[:, 1:, :3] - trajectories[:, :-1, :3]
             distances = torch.linalg.norm(delta_xyz, dim=2).mean(dim=1)
 
-            if distances.numel() > 1:
+            if distances.numel() > 1 and not part_aware:
                 mean = distances.mean()
                 std = distances.std(unbiased=False)
                 std_threshold = 2.0 * std
                 valid_mask_std = torch.abs(distances - mean) <= std_threshold
+                if _tr is not None:
+                    _tr.update(global_keep=valid_mask_std, global_applied=bool(valid_mask_std.any()),
+                               global_mean=mean, global_std=std, endpoint_xyz=trajectories[:, [0, -1], :3])
                 if valid_mask_std.any():
                     trajectories = trajectories[valid_mask_std]
                     y_indices = y_indices[valid_mask_std]
@@ -188,22 +215,40 @@ class Tracker:
                     else:
                         thr = torch.topk(local_cnt, k=required_keep, largest=True).values[-1]
                         keep = local_cnt >= thr
+                if _tr is not None:
+                    _tr.update(density_keep=keep, density_applied=bool(keep.any()), density_count=local_cnt)
                 if keep.any():
                     trajectories = trajectories[keep]
                     y_indices = y_indices[keep]
                     x_indices = x_indices[keep]
+                    if part_weights is not None:
+                        part_weights = part_weights[keep]
 
             filtered_count = int(trajectories.shape[0])
             if original_count > 0:
                 filter_ratio = (original_count - filtered_count) / original_count
                 cprint(f"  Prefilter: {original_count} -> {filtered_count} trajectories (ratio={filter_ratio:.6f})", "yellow")
 
+        if _tr is not None:
+            arrays = {k: v for k, v in _tr.items() if k not in ("global_applied", "density_applied", "global_mean", "global_std")}
+            arrays.update(final_y=y_indices, final_x=x_indices)
+            _trace.event("track_filter_stages", local_file="tracking/tracker_toolkit.py", function="get_visible_trajectories",
+                         coordinate_frame="camera_optical", arrays=arrays,
+                         value=dict(H=H, W=W, T=T, track_filter_mode=getattr(args, "track_filter_mode", "global"),
+                                    visibility_threshold=float(args.visibility_threshold), min_depth=float(args.min_depth),
+                                    max_depth=float(args.max_depth), always_visible=int(_tr["cand_y"].numel()),
+                                    in_depth_range=int(_tr["depth_in_range"].sum()) if "depth_in_range" in _tr else None,
+                                    global_applied=_tr.get("global_applied"), global_mean=_tr.get("global_mean"),
+                                    global_std=_tr.get("global_std"), density_applied=_tr.get("density_applied"),
+                                    final=int(trajectories.shape[0])))
         # Keep return signature unchanged: 3rd output is an auxiliary per-point weight tensor.
         aux_weights = torch.ones(
             (trajectories.shape[0], trajectories.shape[1]),
             dtype=trajectories.dtype,
             device=trajectories.device,
         )
+        if part_weights is not None:  # part_aware: 1 = one motion explains it, 0.5 = ambiguous
+            aux_weights = aux_weights * part_weights.to(aux_weights.dtype)[:, None]
         return trajectories[:, :, :3], (y_indices, x_indices), aux_weights, filter_ratio, filtered_count
 
     def get_4d_traj_maps(self, images_window_dict, traj_maps_e, visconf_maps_e):

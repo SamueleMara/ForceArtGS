@@ -37,6 +37,34 @@ TRACKING_DEFAULTS = {
     "w_p": 0.0,
     "w_m": 200.0,
     "w_e": -0.01,
+    # Rigid-motion corrections (docs/multiview_root_cause_black_box.md, follow-up).  Defaults keep the
+    # legacy behaviour bit-identical.
+    "transform_parameterization": "matrix",   # "se3": optimise T1/T2 as T = C Exp(xi) C^-1 T_init
+    "transform_reinit_apply": False,          # legacy re-init writes into temporary views (no effect)
+    "track_filter_mode": "global",            # "part_aware": two rigid hypotheses instead of the 2-sigma filter
+    # Robot-TCP contact phases (docs/tcp_contact_tracking.md).  All OFF by default; physical
+    # tolerances/weights are null and must be configured explicitly when a phase is enabled.
+    "tcp_supervision_enabled": False,          # Phase A
+    "moving_prompt_enabled": False,            # Phase B
+    "contact_surface_enabled": False,          # Phase C
+    "contact_multiview_refine_enabled": False,  # optional Phase C substage (not implemented)
+    "tcp_contact_artifact": None,              # default <dataset>/metadata/tcp_contact
+    "moving_prompt_artifact": None,            # default <dataset>/metadata/moving_prompts/moving_seed_maps.npz
+    "tool_contact_geometry": None,             # consumed by samuele/tcp_contact_evidence.py
+    "tcp_track_correction_mode": "diagnostic_only",  # or adaptive_requery
+    "tcp_track_point": "tcp",                  # or secondary_feature (calibrated tool-fixed point)
+    "tcp_visibility_depth_tol_m": None,
+    "tcp_sigma_px": None,
+    "tcp_requery_error_px": None,
+    "tcp_requery_max_retries": 2,              # bounded retry safeguard, not a physical threshold
+    "tcp_requery_persistence_frames": 1,       # consecutive valid failures before a split
+    "moving_prompt_weight": 0.0,
+    "moving_prompt_min_seeds": 1,
+    "contact_surface_weight": 0.0,
+    "contact_sigma_m": None,
+    "contact_robust_delta_m": None,
+    "contact_support_max_distance_m": None,
+    "contact_exclude_tool_radius_m": None,      # Phase C: drop canonical support inside the tool cylinder
 }
 
 PREPROCESS_DEFAULTS = {

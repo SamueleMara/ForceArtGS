@@ -1,0 +1,62 @@
+# Opt-in robot-TCP contact phases for FreeArtGS tracking (docs/tcp_contact_tracking.md).
+#
+# Use with:  python pipelines/train_local_datasets.py ... --tracking-overrides <copy-of-this-file>.yaml
+# or merge the `tracking:` section into a per-camera pipeline config.
+#
+# Every physical tolerance / weight below is deliberately null.  Fill them from your own
+# calibration or measurement before enabling a phase; an enabled phase with a missing value
+# fails with a clear error instead of guessing.  Enable ONE phase at a time for ablations.
+
+tracking:
+  tcp_supervision_enabled: false        # Phase A: raw-tracker TCP diagnostic / adaptive requery
+  moving_prompt_enabled: false          # Phase B: contact-guided moving-part seeds
+  contact_surface_enabled: false        # Phase C: sliding contact-to-moving-surface loss
+  contact_multiview_refine_enabled: false  # optional Phase C post-ICP stage: NOT implemented (fails if true)
+
+  tcp_contact_artifact: null            # default: <dataset>/metadata/tcp_contact
+  moving_prompt_artifact: null          # default: <dataset>/metadata/moving_prompts/moving_seed_maps.npz
+  tool_contact_geometry: null           # JSON with calibrated contact_point_local_tool_m (see docs)
+
+  # Phase A
+  tcp_track_correction_mode: diagnostic_only   # or adaptive_requery
+  tcp_track_point: tcp                  # or secondary_feature (calibrated tool-fixed point in tool geometry)
+  tcp_visibility_depth_tol_m: null      # REQUIRED for A: depth agreement for "TCP visible" (m)
+  tcp_sigma_px: null                    # optional: pixel noise for the robust E_tcp score
+  tcp_requery_error_px: null            # REQUIRED for adaptive_requery: pixel tolerance
+  tcp_requery_max_retries: 2            # bounded retry safeguard (count)
+  tcp_requery_persistence_frames: 1     # consecutive valid failures before a split (count)
+
+  # Phase B
+  moving_prompt_weight: 0.0             # REQUIRED > 0 for B
+  moving_prompt_min_seeds: 1            # minimum seed tracks to resolve the moving branch (count)
+
+  # Phase C
+  contact_surface_weight: 0.0           # REQUIRED > 0 for C
+  contact_sigma_m: null                 # REQUIRED: contact uncertainty (enlarge if contact point uncalibrated)
+  contact_robust_delta_m: null          # REQUIRED: Huber transition (m)
+  contact_support_max_distance_m: null  # REQUIRED: reject contact samples with no observed moving surface nearby
+
+# Shared adapter inputs (samuele/tcp_contact_evidence.py), used when any phase is enabled.
+tcp_contact_evidence:
+  contact_file: null        # REQUIRED for B/C: "force" (derive from the recorded wrench) or a JSON/CSV path
+  tool_geometry: null       # same as tracking.tool_contact_geometry (either may be set)
+  pose_archive: null        # default <scene>/metadata/robot_poses/poses_rgbd.npz
+  parquet_python: null      # Python with polars; derive TCP from raw Parquet if no pose archive
+  calibration_map: null     # e.g. configs/real_robot_pose_calibration.json instead of robot_tool.json
+
+# Phase B prompt generation (samuele/contact_moving_part_prompts.py).
+contact_moving_prompts:
+  search_radius_m: null     # REQUIRED for B: 3D search radius around the contact point
+  depth_margin_m: null      # REQUIRED for B: tool-pixel depth agreement / occluder margin
+  max_positive: 5           # max positive prompt pixels per frame (count)
+  tool_exclusion_radius_m: null  # optional: tool radius + calibration uncertainty around the tool axis
+  tool_exclusion_start_m: null   # optional: where that cylinder starts along the axis (negative: covers the tip)
+
+# Automatic contact from the recorded wrench (contact_file: force). Defaults shown; see docs.
+force_contact:
+  baseline_duration_s: 0.5  # contact-free start used for tare and noise
+  contact_z: 6.0            # noise-normalised force for confirmed contact
+  absent_z: 3.0             # at or below: confirmed absence; in between: uncertain
+  min_contact_duration_s: 0.2
+  tool_mass_kg: null        # enables gravity compensation when the EE rotates
+  corrections: null         # optional manual corrections JSON (provenance + reasons)

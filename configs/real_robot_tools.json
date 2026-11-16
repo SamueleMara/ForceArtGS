@@ -1,0 +1,974 @@
+{
+  "schema_version": 1,
+  "description": "Explicit tool assignments for 118 real scenes. Three early white-drawer recordings have a different, uncalibrated mounting; their nominal tool transform is retained for provenance and must not be used. Unknown recordings have no default tool.",
+  "reference_assumption": "Transforms are applied to the recorded Cartesian EE pose as requested. Bare contact calibration reference is assumed to coincide with that EE reference. Absolute link_6-to-tip validity requires the bare contact point to coincide with the link_6 origin; this has not been independently established.",
+  "transform_convention": "T_base_tcp = T_base_recorded_ee @ T_ee_tcp; p_base_tcp = p_base_ee + R_base_ee @ t_ee_tcp",
+  "table_height_shift_applied": false,
+  "contact_force_convention": {
+    "schema_version": 1,
+    "confirmation_source": "Operator confirmation on 2026-11-13",
+    "recorded_quantity": "contact_reaction_force_on_robot",
+    "force_exerted_by": "object",
+    "force_acting_on": "robot",
+    "physical_application_point": "robot-object contact point",
+    "units": "N",
+    "recorded_force_fields": ["Fx_N", "Fy_N", "Fz_N", "force_N"],
+    "derived_force_fields_with_same_reaction_sign": ["force_sensor_N", "force_ee_N", "force_base_N", "force_camera_N", "force_tangent_base_N", "force_perpendicular_base_N"],
+    "object_side_quantity": "force_exerted_by_robot_on_object",
+    "object_side_force_multiplier": -1,
+    "object_side_force_equation": "F_robot_on_object_A = -F_object_on_robot_A",
+    "frame_requirement": "Both forces must be expressed in the same coordinate frame A at the same contact and time; retain the existing wrench_frame axis mapping",
+    "automatic_sign_reversal_applied": false,
+    "existing_visualizations_show": "robot-side contact reaction, as recorded",
+    "signed_tangential_force_on_object": "negative of the robot-side signed tangential force for the same trajectory tangent",
+    "force_norm_and_absolute_tangential_percentage": "unchanged by action-reaction sign reversal",
+    "scope": "Force-vector sign semantics only; no change to measurements, calibration, tare/gravity processing or torque origin/transport conventions"
+  },
+  "tools": {
+    "bare_force_sensor": {
+      "T_ee_tcp": [
+        [
+          1,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          1,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          1,
+          0.03487365
+        ],
+        [
+          0,
+          0,
+          0,
+          1
+        ]
+      ],
+      "translation_units": "m",
+      "offset_axis": "EE-local +Z",
+      "orientation": "TCP axes equal EE axes",
+      "calibration_source": "User-provided contact calibration"
+    },
+    "pointed_tip": {
+      "T_ee_tcp": [
+        [
+          1,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          1,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          1,
+          0.1876174
+        ],
+        [
+          0,
+          0,
+          0,
+          1
+        ]
+      ],
+      "translation_units": "m",
+      "offset_axis": "EE-local +Z",
+      "orientation": "TCP axes equal EE axes",
+      "calibration_source": "User-provided contact calibration"
+    }
+  },
+  "datasets": {
+    "black_box_20261021_161154_episode_000003": {
+      "tool": "pointed_tip",
+      "source_recording": "dataset_fridge_plastic_depth_20261021_161154",
+      "episode": 3,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "black_monitor_20261021_161154_episode_000005": {
+      "tool": "pointed_tip",
+      "source_recording": "dataset_fridge_plastic_depth_20261021_161154",
+      "episode": 5,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "dog_20261022_185923_episode_000000": {
+      "tool": "pointed_tip",
+      "source_recording": "dataset_dog_20261022_185923",
+      "episode": 0,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_box_episode_000000": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_box",
+      "episode": 0,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_box_episode_000001": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_box",
+      "episode": 1,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_box_episode_000002": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_box",
+      "episode": 2,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_box_episode_000003": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_box",
+      "episode": 3,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_box_episode_000004": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_box",
+      "episode": 4,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_box_episode_000005": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_box",
+      "episode": 5,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_box_episode_000006": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_box",
+      "episode": 6,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_box_episode_000007": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_box",
+      "episode": 7,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_box_episode_000008": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_box",
+      "episode": 8,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_box_episode_000009": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_box",
+      "episode": 9,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_box_episode_000010": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_box",
+      "episode": 10,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_box_episode_000011": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_box",
+      "episode": 11,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_laptop_episode_000000": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_laptop",
+      "episode": 0,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_laptop_episode_000001": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_laptop",
+      "episode": 1,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_laptop_episode_000002": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_laptop",
+      "episode": 2,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_laptop_episode_000003": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_laptop",
+      "episode": 3,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_laptop_episode_000004": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_laptop",
+      "episode": 4,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_laptop_episode_000005": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_laptop",
+      "episode": 5,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_laptop_episode_000006": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_laptop",
+      "episode": 6,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_laptop_episode_000007": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_laptop",
+      "episode": 7,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_laptop_episode_000008": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_laptop",
+      "episode": 8,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_laptop_episode_000009": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_laptop",
+      "episode": 9,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_laptop_episode_000010": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_laptop",
+      "episode": 10,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_black_laptop_episode_000011": {
+      "tool": "pointed_tip",
+      "source_recording": "final_black_laptop",
+      "episode": 11,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_light_blue_box_episode_000000": {
+      "tool": "pointed_tip",
+      "source_recording": "final_light_blue_box",
+      "episode": 0,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_light_blue_box_episode_000001": {
+      "tool": "pointed_tip",
+      "source_recording": "final_light_blue_box",
+      "episode": 1,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_light_blue_box_episode_000002": {
+      "tool": "pointed_tip",
+      "source_recording": "final_light_blue_box",
+      "episode": 2,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_light_blue_box_episode_000003": {
+      "tool": "pointed_tip",
+      "source_recording": "final_light_blue_box",
+      "episode": 3,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_light_blue_box_episode_000004": {
+      "tool": "pointed_tip",
+      "source_recording": "final_light_blue_box",
+      "episode": 4,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_light_blue_box_episode_000005": {
+      "tool": "pointed_tip",
+      "source_recording": "final_light_blue_box",
+      "episode": 5,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_light_blue_box_episode_000006": {
+      "tool": "pointed_tip",
+      "source_recording": "final_light_blue_box",
+      "episode": 6,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_light_blue_box_episode_000007": {
+      "tool": "pointed_tip",
+      "source_recording": "final_light_blue_box",
+      "episode": 7,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_light_blue_box_episode_000008": {
+      "tool": "pointed_tip",
+      "source_recording": "final_light_blue_box",
+      "episode": 8,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_light_blue_box_episode_000009": {
+      "tool": "pointed_tip",
+      "source_recording": "final_light_blue_box",
+      "episode": 9,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_light_blue_box_episode_000010": {
+      "tool": "pointed_tip",
+      "source_recording": "final_light_blue_box",
+      "episode": 10,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_light_blue_box_episode_000011": {
+      "tool": "pointed_tip",
+      "source_recording": "final_light_blue_box",
+      "episode": 11,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_matchbox_episode_000000": {
+      "tool": "pointed_tip",
+      "source_recording": "final_matchbox",
+      "episode": 0,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_matchbox_episode_000001": {
+      "tool": "pointed_tip",
+      "source_recording": "final_matchbox",
+      "episode": 1,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_matchbox_episode_000002": {
+      "tool": "pointed_tip",
+      "source_recording": "final_matchbox",
+      "episode": 2,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_matchbox_episode_000003": {
+      "tool": "pointed_tip",
+      "source_recording": "final_matchbox",
+      "episode": 3,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_matchbox_episode_000004": {
+      "tool": "pointed_tip",
+      "source_recording": "final_matchbox",
+      "episode": 4,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_matchbox_episode_000005": {
+      "tool": "pointed_tip",
+      "source_recording": "final_matchbox",
+      "episode": 5,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_matchbox_episode_000006": {
+      "tool": "pointed_tip",
+      "source_recording": "final_matchbox",
+      "episode": 6,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_matchbox_episode_000007": {
+      "tool": "pointed_tip",
+      "source_recording": "final_matchbox",
+      "episode": 7,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_matchbox_episode_000008": {
+      "tool": "pointed_tip",
+      "source_recording": "final_matchbox",
+      "episode": 8,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_matchbox_episode_000009": {
+      "tool": "pointed_tip",
+      "source_recording": "final_matchbox",
+      "episode": 9,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_matchbox_episode_000010": {
+      "tool": "pointed_tip",
+      "source_recording": "final_matchbox",
+      "episode": 10,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_matchbox_episode_000011": {
+      "tool": "pointed_tip",
+      "source_recording": "final_matchbox",
+      "episode": 11,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_matchbox_episode_000012": {
+      "tool": "pointed_tip",
+      "source_recording": "final_matchbox",
+      "episode": 12,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_matchbox_episode_000013": {
+      "tool": "pointed_tip",
+      "source_recording": "final_matchbox",
+      "episode": 13,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_matchbox_episode_000014": {
+      "tool": "pointed_tip",
+      "source_recording": "final_matchbox",
+      "episode": 14,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_matchbox_episode_000015": {
+      "tool": "pointed_tip",
+      "source_recording": "final_matchbox",
+      "episode": 15,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_matchbox_episode_000016": {
+      "tool": "pointed_tip",
+      "source_recording": "final_matchbox",
+      "episode": 16,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_orange_suitecase_episode_000000": {
+      "tool": "pointed_tip",
+      "source_recording": "final_orange_suitecase",
+      "episode": 0,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_orange_suitecase_episode_000001": {
+      "tool": "pointed_tip",
+      "source_recording": "final_orange_suitecase",
+      "episode": 1,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_orange_suitecase_episode_000002": {
+      "tool": "pointed_tip",
+      "source_recording": "final_orange_suitecase",
+      "episode": 2,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_orange_suitecase_episode_000003": {
+      "tool": "pointed_tip",
+      "source_recording": "final_orange_suitecase",
+      "episode": 3,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_orange_suitecase_episode_000004": {
+      "tool": "pointed_tip",
+      "source_recording": "final_orange_suitecase",
+      "episode": 4,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_orange_suitecase_episode_000005": {
+      "tool": "pointed_tip",
+      "source_recording": "final_orange_suitecase",
+      "episode": 5,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_orange_suitecase_episode_000006": {
+      "tool": "pointed_tip",
+      "source_recording": "final_orange_suitecase",
+      "episode": 6,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_orange_suitecase_episode_000007": {
+      "tool": "pointed_tip",
+      "source_recording": "final_orange_suitecase",
+      "episode": 7,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_orange_suitecase_episode_000008": {
+      "tool": "pointed_tip",
+      "source_recording": "final_orange_suitecase",
+      "episode": 8,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_orange_suitecase_episode_000009": {
+      "tool": "pointed_tip",
+      "source_recording": "final_orange_suitecase",
+      "episode": 9,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_orange_suitecase_episode_000010": {
+      "tool": "pointed_tip",
+      "source_recording": "final_orange_suitecase",
+      "episode": 10,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_orange_suitecase_episode_000011": {
+      "tool": "pointed_tip",
+      "source_recording": "final_orange_suitecase",
+      "episode": 11,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_red_fridge_episode_000000": {
+      "tool": "pointed_tip",
+      "source_recording": "final_red_fridge",
+      "episode": 0,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_red_fridge_episode_000001": {
+      "tool": "pointed_tip",
+      "source_recording": "final_red_fridge",
+      "episode": 1,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_red_fridge_episode_000002": {
+      "tool": "pointed_tip",
+      "source_recording": "final_red_fridge",
+      "episode": 2,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_red_fridge_episode_000003": {
+      "tool": "pointed_tip",
+      "source_recording": "final_red_fridge",
+      "episode": 3,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_red_fridge_episode_000004": {
+      "tool": "pointed_tip",
+      "source_recording": "final_red_fridge",
+      "episode": 4,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_red_fridge_episode_000005": {
+      "tool": "pointed_tip",
+      "source_recording": "final_red_fridge",
+      "episode": 5,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_red_fridge_episode_000006": {
+      "tool": "pointed_tip",
+      "source_recording": "final_red_fridge",
+      "episode": 6,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_red_fridge_episode_000007": {
+      "tool": "pointed_tip",
+      "source_recording": "final_red_fridge",
+      "episode": 7,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_red_fridge_episode_000008": {
+      "tool": "pointed_tip",
+      "source_recording": "final_red_fridge",
+      "episode": 8,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_red_fridge_episode_000009": {
+      "tool": "pointed_tip",
+      "source_recording": "final_red_fridge",
+      "episode": 9,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_red_fridge_episode_000010": {
+      "tool": "pointed_tip",
+      "source_recording": "final_red_fridge",
+      "episode": 10,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_red_fridge_episode_000011": {
+      "tool": "pointed_tip",
+      "source_recording": "final_red_fridge",
+      "episode": 11,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_red_fridge_episode_000012": {
+      "tool": "pointed_tip",
+      "source_recording": "final_red_fridge",
+      "episode": 12,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_red_fridge_episode_000013": {
+      "tool": "pointed_tip",
+      "source_recording": "final_red_fridge",
+      "episode": 13,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_robot_dog_episode_000000": {
+      "tool": "pointed_tip",
+      "source_recording": "final_robot_dog",
+      "episode": 0,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_robot_dog_episode_000001": {
+      "tool": "pointed_tip",
+      "source_recording": "final_robot_dog",
+      "episode": 1,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_robot_dog_episode_000002": {
+      "tool": "pointed_tip",
+      "source_recording": "final_robot_dog",
+      "episode": 2,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_robot_dog_episode_000003": {
+      "tool": "pointed_tip",
+      "source_recording": "final_robot_dog",
+      "episode": 3,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_robot_dog_episode_000004": {
+      "tool": "pointed_tip",
+      "source_recording": "final_robot_dog",
+      "episode": 4,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_robot_dog_episode_000005": {
+      "tool": "pointed_tip",
+      "source_recording": "final_robot_dog",
+      "episode": 5,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_robot_dog_episode_000006": {
+      "tool": "pointed_tip",
+      "source_recording": "final_robot_dog",
+      "episode": 6,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_robot_dog_episode_000007": {
+      "tool": "pointed_tip",
+      "source_recording": "final_robot_dog",
+      "episode": 7,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_robot_dog_episode_000008": {
+      "tool": "pointed_tip",
+      "source_recording": "final_robot_dog",
+      "episode": 8,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_robot_dog_episode_000009": {
+      "tool": "pointed_tip",
+      "source_recording": "final_robot_dog",
+      "episode": 9,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_robot_dog_episode_000010": {
+      "tool": "pointed_tip",
+      "source_recording": "final_robot_dog",
+      "episode": 10,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_robot_dog_episode_000011": {
+      "tool": "pointed_tip",
+      "source_recording": "final_robot_dog",
+      "episode": 11,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_robot_dog_episode_000012": {
+      "tool": "pointed_tip",
+      "source_recording": "final_robot_dog",
+      "episode": 12,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_robot_dog_episode_000013": {
+      "tool": "pointed_tip",
+      "source_recording": "final_robot_dog",
+      "episode": 13,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_robot_dog_episode_000014": {
+      "tool": "pointed_tip",
+      "source_recording": "final_robot_dog",
+      "episode": 14,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_robot_dog_episode_000015": {
+      "tool": "pointed_tip",
+      "source_recording": "final_robot_dog",
+      "episode": 15,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_robot_dog_episode_000016": {
+      "tool": "pointed_tip",
+      "source_recording": "final_robot_dog",
+      "episode": 16,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_robot_dog_episode_000017": {
+      "tool": "pointed_tip",
+      "source_recording": "final_robot_dog",
+      "episode": 17,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_robot_dog_episode_000018": {
+      "tool": "pointed_tip",
+      "source_recording": "final_robot_dog",
+      "episode": 18,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_wooden_box_episode_000000": {
+      "tool": "pointed_tip",
+      "source_recording": "final_wooden_box",
+      "episode": 0,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_wooden_box_episode_000001": {
+      "tool": "pointed_tip",
+      "source_recording": "final_wooden_box",
+      "episode": 1,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_wooden_box_episode_000002": {
+      "tool": "pointed_tip",
+      "source_recording": "final_wooden_box",
+      "episode": 2,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_wooden_box_episode_000003": {
+      "tool": "pointed_tip",
+      "source_recording": "final_wooden_box",
+      "episode": 3,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_wooden_box_episode_000004": {
+      "tool": "pointed_tip",
+      "source_recording": "final_wooden_box",
+      "episode": 4,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_wooden_box_episode_000005": {
+      "tool": "pointed_tip",
+      "source_recording": "final_wooden_box",
+      "episode": 5,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_wooden_box_episode_000006": {
+      "tool": "pointed_tip",
+      "source_recording": "final_wooden_box",
+      "episode": 6,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_wooden_box_episode_000007": {
+      "tool": "pointed_tip",
+      "source_recording": "final_wooden_box",
+      "episode": 7,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_wooden_box_episode_000008": {
+      "tool": "pointed_tip",
+      "source_recording": "final_wooden_box",
+      "episode": 8,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_wooden_box_episode_000009": {
+      "tool": "pointed_tip",
+      "source_recording": "final_wooden_box",
+      "episode": 9,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_wooden_box_episode_000010": {
+      "tool": "pointed_tip",
+      "source_recording": "final_wooden_box",
+      "episode": 10,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "final_wooden_box_episode_000011": {
+      "tool": "pointed_tip",
+      "source_recording": "final_wooden_box",
+      "episode": 11,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "fridge_plastic_20261016_163314": {
+      "tool": "pointed_tip",
+      "source_recording": "dataset_fridge_plastic_depth_20261016_163314",
+      "episode": 0,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "laptop_20261021_161154_episode_000004": {
+      "tool": "pointed_tip",
+      "source_recording": "dataset_fridge_plastic_depth_20261021_161154",
+      "episode": 4,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link"
+    },
+    "white_drawer_20261021_161154_episode_000000": {
+      "tool": "bare_force_sensor",
+      "source_recording": "dataset_fridge_plastic_depth_20261021_161154",
+      "episode": 0,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link",
+      "mounting_id": "white_drawer_early_mounting",
+      "tcp_calibration_valid": false,
+      "calibration_status": "UNVERIFIED_DIFFERENT_MOUNTING",
+      "wrench_frame": {
+        "axes": "unspecified",
+        "R_ee_force_sensor": null,
+        "alignment_source": "User confirmed different mounting for these three drawer recordings on 2026-11-12; old transform unknown",
+        "torque_origin": "recorded_origin_unspecified",
+        "tcp_torque_transport_applied": false
+      }
+    },
+    "white_drawer_20261021_161154_episode_000001": {
+      "tool": "bare_force_sensor",
+      "source_recording": "dataset_fridge_plastic_depth_20261021_161154",
+      "episode": 1,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link",
+      "mounting_id": "white_drawer_early_mounting",
+      "tcp_calibration_valid": false,
+      "calibration_status": "UNVERIFIED_DIFFERENT_MOUNTING",
+      "wrench_frame": {
+        "axes": "unspecified",
+        "R_ee_force_sensor": null,
+        "alignment_source": "User confirmed different mounting for these three drawer recordings on 2026-11-12; old transform unknown",
+        "torque_origin": "recorded_origin_unspecified",
+        "tcp_torque_transport_applied": false
+      }
+    },
+    "white_drawer_20261021_161154_episode_000002": {
+      "tool": "bare_force_sensor",
+      "source_recording": "dataset_fridge_plastic_depth_20261021_161154",
+      "episode": 2,
+      "recorded_pose_frame": "ee",
+      "coordinate_frame": "base_link",
+      "mounting_id": "white_drawer_early_mounting",
+      "tcp_calibration_valid": false,
+      "calibration_status": "UNVERIFIED_DIFFERENT_MOUNTING",
+      "wrench_frame": {
+        "axes": "unspecified",
+        "R_ee_force_sensor": null,
+        "alignment_source": "User confirmed different mounting for these three drawer recordings on 2026-11-12; old transform unknown",
+        "torque_origin": "recorded_origin_unspecified",
+        "tcp_torque_transport_applied": false
+      }
+    }
+  },
+  "wrench_frame": {
+    "axes": "ee",
+    "R_ee_force_sensor": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        0,
+        1
+      ]
+    ],
+    "alignment_source": "User confirmation: force sensor axes are the same as EE axes",
+    "torque_origin": "recorded_origin_unspecified; not assumed to coincide with TCP",
+    "tcp_torque_transport_applied": false
+  }
+}
