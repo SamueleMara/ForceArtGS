@@ -1,0 +1,11 @@
+# Real final_* sessions: calibrated joint-aware Phase 1 with TCP contact.
+# Contact-surface tolerance = 2 cm: the TCP projection audit (outputs/tcp_projection_audit_20261116_200632)
+# found the registered cameras + nominal TCP consistent with observed geometry to ~1-2 cm in cam_001/002,
+# accepted as the TCP uncertainty. Cameras are chosen per scene on the command line (--cameras).
+joint_discovery:
+  mode: calibrated_joint_aware
+  cameras: [cam_001, cam_002]
+  enable_tcp_contact: true
+  require_calibrated_wrench: true   # recorded wrench has no declared tare/gravity compensation
+  contact:
+    surface_max_distance_m: 0.02

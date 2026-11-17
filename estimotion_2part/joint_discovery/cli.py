@@ -441,6 +441,38 @@ def _merge_same_camera(parts):
                              **{k: np.concatenate(v) for k, v in kw.items()})
 
 
+def build_robot_archive(scene, output):
+    """Write ``T_base_ee``, ``T_base_tcp = T_base_ee @ T_ee_tcp``, ``source_row`` and raw ``wrench``.
+
+    Reads ``metadata/raw/*.parquet`` (``observation.state`` = EE position + rotation vector,
+    ``observation.wrench`` = recorded wrench in EE axes) and ``metadata/robot_tool.json``.
+    Refuses scenes whose TCP calibration is marked invalid. Nothing is interpolated."""
+    import glob
+    import polars as pl
+    from scipy.spatial.transform import Rotation
+    scene = Path(scene)
+    tool = json.loads((scene / "metadata" / "robot_tool.json").read_text())
+    if tool.get("tcp_calibration_valid") is False:
+        raise SystemExit(f"{scene.name}: robot_tool.json marks the TCP calibration invalid; refusing to build a TCP archive")
+    if tool.get("recorded_pose_frame", "ee") != "ee":
+        raise SystemExit(f"{scene.name}: recorded pose frame {tool.get('recorded_pose_frame')!r} is not 'ee'")
+    files = sorted(glob.glob(str(scene / "metadata" / "raw" / "*.parquet")))
+    if len(files) != 1:
+        raise SystemExit(f"{scene.name}: expected one raw Parquet, found {len(files)}")
+    df = pl.read_parquet(files[0])
+    st = np.stack(df["observation.state"].to_list()).astype(float)
+    wr = np.stack(df["observation.wrench"].to_list()).astype(float)
+    T_ee = np.tile(np.eye(4), (len(st), 1, 1))
+    T_ee[:, :3, :3] = Rotation.from_rotvec(st[:, 3:6]).as_matrix()
+    T_ee[:, :3, 3] = st[:, :3]
+    T_ee_tcp = np.asarray(tool["T_ee_tcp"], float)
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(output, T_base_ee=T_ee, T_base_tcp=T_ee @ T_ee_tcp, source_row=df["frame_index"].to_numpy(),
+             wrench=wr[:, :6])
+    _log(f"robot archive: {len(st)} rows, tool {tool.get('tool')}, T_ee_tcp z {T_ee_tcp[2, 3]:.4f} m -> {output}")
+
+
 def summarize_runs(runs, ref_axis=None, ref_point=None) -> str:
     from .rigid_kinematics import axis_angle_deg, line_to_line_distance
     head = ("| run | cameras | depth | decision | z(R vs P) | z(R vs static) | z(P vs static) | R arc [deg] | "
@@ -509,6 +541,9 @@ def main(argv=None):
     f.add_argument("--contact-annotations-csv", type=Path, default=None,
                    help="independent contact annotations (source_frame_index, contact_active); joined exactly")
     f.add_argument("--output", required=True, type=Path)
+    a = sub.add_parser("robot-archive", help="TCP/EE/wrench archive from the raw Parquet (measured EE x T_ee_tcp)")
+    a.add_argument("--scene", required=True, type=Path)
+    a.add_argument("--output", required=True, type=Path)
     m = sub.add_parser("summarize", help="markdown table over run directories (reference = oracle diagnostic only)")
     m.add_argument("--runs", nargs="+", required=True, type=Path)
     m.add_argument("--reference-axis", type=float, nargs=3, default=None, help="diagnostic reference hinge direction")
@@ -517,6 +552,9 @@ def main(argv=None):
 
     if args.cmd == "summarize":
         print(summarize_runs(args.runs, args.reference_axis, args.reference_point))
+        return 0
+    if args.cmd == "robot-archive":
+        build_robot_archive(args.scene, args.output)
         return 0
     if args.cmd == "synthetic":
         from .synthetic import make_scene
