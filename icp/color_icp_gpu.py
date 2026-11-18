@@ -1376,4 +1376,7 @@ def main():
 
 
 if __name__ == "__main__":
+    import os as _ja_os
+    if _ja_os.environ.get("FORCEARTGS_JOINT_AWARE_TRIPWIRE") == "1":
+        raise RuntimeError("legacy stage icp/color_icp_gpu.py invoked inside a joint-aware run")
     main()    

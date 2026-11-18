@@ -440,6 +440,9 @@ def slide_window_tracking(args, cfg, tracker: Tracker, image_loader: ImageLoader
 
 
 if __name__ == "__main__":
+    import os as _ja_os
+    if _ja_os.environ.get("FORCEARTGS_JOINT_AWARE_TRIPWIRE") == "1":
+        raise RuntimeError("legacy stage estimotion_2part/track_2part.py invoked inside a joint-aware run")
     parser = argparse.ArgumentParser(description="Dynamic Tracking with Transformation Solving")
     parser.add_argument("--config", type=str, default=None, help="Path to pipeline config YAML")
     parser.add_argument("--object_name", type=str, default=None, help="Object name override used with --config")

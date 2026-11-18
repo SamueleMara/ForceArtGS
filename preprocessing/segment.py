@@ -55,6 +55,9 @@ def convert_png_to_jpg(args):
         
 
 if __name__ == "__main__":
+    import os as _ja_os
+    if _ja_os.environ.get("FORCEARTGS_JOINT_AWARE_TRIPWIRE") == "1":
+        raise RuntimeError("legacy stage preprocessing/segment.py invoked inside a joint-aware run")
     parser = argparse.ArgumentParser(
         description="Segment a video using SAM2",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter

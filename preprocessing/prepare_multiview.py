@@ -55,6 +55,9 @@ def prepare_multiview(scene, camera_datasets, output, reference_selection="motio
     (preprocessing/multiview_quality.py).  With ``quality`` and no supported camera,
     ``on_unresolved="raise"`` stops after writing ``multiview_quality.json``; ``"flag"`` keeps the
     legacy choice but records ``reference_status: unresolved`` in the manifest."""
+    import os as _ja_os
+    if _ja_os.environ.get("FORCEARTGS_JOINT_AWARE_TRIPWIRE") == "1":
+        raise RuntimeError("legacy prepare_multiview (reference-camera ICP motion) invoked inside a joint-aware run")
     if reference_selection not in ("motion", "quality"):
         raise ValueError(f"reference_selection must be 'motion' or 'quality', got {reference_selection!r}")
     if on_unresolved not in ("raise", "flag"):

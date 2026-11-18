@@ -66,11 +66,43 @@ def calibrated_noise(obs, cfg, log=None):
         noise.sigma_depth_m0 *= d
         noise.sigma_depth_m2 *= d
         report["applied"] = True
+    if getattr(noise, "calibrate_depth_ar1", False):
+        rho = static_core_depth_ar1(obs, core)
+        report["depth_ar1_rho_measured"] = rho
+        if rho is not None:
+            noise.depth_ar1_rho = float(np.clip(rho, 0.0, 0.99))
+            report["applied"] = True
     report["calibrated"] = dict(sigma_px=noise.sigma_px, sigma_depth_m0=noise.sigma_depth_m0,
-                                sigma_depth_m2=noise.sigma_depth_m2)
+                                sigma_depth_m2=noise.sigma_depth_m2, depth_ar1_rho=noise.depth_ar1_rho)
     if log:
         log(f"  noise calibration on {rep.get('n_static_tracks')} static-core tracks: {report['calibrated']}")
     return noise, report
+
+
+def static_core_depth_ar1(obs, core_tracks, min_pairs=50, return_raw=False):
+    """Lag-1 autocorrelation of de-meaned depth along static-core tracks (consecutive model times)."""
+    h = obs.has_3d & core_tracks[obs.track]
+    if h.sum() < min_pairs:
+        return None
+    idx = np.flatnonzero(h)
+    o = idx[np.lexsort((obs.time[idx], obs.track[idx]))]
+    tr, t, z = obs.track[o], obs.time[o], obs.z[o]
+    med = np.zeros(obs.n_tracks)
+    for k in np.unique(tr):
+        med[k] = np.median(z[tr == k])
+    r = z - med[tr]
+    pair = (tr[1:] == tr[:-1]) & (t[1:] == t[:-1] + 1)
+    if pair.sum() < min_pairs:
+        return None
+    a, b = r[:-1][pair], r[1:][pair]
+    den = np.sqrt(np.sum(a * a) * np.sum(b * b))
+    if not den > 0:
+        return None
+    raw = float(np.sum(a * b) / den)
+    # de-meaning each short track biases the lag-1 estimate low (Marriott-Pope: E[r] ~ rho - (1+3 rho)/L)
+    L = float(np.mean(np.bincount(tr)[np.unique(tr)]))
+    corr = (L * raw + 1.0) / (L - 3.0) if L > 4 else raw
+    return float(np.clip(corr, raw, 0.99)) if return_raw is False else (float(np.clip(corr, raw, 0.99)), raw, L)
 
 
 @dataclass
@@ -124,6 +156,8 @@ class ModelDecision:
     scores: dict
     heldout_times: list
     n_scored_tracks: int
+    track_pred_nll: dict = field(default_factory=dict)   # per-track held-out predictive NLL per model
+    scored_mask: np.ndarray | None = None
 
 
 def _heldout_track_ll(problem: Problem, obs_ho: TrackObservations, kind, axis, origin, q, anchors):
@@ -156,13 +190,27 @@ def score_candidates_on_heldout(fit: HypothesisFit, obs_ho: TrackObservations, c
         r = np.where(np.isfinite(r), r, np.array([1.0, 0.0, 0.0]))
         pred[kind] = -logsumexp(np.stack([ll_s, ll_m, ll_o], 1), b=np.clip(r, 1e-300, 1), axis=1)
     n = int(scored.sum())
+    cluster = cfg.comparison.uncertainty_method == "cluster_robust"
+    groups = None
+    if cluster:
+        from .validation_folds import surface_groups
+        groups = surface_groups(problem.obs, cfg.comparison.group_voxel_m)
 
     def paired(a, b):
         d = pred[a][scored] - pred[b][scored]  # positive: b predicts better
         if n < 2:
             return dict(delta_nll=float(d.sum()) if n else 0.0, z=0.0, n=n)
         se = float(d.std(ddof=1) * np.sqrt(n))
-        return dict(delta_nll=float(d.sum()), z=float(d.sum() / se) if se > 0 else 0.0, n=n)
+        z_naive = float(d.sum() / se) if se > 0 else 0.0
+        out = dict(delta_nll=float(d.sum()), z=z_naive, z_naive=z_naive, n=n, z_method="track_paired")
+        if cluster:
+            from .validation_folds import grouped_paired_statistics
+            g = grouped_paired_statistics(d, groups[scored])
+            out.update(z=g["z_cluster"], z_method="cluster_robust", n_groups=g["n_groups"],
+                       design_effect=g.get("design_effect"), n_eff=g.get("n_eff"),
+                       bootstrap_ci95=g.get("bootstrap_ci95"), bootstrap_p_second_better=g.get("bootstrap_p_second_better"),
+                       largest_group_share=g.get("largest_group_share"))
+        return out
 
     for k in pred:
         scores[f"heldout_nll_{k}"] = float(pred[k][scored].sum())
@@ -204,6 +252,20 @@ def score_candidates_on_heldout(fit: HypothesisFit, obs_ho: TrackObservations, c
         else:
             label = "revolute" if zz > 0 else "prismatic"
             reasons.append(f"held-out revolute-vs-prismatic z={zz:.2f}")
+    if cfg.comparison.remote_hinge_policy == "observability" and "revolute" in fit.candidates:
+        from .observability import observability_assessment
+        oa = observability_assessment(fit.candidates["revolute"], problem, cfg)
+        scores["revolute_observability"] = oa
+        if label == "revolute" and not oa["geometry_identifiable"]:
+            label = "ambiguous/unobservable"
+            if "prismatic" in better_than_null:
+                scores["occam_preference"] = "prismatic"
+            reasons.append("revolute wins on held-out data but its geometry is not identifiable: " + "; ".join(oa["reasons"]))
+        elif label == "ambiguous/unobservable" and not oa["geometry_identifiable"] and "prismatic" in better_than_null:
+            scores["occam_preference"] = "prismatic"
+            reasons.append("revolute geometry not identifiable: " + "; ".join(oa["reasons"]))
+        scores["type_confidence"] = _type_confidence(label, scores)
+        return ModelDecision(label, reasons, scores, [], n, track_pred_nll=pred, scored_mask=scored)
     if label == "revolute" and "prismatic" in better_than_null:
         rep = observability_report(fit.candidates["revolute"], problem, cfg.comparison.remote_hinge_ratio)
         if "remote_hinge_approximates_translation" in rep["degeneracy_flags"]:
@@ -223,7 +285,19 @@ def score_candidates_on_heldout(fit: HypothesisFit, obs_ho: TrackObservations, c
             reasons.append(f"the revolute fit collapsed to its prismatic limit (hinge radius {r:.2f} m, arc "
                            f"{np.degrees(rep['q_span']):.2f} deg): the data are a translation that a remote hinge can "
                            "mimic; label kept ambiguous, occam_preference=prismatic")
-    return ModelDecision(label, reasons, scores, [], n)
+    return ModelDecision(label, reasons, scores, [], n, track_pred_nll=pred, scored_mask=scored)
+
+
+def _type_confidence(label, scores) -> dict:
+    """Descriptive confidence of the joint TYPE (not of its geometry)."""
+    rp = scores.get("revolute_vs_prismatic", {})
+    z = rp.get("z")
+    p = rp.get("bootstrap_p_second_better")
+    if label not in ("revolute", "prismatic"):
+        return dict(level="none", z=z, bootstrap_p_revolute_better=p)
+    zz = abs(z or 0.0)
+    return dict(level="high" if zz >= 4 else ("moderate" if zz >= 2 else "low"), z=z, z_method=rp.get("z_method"),
+                bootstrap_p_revolute_better=p)
 
 
 def _span_sigma(c: JointCandidate):

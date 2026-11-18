@@ -92,6 +92,9 @@ def depth_sigma(z, noise, edge=None, cos_incidence=None):
     if cos_incidence is not None and getattr(noise, "incidence_model", False):
         c = np.nan_to_num(np.asarray(cos_incidence, float), nan=1.0)
         s = s / np.clip(c, noise.incidence_cos_floor, 1.0)
+    rho = getattr(noise, "depth_ar1_rho", None)
+    if rho is not None and rho > 0:
+        s = s * np.sqrt((1 + rho) / (1 - rho))   # AR(1) effective-sample-size inflation
     return s
 
 

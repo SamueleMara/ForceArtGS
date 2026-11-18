@@ -90,15 +90,33 @@ def summarize_velocity(vd: dict) -> dict:
 
 # --------------------------------------------------------------------------- run orchestration
 def run_discovery(obs: TrackObservations, calibs: dict, cfg, out_dir, scene=None, contact=None, wrench_convention=None,
-                  oracle=None, extra_manifest=None) -> dict:
+                  oracle=None, extra_manifest=None, fold=None, experiment_id=None, physical=None) -> dict:
+    """``fold``: optional dict(reference_time_index, heldout_times) to reuse another run's split exactly
+    (identical folds across an A/B matrix). ``physical``: optional Stage-E inputs (see
+    ``physical_selection.physical_stage``); without verified gates it abstains and changes nothing."""
     out = Path(out_dir)
     if out.exists() and any(out.iterdir()):
         raise FileExistsError(f"refusing to overwrite non-empty run directory {out}")
     out.mkdir(parents=True, exist_ok=True)
     t_start = time.time()
     T = obs.frame_map.T
-    ref = choose_reference_time(obs)
-    heldout = make_heldout_split(T, ref, cfg.comparison.heldout_time_fraction, cfg.fit.seed)
+    v2 = cfg.comparison.selection == "observable_physical_v2"
+    v2_part = v2_acf = None
+    if v2 and fold is not None:
+        raise ValueError("observable_physical_v2 declares its own block partition; a fold override is not allowed")
+    if v2:
+        from .selection_v2 import declare_partition
+        v2_part, v2_acf = declare_partition(obs, cfg)
+        ref = v2_part.reference_time_index
+        heldout = np.asarray(v2_part.heldout_times, int)
+    elif fold is not None:
+        ref = int(fold["reference_time_index"])
+        heldout = np.asarray(fold["heldout_times"], int)
+        if ref in heldout or heldout.max(initial=-1) >= T:
+            raise ValueError("invalid fold override")
+    else:
+        ref = choose_reference_time(obs)
+        heldout = make_heldout_split(T, ref, cfg.comparison.heldout_time_fraction, cfg.fit.seed)
     train = obs.select_obs(~np.isin(obs.time, heldout))
     test = obs.select_obs(np.isin(obs.time, heldout))
     write_json(out / "input_audit.json", dict(summary=obs.summary(), reference_time_index=ref,
@@ -112,6 +130,8 @@ def run_discovery(obs: TrackObservations, calibs: dict, cfg, out_dir, scene=None
     decision = score_candidates_on_heldout(fit_tr, test, cfg)
     decision.heldout_times = heldout.tolist()
     _log(f"[selection] {decision.label}: {decision.reasons}")
+    from .validation_folds import decision_statistics
+    grouped = decision_statistics(decision, train, cfg.comparison.group_voxel_m)
     # depth ablation on the same split (B2/B3 style: 2D-only vs 2D+depth evidence)
     _log("[final] refitting both hypotheses on all times (selection already made on the held-out split)")
     fit_all = fit_joint_hypotheses(obs, calibs, cfg, ref=ref, log=_log)
@@ -150,25 +170,77 @@ def run_discovery(obs: TrackObservations, calibs: dict, cfg, out_dir, scene=None
     cf = None
     if contact is not None:
         cf = contact_force_stage(cands, contact, cfg, out, calibs, wrench_convention, problem)
+    phys = None
+    if physical is not None:
+        from .physical_selection import physical_stage
+        phys = physical_stage(fit_tr, test, decision, cfg, physical, out)
+        _log(f"[physical] {phys['status']}: {phys.get('reason', '')}")
     sel = dict(decision=decision.label, allowed=DECISIONS, reasons=decision.reasons, scores=decision.scores,
+               grouped_statistics=grouped, experiment_id=experiment_id,
+               output_contract=dict(used_for_visual_fit=True,
+                                    used_for_contact_fit=bool(phys and phys.get("used_for_contact_fit")),
+                                    used_for_force_fit=bool(phys and phys.get("used_for_force_fit")),
+                                    used_for_model_selection=["visual"] + ([] if not phys else phys.get("selection_terms", [])),
+                                    calibration_verified=bool(phys and phys.get("calibration_verified")),
+                                    contact_annotation_provenance=None if contact is None else contact.contact_source,
+                                    holdout_camera_ids=[], heldout_time_block_indices=decision.heldout_times,
+                                    uncertainty_method=cfg.comparison.uncertainty_method,
+                                    renderer_evaluation_kind="point_proxy"),
+               physical_selection=phys,
                heldout_times=decision.heldout_times, n_scored_tracks=decision.n_scored_tracks,
                bic_training_diagnostic=bic_report(fit_tr), seed_training_nll=fit_tr.seed_scores,
                training_split_candidates={k: dict(axis=c.axis_w, origin=c.origin_w, q=c.q) for k, c in fit_tr.candidates.items()},
-               noise_calibration=fit_tr.noise_report, robot_terms_used_in_selection=False,
-               note="selection is vision-only (S2); contact/force evidence is reported separately (S3/S4)")
+               noise_calibration=fit_tr.noise_report,
+               robot_terms_used_in_selection=bool(phys and phys.get("selection_terms")),
+               note=("selection is vision-only (S2); contact/force evidence is reported separately (S3/S4)"
+                     if not (phys and phys.get("selection_terms")) else
+                     f"selection used physical terms {phys['selection_terms']} under verified gates"))
     write_json(out / "model_selection.json", sel)
     integ = integration_checks(cands, calibs, obs)
     write_json(out / "integration_checks.json", integ)
-    best = cands.get(decision.label)
+    sel_v2 = None
+    if v2:
+        from .selection_v2 import run_selection_v2
+        sel_v2 = run_selection_v2(obs, calibs, cfg, out, scene=scene, fit_tr=fit_tr, partition=v2_part, acf=v2_acf,
+                                  test_obs=test, contact=contact, legacy=decision.label, log=_log,
+                                  source_files=(extra_manifest or {}).get("observation_sha256"))
+    # v2: the adapter follows the v2 physical status only; the legacy label is a diagnostic (never a fallback)
+    best = cands.get(decision.label) if not v2 else (
+        cands.get(sel_v2["selected_candidate"]) if sel_v2["physical_joint_status"].startswith("IDENTIFIED_") else None)
     if best is not None:
         export_for_existing_freeart(best, {c: calibs[c] for c in obs.camera_ids}, obs.frame_map, out / "freeart_adapter")
+    else:
+        # explicit abstention: never a silently arbitrary joint for downstream training
+        write_json(out / "freeart_adapter" / "ABSTAINED.json",
+                   dict(status="ABSTAINED", decision=decision.label if not v2 else sel_v2["physical_joint_status"],
+                        reasons=decision.reasons if not v2 else sel_v2["reasons"],
+                        occam_preference=decision.scores.get("occam_preference"),
+                        candidates_not_exported={k: dict(axis=c.axis_w, origin=c.origin_w,
+                                                         q_span=float(np.nanmax(c.q) - np.nanmin(c.q)))
+                                                 for k, c in cands.items()},
+                        note="no transforms written; downstream FreeArtGS training must not proceed from this run"))
     manifest = dict(created_unix=time.time(), runtime_s=round(time.time() - t_start, 1), config=cfg.to_dict(),
                     config_hash=cfg.config_hash(), git=git_provenance(REPO), packages=package_versions(), scene=str(scene),
                     cameras=obs.camera_ids, camera_sources={c: calibs[c].calibration_source for c in obs.camera_ids},
                     frame_map=obs.frame_map.to_json(), robot_available=contact is not None,
-                    oracle_used_for_fitting=False, oracle_reported=oracle is not None, extra=extra_manifest or {})
+                    oracle_used_for_fitting=False, oracle_reported=oracle is not None, extra=extra_manifest or {},
+                    experiment_id=experiment_id, fold=dict(reference_time_index=int(ref), heldout_times=heldout.tolist(),
+                                                           source="override" if fold is not None else "make_heldout_split"),
+                    fingerprints=dict(config_sha=cfg.config_hash(),
+                                      calibration_sha={c: calibs[c].calib_sha for c in obs.camera_ids},
+                                      time_map_sha=_sha_text(json.dumps(obs.frame_map.to_json(), sort_keys=True)),
+                                      tool_exclusion={c: (obs.provenance.get(c, {}) or {}).get("tool_exclusion")
+                                                      for c in obs.camera_ids}))
     write_json(out / "manifest.json", manifest)
-    summary = dict(decision=decision.label, reasons=decision.reasons,
+    summary = dict(decision=decision.label, reasons=decision.reasons, experiment_id=experiment_id,
+                   grouped_z={k: dict(z_naive=v.get("z_naive"), z_cluster=v.get("z_cluster"), n_groups=v.get("n_groups"),
+                                      bootstrap_p_second_better=v.get("bootstrap_p_second_better"))
+                              for k, v in grouped.items()},
+                   type_confidence=decision.scores.get("type_confidence"),
+                   revolute_observability={k: decision.scores["revolute_observability"].get(k) for k in
+                                           ("geometry_identifiable", "finite_hinge_distinguishable_from_translation",
+                                            "reasons", "report_hinge_origin")} if "revolute_observability" in decision.scores else None,
+                   physical_selection=None if phys is None else {k: phys.get(k) for k in ("status", "reason", "selection_terms")},
                    candidates={k: dict(axis=cj[k]["joint_axis_world"], origin=cj[k]["joint_origin_world"],
                                        q_span=cj[k]["observability"]["q_span"], q_units=cj[k]["q_units"],
                                        n_moving=cj[k]["n_moving_tracks"], flags=cj[k]["observability"]["degeneracy_flags"],
@@ -178,7 +250,10 @@ def run_discovery(obs: TrackObservations, calibs: dict, cfg, out_dir, scene=None
                                                                               n_moving=v["n_moving_tracks"])
                                                                    for cam, v in proj[k].items()} for k in proj},
                    heldout_scores={k: v for k, v in decision.scores.items() if "vs" in k},
-                   contact_force=None if cf is None else cf.get("summary"))
+                   contact_force=None if cf is None else cf.get("summary"),
+                   selection_v2=None if sel_v2 is None else {k: sel_v2[k] for k in (
+                       "physical_joint_status", "working_motion_model", "working_model_is_approximation",
+                       "physics_joint_export_ready", "selected_candidate", "failure_codes")})
     write_json(out / "summary.json", summary)
     _write_report(out / "report.md", summary, sel, obs, integ)
     _log(f"[done] {out} ({manifest['runtime_s']} s)")
@@ -499,6 +574,187 @@ def summarize_runs(runs, ref_axis=None, ref_point=None) -> str:
     return "\n".join(lines)
 
 
+def cmd_audit_depth(args) -> int:
+    from .depth_conflict_audit import FrozenJoint, load_frozen_from_run, reference_joint_posthoc, run_depth_audit
+    from .model_selection import calibrated_noise
+    cfg = load_joint_discovery_config(args.config or {"mode": "calibrated_joint_aware"})
+    parts = [TrackObservations.load(p) for p in args.observations]
+    parts = [p for p in parts if p.camera_ids[0] in args.cameras]
+    if {p.camera_ids[0] for p in parts} != set(args.cameras):
+        raise SystemExit(f"observation tables do not cover cameras {args.cameras}")
+    obs = concatenate_observations(parts)
+    calibs, audit = load_scene_cameras(args.scene, obs.camera_ids)
+    noise, noise_rep = calibrated_noise(obs, cfg, _log)
+    joints = {"STATIC_null": FrozenJoint("STATIC_null", "static", None, None, np.zeros(obs.frame_map.T), "null")}
+    for spec in args.run:
+        prefix, rest = spec.split("=", 1)
+        role = "fitted"
+        if rest.rsplit(":", 1)[-1] in ("fitted", "diagnostic"):
+            rest, role = rest.rsplit(":", 1)
+        run = Path(rest)
+        man = json.loads((run / "manifest.json").read_text())
+        if man["frame_map"]["rgbd_frame_index"] != obs.frame_map.rgbd_frame_index.tolist():
+            raise SystemExit(f"{run}: frame map differs from the audited observations; refusing to compare")
+        joints.update(load_frozen_from_run(run, prefix, role))
+    if args.reference_json is not None:
+        r = reference_joint_posthoc(args.reference_json, obs.frame_map, args.reference_camera)
+        joints[r.name] = r
+    tcp = None
+    if args.tcp_npz is not None:
+        from .tcp_contact import load_robot_contact_record
+        rec = load_robot_contact_record(args.scene, obs.frame_map, tcp_npz=args.tcp_npz)
+        tcp = dict(p_tcp_w=rec.p_tcp_w, p_ee_w=rec.p_ee_w)
+    pairs = [tuple(p.split(":")) for p in args.pairs]
+    hp = [tuple(p.split(":")) for p in args.heatmap_pairs]
+    for a, b in pairs + hp:
+        if a not in joints or b not in joints:
+            raise SystemExit(f"unknown hypothesis in pair {a}:{b}; available {sorted(joints)}")
+    s = run_depth_audit(obs, calibs, noise, joints, args.output, scene=args.scene, pairs=pairs, tcp=tcp,
+                        heatmap_pairs=hp)
+    from .exports import write_json
+    write_json(Path(args.output) / "manifest.json",
+               dict(created_unix=time.time(), git=git_provenance(REPO), scene=str(args.scene), cameras=obs.camera_ids,
+                    observation_files=[str(p) for p in args.observations],
+                    observation_sha256={str(p): _sha256(p) for p in args.observations},
+                    runs=args.run, reference_json=str(args.reference_json), noise_calibration=noise_rep,
+                    calibration_audit=audit, camera_calib_sha={c: calibs[c].calib_sha for c in obs.camera_ids},
+                    experiment_id="NEXT_A1_audit_depth"))
+    _log(f"[audit-depth] {len(s['pairs'])} attributions -> {args.output}/depth_conflict_report.md")
+    return 0
+
+
+def cmd_folds(args) -> int:
+    from .exports import write_json
+    from .validation_folds import camera_folds, fold_label_stability, run_fold, time_folds
+    cfg = load_joint_discovery_config(args.config or {"mode": "calibrated_joint_aware"})
+    if args.no_depth:
+        cfg.enable_depth = False
+    if args.depth_evidence:
+        cfg.depth_evidence.mode = args.depth_evidence
+    cfg.comparison.uncertainty_method = "cluster_robust"
+    parts = [TrackObservations.load(p) for p in args.observations]
+    parts = [p for p in parts if p.camera_ids[0] in args.cameras]
+    _refuse_stale_observations(parts, args.scene)
+    obs = concatenate_observations(parts)
+    calibs, _ = load_scene_cameras(args.scene, obs.camera_ids)
+    if cfg.depth_evidence.mode == "evidence":
+        obs, _ = _apply_depth_evidence(obs, calibs, cfg, args.scene, args.tcp_npz, args.output)
+    out = Path(args.output)
+    if out.exists() and any(out.iterdir()):
+        raise SystemExit(f"refusing to overwrite non-empty {out}")
+    out.mkdir(parents=True, exist_ok=True)
+    ref, inter = choose_reference_time(obs), None
+    if args.fold_from is not None:
+        ia = json.loads((args.fold_from / "input_audit.json").read_text())
+        ref, inter = ia["reference_time_index"], ia["heldout_times"]
+    T = obs.frame_map.T
+    folds = [f for f in time_folds(T, ref, obs.camera_ids, interleaved_times=inter) + camera_folds(T, obs.camera_ids)
+             if f.kind in args.kinds]
+    results = []
+    for f in folds:
+        _log(f"[fold] {f.name} ({f.kind}): train cams {f.train_cameras}, test cams {f.test_cameras}")
+        r = run_fold(obs, calibs, cfg, f, ref, log=_log)
+        results.append(r)
+        write_json(out / f"fold_{f.name}.json", r)
+    st = fold_label_stability(results, cfg.comparison.z_threshold)
+    write_json(out / "folds_summary.json", dict(stability=st, folds=[dict(name=r["fold"]["name"], kind=r["fold"]["kind"],
+               status=r["status"], q_at_test=r.get("q_at_test"), comparisons={k: dict(z_cluster=v["z_cluster"],
+               z_naive=v["z_naive"], n_groups=v["n_groups"], delta=v["delta"]) for k, v in r.get("comparisons", {}).items()},
+               candidates=r.get("candidates")) for r in results], git=git_provenance(REPO), cameras=obs.camera_ids,
+               reference_time_index=ref, depth=cfg.enable_depth, depth_evidence=cfg.depth_evidence.mode))
+    _log(f"[folds] labels {st}")
+    return 0
+
+
+def _refuse_stale_observations(parts, scene):
+    """Fail closed when a cached observation table does not belong to this scene / time map."""
+    for p in parts:
+        fm = load_scene_frame_map(scene, p.frame_map.rgbd_frame_index.tolist())
+        if not (np.array_equal(fm.source_frame_index, p.frame_map.source_frame_index)
+                and np.allclose(fm.timestamp_s, p.frame_map.timestamp_s)):
+            raise SystemExit(f"{p.camera_ids}: observation table time map differs from {scene}; stale cache, re-extract")
+        prov = json.dumps(p.provenance, default=str)
+        if "scene" in prov and Path(scene).name not in prov:
+            raise SystemExit(f"{p.camera_ids}: observation provenance names a different scene; stale cache, re-extract")
+
+
+def _apply_depth_evidence(obs, calibs, cfg, scene, tcp_npz, out_dir):
+    from dataclasses import asdict
+    from .depth_conflict_audit import tool_distance
+    from .depth_evidence import DepthEvidenceConfig, apply_depth_evidence, assess_depth_evidence
+    from .model_selection import calibrated_noise
+    dcfg = DepthEvidenceConfig(**{k: v for k, v in asdict(cfg.depth_evidence).items() if k != "mode"})
+    noise, _ = calibrated_noise(obs, cfg)
+    from .observations import depth_sigma
+    sz = depth_sigma(np.nan_to_num(obs.z, nan=1.0), noise, obs.depth_edge, obs.depth_cos)
+    td = None
+    if tcp_npz is not None:
+        from .tcp_contact import load_robot_contact_record
+        rec = load_robot_contact_record(scene, obs.frame_map, tcp_npz=tcp_npz)
+        td = tool_distance(obs, rec.p_tcp_w, rec.p_ee_w)
+    code, det = assess_depth_evidence(obs, dcfg, scene=scene, sigma_z=sz, tool_distance_m=td)
+    out = apply_depth_evidence(obs, code, dcfg.unverified_policy)
+    _log(f"[depth evidence] kept {int(out.depth_valid.sum())}/{int(obs.depth_valid.sum())} depth samples: {det['counts']}")
+    det["tool_distance_used"] = td is not None
+    det["_codes"] = dict(code=code, track=obs.track, time=obs.time, cam=obs.cam)
+    return out, det
+
+
+def cmd_select_v2(args) -> int:
+    from .selection_v2 import run_selection_v2
+    cfg = load_joint_discovery_config(args.config or {"mode": "calibrated_joint_aware"})
+    cfg.comparison.selection = "observable_physical_v2"
+    if args.no_depth:
+        cfg.enable_depth = False
+    if args.from_run is not None:
+        src_npz = args.from_run / "tracks_observations.npz"
+        obs = TrackObservations.load(src_npz)
+        files = {str(src_npz): _sha256(src_npz)}
+        legacy = json.loads((args.from_run / "model_selection.json").read_text()).get("decision") \
+            if (args.from_run / "model_selection.json").is_file() else None
+    else:
+        parts = [TrackObservations.load(p) for p in args.observations]
+        obs = concatenate_observations(parts)
+        files = {str(p): _sha256(p) for p in args.observations}
+        legacy = None
+    cfg.cameras = list(obs.camera_ids)
+    cfg.validate()
+    if args.output.exists() and any(args.output.iterdir()):
+        raise SystemExit(f"refusing to overwrite non-empty {args.output}")
+    calibs, audit = load_scene_cameras(args.scene, obs.camera_ids)
+    robot = contact = calib = None
+    if args.tcp_npz is not None:
+        from .tcp_contact import load_robot_contact_record
+        try:
+            contact = load_robot_contact_record(args.scene, obs.frame_map, tcp_npz=args.tcp_npz)
+            robot = dict(p_tcp_w=contact.p_tcp_w, p_ee_w=contact.p_ee_w)
+        except (ValueError, RuntimeError, KeyError, OSError) as e:
+            _log(f"[v2] robot archive unusable ({e}); robot evidence ABSTAIN")
+        try:
+            from .wrench_calibration import WrenchCalibration
+            calib = WrenchCalibration.from_scene_metadata(args.scene)
+        except Exception as e:  # noqa: BLE001 -- missing calibration -> ABSTAIN, recorded
+            _log(f"[v2] no wrench calibration ({e})")
+    files["calibration_audit"] = json.dumps(audit, sort_keys=True, default=str)
+    run_selection_v2(obs, calibs, cfg, args.output, scene=args.scene, robot=robot, contact=contact,
+                     wrench_calibration=calib, legacy=legacy, source_files=files, log=_log)
+    return 0
+
+
+def _sha_text(text) -> str:
+    import hashlib
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def _sha256(path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for blk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(blk)
+    return h.hexdigest()
+
+
 # --------------------------------------------------------------------------- main
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="python -m estimotion_2part.joint_discovery.cli", description=__doc__,
@@ -540,22 +796,73 @@ def main(argv=None):
     f.add_argument("--tare-frames", default=None, help="model-time range a:b used as wrench tare (pre-contact)")
     f.add_argument("--contact-annotations-csv", type=Path, default=None,
                    help="independent contact annotations (source_frame_index, contact_active); joined exactly")
+    f.add_argument("--depth-evidence", choices=["raw", "evidence"], default=None,
+                   help="override joint_discovery.depth_evidence.mode (Stage B1 ablation)")
+    f.add_argument("--depth-ar1", choices=["off", "calibrate"], default=None,
+                   help="AR(1) correlated-depth inflation calibrated on the training static core (Stage B2 ablation)")
+    f.add_argument("--uncertainty", choices=["track_paired", "cluster_robust"], default=None)
+    f.add_argument("--remote-hinge-policy", choices=["ratio", "observability"], default=None)
+    f.add_argument("--fold-from", type=Path, default=None,
+                   help="reuse reference time and held-out times of an earlier run (identical folds)")
+    f.add_argument("--experiment-id", default=None, help="e.g. NEXT_A3_V2D_edgeD (kept apart from historical B* ids)")
+    f.add_argument("--physical-selection", action="store_true",
+                   help="Stage E: evaluate TCP/force terms for selection under verified gates (abstains otherwise)")
     f.add_argument("--output", required=True, type=Path)
     a = sub.add_parser("robot-archive", help="TCP/EE/wrench archive from the raw Parquet (measured EE x T_ee_tcp)")
     a.add_argument("--scene", required=True, type=Path)
     a.add_argument("--output", required=True, type=Path)
+    ad = sub.add_parser("audit-depth", help="Stage A: frozen-hypothesis RGB-vs-depth counterfactual audit (no refit)")
+    ad.add_argument("--scene", required=True, type=Path)
+    ad.add_argument("--observations", nargs="+", required=True, type=Path)
+    ad.add_argument("--cameras", nargs="+", required=True)
+    ad.add_argument("--config", default=None)
+    ad.add_argument("--run", nargs="+", required=True, metavar="PREFIX=RUN_DIR[:role]",
+                    help="frozen candidates from fit runs; role fitted|diagnostic (default fitted)")
+    ad.add_argument("--reference-json", type=Path, default=None, help="tracker-free hinge (POST HOC ONLY)")
+    ad.add_argument("--reference-camera", default="cam_000")
+    ad.add_argument("--pairs", nargs="*", default=[], metavar="A:B", help="objective-gap attributions")
+    ad.add_argument("--heatmap-pairs", nargs="*", default=[], metavar="A:B")
+    ad.add_argument("--tcp-npz", type=Path, default=None, help="robot archive: tool-contamination distances")
+    ad.add_argument("--output", required=True, type=Path)
+    fo = sub.add_parser("folds", help="Stage C2: blocked-time and held-out-camera folds with cluster-robust scores")
+    fo.add_argument("--scene", required=True, type=Path)
+    fo.add_argument("--observations", nargs="+", required=True, type=Path)
+    fo.add_argument("--cameras", nargs="+", required=True)
+    fo.add_argument("--config", default=None)
+    fo.add_argument("--fold-from", type=Path, default=None, help="reference time (and interleaved fold) of a run")
+    fo.add_argument("--kinds", nargs="+", default=["contiguous_block", "forward_block", "heldout_camera"])
+    fo.add_argument("--depth-evidence", choices=["raw", "evidence"], default=None)
+    fo.add_argument("--no-depth", action="store_true")
+    fo.add_argument("--tcp-npz", type=Path, default=None)
+    fo.add_argument("--output", required=True, type=Path)
     m = sub.add_parser("summarize", help="markdown table over run directories (reference = oracle diagnostic only)")
     m.add_argument("--runs", nargs="+", required=True, type=Path)
     m.add_argument("--reference-axis", type=float, nargs=3, default=None, help="diagnostic reference hinge direction")
     m.add_argument("--reference-point", type=float, nargs=3, default=None, help="diagnostic reference hinge point")
+    sv = sub.add_parser("select-v2", help="joint selection v2 (observable physical model selection) on observations; "
+                                          "writes a NEW run directory, never edits the source run")
+    sv.add_argument("--scene", required=True, type=Path)
+    src = sv.add_mutually_exclusive_group(required=True)
+    src.add_argument("--from-run", type=Path, help="reuse tracks_observations.npz of an existing discovery run")
+    src.add_argument("--observations", nargs="+", type=Path)
+    sv.add_argument("--config", default=None)
+    sv.add_argument("--tcp-npz", type=Path, default=None, help="robot archive: tool proximity + robot gate report")
+    sv.add_argument("--no-depth", action="store_true")
+    sv.add_argument("--output", required=True, type=Path)
     args = ap.parse_args(argv)
 
+    if args.cmd == "select-v2":
+        return cmd_select_v2(args)
     if args.cmd == "summarize":
         print(summarize_runs(args.runs, args.reference_axis, args.reference_point))
         return 0
     if args.cmd == "robot-archive":
         build_robot_archive(args.scene, args.output)
         return 0
+    if args.cmd == "audit-depth":
+        return cmd_audit_depth(args)
+    if args.cmd == "folds":
+        return cmd_folds(args)
     if args.cmd == "synthetic":
         from .synthetic import make_scene
         cfg = load_joint_discovery_config(args.config or {"mode": "calibrated_joint_aware"})
@@ -584,6 +891,19 @@ def main(argv=None):
             cfg.cameras = list(args.cameras)
         if args.no_depth:
             cfg.enable_depth = False
+        if args.depth_evidence:
+            cfg.depth_evidence.mode = args.depth_evidence
+        if args.depth_ar1 == "calibrate":
+            cfg.noise.calibrate_depth_ar1 = True
+        elif args.depth_ar1 == "off":
+            cfg.noise.calibrate_depth_ar1, cfg.noise.depth_ar1_rho = False, None
+        if args.uncertainty:
+            cfg.comparison.uncertainty_method = args.uncertainty
+        if args.remote_hinge_policy:
+            cfg.comparison.remote_hinge_policy = args.remote_hinge_policy
+        if args.physical_selection:
+            cfg.enable_physical_selection = True
+        cfg.validate()
         if not cfg.is_new_mode:
             raise SystemExit("joint_discovery.mode is 'legacy'; nothing to do (use calibrated_joint_aware)")
         parts = [TrackObservations.load(p) for p in args.observations]
@@ -591,10 +911,21 @@ def main(argv=None):
         missing = set(cfg.cameras) - {p.camera_ids[0] for p in parts}
         if missing:
             raise SystemExit(f"no observation table for cameras {sorted(missing)}")
+        _refuse_stale_observations(parts, args.scene)
         obs = concatenate_observations(parts)
         calibs, audit = load_scene_cameras(args.scene, obs.camera_ids)
         contact, conv = None, None
-        extra = dict(calibration_audit=audit, observation_files=[str(p) for p in args.observations])
+        extra = dict(calibration_audit=audit, observation_files=[str(p) for p in args.observations],
+                     observation_sha256={str(p): _sha256(p) for p in args.observations})
+        if cfg.depth_evidence.mode == "evidence":
+            obs, extra["depth_evidence"] = _apply_depth_evidence(obs, calibs, cfg, args.scene, args.tcp_npz, args.output)
+        fold = None
+        if args.fold_from is not None:
+            ia = json.loads((args.fold_from / "input_audit.json").read_text())
+            if ia["frame_map"]["rgbd_frame_index"] != obs.frame_map.rgbd_frame_index.tolist():
+                raise SystemExit(f"--fold-from {args.fold_from}: different frame map; folds are not comparable")
+            fold = dict(reference_time_index=ia["reference_time_index"], heldout_times=ia["heldout_times"])
+            extra["fold_from"] = str(args.fold_from)
         if args.tcp_npz is not None:
             from .tcp_contact import load_robot_contact_record
             from .wrench_physics import WrenchConvention
@@ -630,8 +961,22 @@ def main(argv=None):
                 contact.reasons = [r for r in contact.reasons if not r.startswith("no independently verified")]
                 contact.reasons.append(contact.contact_source)
                 extra["contact_flags"] = contact.contact_source
+        physical = None
+        if cfg.enable_physical_selection:
+            if contact is None:
+                raise SystemExit("--physical-selection needs --tcp-npz (TCP/wrench archive)")
+            from .wrench_calibration import WrenchCalibration
+            timeline = None
+            if args.contact_annotations_csv is not None:
+                from .contact_annotations import load_annotation_csv
+                timeline = load_annotation_csv(args.contact_annotations_csv)
+            physical = dict(contact=contact, calibration=WrenchCalibration.from_scene_metadata(args.scene),
+                            calibs=calibs, timeline=timeline)
+        codes = (extra.get("depth_evidence") or {}).pop("_codes", None)
         run_discovery(obs, calibs, cfg, args.output, scene=args.scene, contact=contact, wrench_convention=conv,
-                      extra_manifest=extra)
+                      extra_manifest=extra, fold=fold, experiment_id=args.experiment_id, physical=physical)
+        if codes is not None:
+            np.savez_compressed(args.output / "depth_evidence_codes.npz", **codes)
         return 0
     return 1
 

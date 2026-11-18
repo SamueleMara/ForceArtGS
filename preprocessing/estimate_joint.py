@@ -4,6 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import os
+
+
+def _joint_aware_tripwire(name):
+    if os.environ.get("FORCEARTGS_JOINT_AWARE_TRIPWIRE") == "1":
+        raise RuntimeError(f"legacy stage {name} invoked inside a joint-aware run")
 import json
 import time
 import sys
@@ -1137,6 +1143,9 @@ def process_twopart_blend_dir(
     force_revolute: bool = False,
     interactive: bool = False,
 ) -> Path:
+    if (blend_dir / "JOINT_AWARE_AUTHORITY.json").exists():
+        raise RuntimeError(f"{blend_dir} belongs to a joint-aware run: the legacy joint classifier must not write here")
+    _joint_aware_tripwire("preprocessing/estimate_joint.py")
     poses_file = blend_dir / ("object_poses_eval.json" if use_eval else "object_poses_train.json")
     if not poses_file.exists():
         raise FileNotFoundError(f"Missing object poses file: {poses_file}")

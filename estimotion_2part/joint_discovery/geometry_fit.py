@@ -179,8 +179,13 @@ class _Layout:
         return a, o, q, X
 
 
-def fit_geometry(kind, axis0, origin0, q0, anchors, fit_tracks, weights, problem: Problem, max_nfev=None):
-    """Robust sparse least squares over (axis, hinge, q, anchors of ``fit_tracks``)."""
+def fit_geometry(kind, axis0, origin0, q0, anchors, fit_tracks, weights, problem: Problem, max_nfev=None, extra=None):
+    """Robust sparse least squares over (axis, hinge, q, anchors of ``fit_tracks``).
+
+    ``extra`` (Stage E, optional): object with ``residuals(kind, axis, origin, q) -> [k]`` already
+    whitened, and ``row_times`` [k] (model time each row depends on through q; -1 = joint params
+    only). Rows are appended to the vision residuals; their Jacobian pattern covers the joint
+    parameters and the q column of their time. Vision rows are unchanged."""
     obs, cfg, noise = problem.obs, problem.cfg, problem.noise
     T = obs.frame_map.T
     in_fit = np.zeros(obs.n_tracks, bool)
@@ -216,6 +221,8 @@ def fit_geometry(kind, axis0, origin0, q0, anchors, fit_tracks, weights, problem
             v = np.diff(q) / np.diff(ts)
             acc = np.diff(v) / ((ts[2:] - ts[:-2]) / 2)
             parts.append(acc / cfg.fit.temporal_sigma_qacc)
+        if extra is not None:
+            parts.append(np.nan_to_num(np.asarray(extra.residuals(kind, a, o, q), float)))
         return np.concatenate(parts)
 
     # sparsity pattern
@@ -247,7 +254,22 @@ def fit_geometry(kind, axis0, origin0, q0, anchors, fit_tracks, weights, problem
             qc = qcol[np.arange(n_prior) + k]
             m = qc >= 0
             add(pr[m], qc[m])
-    n_rows = n_uv + n_z + n_prior
+    n_extra = 0
+    if extra is not None:
+        rt = np.asarray(extra.row_times, int)
+        n_extra = len(rt)
+        er = n_uv + n_z + n_prior + np.arange(n_extra)
+        for j in range(L.n_joint):
+            add(er, np.full(n_extra, j))
+        qc = np.where(rt >= 0, qcol[np.clip(rt, 0, T - 1)], -1)
+        m = qc >= 0
+        add(er[m], qc[m])
+        # finite-difference velocities use neighbouring q values too
+        for sh in (-1, 1):
+            qn = np.where(rt >= 0, qcol[np.clip(rt + sh, 0, T - 1)], -1)
+            m = qn >= 0
+            add(er[m], qn[m])
+    n_rows = n_uv + n_z + n_prior + n_extra
     n_cols = L.n_global + 3 * len(fit_tracks)
     S = sparse.coo_matrix((np.ones(sum(len(r) for r in rows)), (np.concatenate(rows), np.concatenate(cols))),
                           shape=(n_rows, n_cols)).tocsr()
@@ -269,7 +291,7 @@ def fit_geometry(kind, axis0, origin0, q0, anchors, fit_tracks, weights, problem
         q_unc[L.free_q] = np.sqrt(np.clip(np.diag(cov["cov"])[L.n_joint:L.n_global], 0, None))
     q = interpolate_missing(q, observed_t | (np.arange(T) == problem.ref), ts)
     info = dict(cost=float(res.cost), nfev=int(res.nfev), status=int(res.status), message=str(res.message),
-                n_residuals=int(n_rows), n_params=int(n_cols), n_fit_tracks=int(len(fit_tracks)),
+                n_residuals=int(n_rows), n_params=int(n_cols), n_fit_tracks=int(len(fit_tracks)), n_extra_rows=int(n_extra),
                 runtime_s=round(time.time() - t0, 3), observed_times=observed_t.tolist())
     info.update({k: v for k, v in cov.items() if k != "cov"})
     return a, o, q, anchors_out, q_unc, observed_t, info

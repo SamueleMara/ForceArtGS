@@ -1,0 +1,25 @@
+# Joint-discovery "next steps" options (all opt-in; omitted keys keep the legacy behaviour).
+# Every flag here does real work or raises; see estimotion_2part/joint_discovery/config.py.
+joint_discovery:
+  mode: calibrated_joint_aware
+  cameras: [cam_001, cam_002]          # cam_000: explicit diagnostic only
+  enable_tcp_contact: true
+  require_calibrated_wrench: true      # never set false to "enable" physics
+  enable_physical_selection: false     # Stage E: contact/force terms in refinement + selection (gated; abstains
+                                       # without independently confirmed contact and a verified wrench calibration)
+  contact:
+    surface_max_distance_m: 0.02
+  noise:
+    calibrate_depth_ar1: false         # Stage B2 ablation: AR(1) depth-noise inflation from the training static core
+  depth_evidence:
+    mode: raw                          # 'evidence': candidate-independent depth support codes (Stage B1)
+    front_gap_m: 0.03
+    jump_m: 0.03
+    rigidity_tol_m: 0.01
+    unverified_policy: drop
+  comparison:
+    uncertainty_method: cluster_robust # 'track_paired' = legacy naive z
+    group_voxel_m: 0.05
+    remote_hinge_policy: observability # 'ratio' = legacy hinge_radius/extent > 5 gate
+    min_translation_distinguishability_sigma: 3.0
+    hinge_support_margin: 1.0

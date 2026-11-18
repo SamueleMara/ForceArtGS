@@ -25,7 +25,14 @@ preparation or training calls this package. Legacy behaviour is unchanged (test 
 | `wrench_physics.py` | Sign convention (`f_obj` = robot on object), frame rotation, signed `F_∥`/`F_⊥` and ratios with exclusion reasons, `Q_H`, power, passivity, Coulomb direction with one shared bounded μ, null controls. |
 | `exports.py` | `joint_candidates.json`, `joint_states.npz`, virtual part cameras `A(q)^-1 T_WC`, per-camera `transforms_{0,1}.json` with `pose_kind`, provenance. |
 | `synthetic.py` | Analytic scenes for tests (ground truth is diagnostic only). |
-| `cli.py` | `synthetic`, `extract`, `from-dumps`, `fit`. |
+| `depth_conflict_audit.py` | Stage A: frozen-hypothesis RGB-vs-depth audit on identical observations (anchors re-estimated with the joint fixed; no refit), per-observation export with reason codes, objective-gap attribution by camera/time/patch, systematic-error statistics, heatmaps. Reference hinges only as `reference_posthoc`. |
+| `depth_evidence.py` | Stage B1: candidate-independent depth support codes (silhouette/front-surface, temporal jump, local rigidity, incidence, robot proximity, unverified). Clears `depth_valid` only; 2D always survives. |
+| `validation_folds.py` | Stage C1/C2: candidate-independent surface groups, cluster-robust z and group bootstrap, grouping sensitivity, contiguous/forward time blocks and held-out-camera folds with an explicit q-at-test rule, frozen-joint predictive scoring. |
+| `observability.py` | Stage C3: revolute-vs-best-translation distinguishability in units of σ_px at large motion, hinge-within-support check, Fisher check, threshold sensitivity (robustness disclosure). |
+| `contact_annotations.py` | Stage D1: contact timelines (`contact_confirmed/probable/unknown`, `no_contact`) with provenance; only independent annotations confirm contact; heuristic evaluation; TCP-to-observed-object distance. |
+| `wrench_calibration.py` | Stage D2/D3: versioned `WrenchCalibration` (R_EE_S, sign, tare, gravity, clock, torque origin) with DECLARED vs VERIFIED status, data checks and force-selection readiness gates. |
+| `physical_selection.py` | Stage E: confirmed sliding contact and calibrated force inside candidate refinement (`fit_geometry(extra=...)`) and held-out comparison (S2/S3/S4), force goodness-of-fit gate, wrench null controls. Abstains unless gates pass. |
+| `cli.py` | `synthetic`, `extract`, `from-dumps`, `fit` (ablation flags, `--fold-from`, `--experiment-id`, `--physical-selection`), `audit-depth`, `folds`, `robot-archive`, `summarize`. |
 
 ## Commands
 
@@ -71,11 +78,23 @@ For example, `70:128:2` gives 30 frames.
 * **Outputs** follow spec §14. `tracks_fate.csv` replaces the spec's Parquet because pyarrow is
   not installed in the `freeartgs` environment.
 
+## Next-steps sprint (2026-11-17)
+
+```bash
+# staged A/B for one scene (A0 baselines, A1 depth audit, A3 ablations, C2 folds, D1 contact audit)
+bash pipelines/joint_discovery_next_steps.sh <scene> 70:128:2 cam_001,cam_002
+# full-episode contact windows and wrench readiness
+python samuele/audit_joint_contact_windows.py --scene <scene> --clip-frames 70:128:2 --output <dir>
+```
+
+New behaviour is opt-in (`configs/joint_discovery_next_steps.example.yaml`); the defaults keep the
+previous selection (`track_paired` z, `ratio` remote-hinge gate, raw depth). Results:
+[`docs/joint_discovery_next_steps_results.md`](../../docs/joint_discovery_next_steps_results.md).
+
 ## What is not implemented
 
 * Level-V2 Gaussian rendering feedback and an appearance loss (`enable_coarse_renderer`,
   `enable_appearance`). Only the patch-NCC helper exists.
-* Held-out *camera* evaluation; only held-out *time* evaluation is implemented.
 * A MoMa-SG (B1) reference run. MoMa-SG was not vendored, and its revolute transform caveat
   (spec §1) is covered by independent tests.
 * Downstream 3DGS training on the new candidates (Gate 7 beyond the adapter and the
