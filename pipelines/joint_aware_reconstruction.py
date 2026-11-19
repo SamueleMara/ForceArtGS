@@ -43,7 +43,7 @@ from estimotion_2part.joint_discovery.integration_contract import (  # noqa: E40
     frame_alignment, sha256_file)
 
 SUBMODULE = REPO / "reconstruction" / "nerfstudio"
-STAGES = ("audit", "discover", "select", "authority", "dense", "build", "parts", "blend", "art", "refine", "compare", "video",
+STAGES = ("audit", "discover", "multimodal_refine", "select", "authority", "dense", "build", "parts", "blend", "art", "refine", "compare", "video",
           "final", "export")
 PARTTWIN_ROOT = Path(os.environ.get("PARTTWIN1D_ROOT", str(Path.home() / "PArtTwin1D")))
 PARTTWIN_PY = os.environ.get("PARTTWIN1D_PYTHON", str(Path.home() / "miniconda3/envs/parttwin_sim/bin/python"))
@@ -211,6 +211,49 @@ V2_STATUS = ("IDENTIFIED_REVOLUTE", "IDENTIFIED_PRISMATIC", "TYPE_UNOBSERVABLE",
              "NO_SIGNIFICANT_MOTION")
 
 
+def _mm_dir(r: Run):
+    return r.root / "multimodal_refine"
+
+
+def st_multimodal_refine(r: Run):
+    """Iterative pre-3DGS RGB-D + TCP contact-mode + verified-force frontend (no Gaussian training)."""
+    if not r.args.multimodal_frontend:
+        r.set("multimodal_refine", "NOT_RUN", reason="opt-in: --multimodal-frontend")
+        return
+    if r.args.selection != "v2":
+        raise StageError("the multimodal frontend requires --selection v2")
+    out = _mm_dir(r)
+    acc = out / "accepted" / "joint_selection_v2.json"
+    if not acc.is_file():
+        if out.exists() and any(out.iterdir()):
+            raise StageError(f"incomplete multimodal frontend directory {out}; inspect and remove it")
+        run = Path(r.m["discovery"]["run"])
+        cmd = [sys.executable, "-m", "estimotion_2part.joint_discovery.cli", "multimodal-refine", "--scene", r.scene,
+               "--from-run", run, "--config", r.args.discovery_config, "--output", out]
+        tcp = r.m["discovery"].get("robot_archive") or r.args.robot_archive
+        has_tcp = bool(tcp and Path(tcp).is_file())
+        if has_tcp:
+            cmd += ["--robot-archive", tcp]
+        if r.args.contact_segments and has_tcp:
+            cmd += ["--contact-segments", r.args.contact_segments]
+        elif r.args.contact_segments:
+            log("multimodal: no robot archive -> contact annotation unused (RGB-D iterative only)")
+        cmd += ["--max-iterations", str(r.args.mm_max_iterations)]
+        env = dict(r.env)
+        env.pop("FORCEARTGS_JOINT_AWARE_TRIPWIRE", None)
+        run_cmd(cmd, r.root / "logs" / "multimodal_refine.log", env, r.args.dry_run)
+    if r.args.dry_run:
+        r.set("multimodal_refine", "DRY_RUN")
+        return
+    sel = json.loads(acc.read_text())
+    r.m["multimodal"] = dict(accepted_dir=str(out / "accepted"), sha256=sha256_file(acc),
+                             contact_segments=None if not r.args.contact_segments else
+                             dict(path=str(r.args.contact_segments), sha256=sha256_file(r.args.contact_segments)))
+    r.set("multimodal_refine", sel["physical_joint_status"],
+          **{k: sel.get(k) for k in ("working_motion_model", "physics_joint_export_ready", "contact_evidence_used",
+                                     "force_evidence_used", "contact_assumption_satisfied", "failure_codes")})
+
+
 def st_select(r: Run):
     """Joint selection v2 (default for the joint-aware path): physical status + working model from hinge-free rigid
     motion evidence (estimotion_2part/joint_discovery/selection_v2.py). Legacy selection is a diagnostic only."""
@@ -219,6 +262,11 @@ def st_select(r: Run):
         return
     run = Path(r.m["discovery"]["run"])
     out = r.root / "joint_selection_v2"
+    if r.m.get("multimodal") and not (out / "joint_selection_v2.json").is_file():
+        # the decision comes from the accepted multimodal state (refined tracks/support/TCP/force), never from the
+        # raw one-pass discovery tracks
+        out.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(Path(r.m["multimodal"]["accepted_dir"]) / "joint_selection_v2.json", out / "joint_selection_v2.json")
     if not (out / "joint_selection_v2.json").is_file():
         if out.exists() and any(out.iterdir()):
             raise StageError(f"incomplete v2 selection directory {out}; inspect and remove it")
@@ -244,7 +292,7 @@ def st_select(r: Run):
 
 
 def st_authority(r: Run):
-    run = r.m["discovery"]["run"]
+    run = r.m["multimodal"]["accepted_dir"] if r.m.get("multimodal") else r.m["discovery"]["run"]
     decision = _decision(run)
     v2 = r.m.get("selection_v2") if r.args.selection == "v2" else None
     if r.args.selection == "v2" and v2 is None:
@@ -278,7 +326,8 @@ def st_authority(r: Run):
         log(f"authority {kind}: {aid[:12]} span {np.ptp(auth.q):.4f} {auth.q_units} status {status}")
     r.m["discovery_decision"] = decision
     r.set("authority", "PASSED" if r.branches() else "FAILED", authorities=made, discovery_decision=decision,
-          decision_source="joint_selection_v2" if v2 else "legacy discovery decision (diagnostic mode)",
+          decision_source=("multimodal frontend + joint_selection_v2" if r.m.get("multimodal") else "joint_selection_v2")
+          if v2 else "legacy discovery decision (diagnostic mode)", authority_source=str(run),
           physical_joint_status=None if v2 is None else v2["physical_joint_status"],
           working_motion_model=None if v2 is None else v2["working_motion_model"])
     if not r.branches():
@@ -328,12 +377,22 @@ def st_dense(r: Run):
         train = np.array([t not in held for t in range(auth.T) for _ in r.args.cameras])
         robot, robot_src = _robot(r, auth)
         obs = r.m["discovery"].get("observations") or []
-        seeds, rep = seeds_from_discovery(r.m["discovery"]["run"], kind, obs, cfg) if obs else (None, {"seeds": "none"})
+        seed_run = r.m["multimodal"]["accepted_dir"] if r.m.get("multimodal") else r.m["discovery"]["run"]
+        seeds, rep = seeds_from_discovery(seed_run, kind, obs, cfg) if obs else (None, {"seeds": "none"})
+        extra_fn = None
+        if r.m.get("multimodal") and robot is not None:
+            cs = np.load(Path(r.m["multimodal"]["accepted_dir"]) / "contact_states.npz")["contact_state"]
+            confirmed = set(np.flatnonzero(cs == "contact_confirmed").tolist())
+            if confirmed:
+                from estimotion_2part.joint_discovery.config import TcpSupportConfig
+                from estimotion_2part.joint_discovery.tcp_support import ToolModel, tcp_pixel_seeds
+                tool = ToolModel.from_scene(r.scene, TcpSupportConfig())
+                extra_fn = lambda stack: tcp_pixel_seeds(stack, robot["p_tcp_w"], robot["p_ee_w"], confirmed, cfg, tool)
         if r.args.dry_run:
             print(f"   DRY: dense {kind} -> {out} (held-out times {held})")
             continue
         m = run_dense_support(r.scene, auth, aid, r.args.cameras, out, train, cfg, seeds=seeds, seed_report=rep,
-                              robot=robot)
+                              robot=robot, extra_seed_fn=extra_fn)
         res[kind] = dict(totals=m["totals"], walltime_s=m["walltime_s"], peak_vram_mib=m["peak_vram_mib"],
                          heldout_times=held, robot_ignore=robot_src)
         log(f"dense {kind}: {m['totals']}")
@@ -649,7 +708,11 @@ def _compare_v2(r: Run):
                physics_joint_export_ready=v2["physics_joint_export_ready"], reasons=v2["reasons"],
                failure_codes=list(v2["failure_codes"]), render_evidence=render, render_veto=veto,
                selection_v2=r.m["selection_v2"]["path"], selection_v2_sha256=r.m["selection_v2"]["sha256"],
-               discovery_decision_legacy=r.m.get("discovery_decision"))
+               discovery_decision_legacy=r.m.get("discovery_decision"),
+               multimodal=None if not r.m.get("multimodal") else dict(
+                   r.m["multimodal"], **{k: v2.get(k) for k in ("contact_evidence_used", "force_evidence_used",
+                                                                 "contact_assumption_satisfied", "joint_type_identified",
+                                                                 "joint_geometry_validated")}))
     if veto.get("allowed") and sel["selected"] and veto["favours"] != sel["selected"]:
         sel.update(status="MODEL_INCONSISTENT", physics_joint_export_ready=False)
         sel["failure_codes"].append("RENDER_VETO")
@@ -843,7 +906,7 @@ def st_export(r: Run):
           physics="measured spec given" if r.args.dynamics_spec else "none: visual + kinematics only")
 
 
-FUNCS = dict(audit=st_audit, discover=st_discover, select=st_select, authority=st_authority, dense=st_dense, build=st_build,
+FUNCS = dict(audit=st_audit, discover=st_discover, multimodal_refine=st_multimodal_refine, select=st_select, authority=st_authority, dense=st_dense, build=st_build,
              parts=st_parts, blend=st_blend, art=st_art, refine=st_refine, compare=st_compare, video=st_video,
              final=st_final, export=st_export)
 
@@ -870,6 +933,12 @@ def main(argv=None):
     ap.add_argument("--selection", choices=["v2", "legacy"], default="v2",
                     help="v2 (default): observable physical joint selection decides; legacy: discovery decision + "
                          "render comparison (diagnostic, never certifies a physical joint)")
+    ap.add_argument("--multimodal-frontend", action="store_true",
+                    help="run the iterative pre-3DGS RGB-D + TCP contact-mode + verified-force frontend; its accepted "
+                         "state feeds select / authority / dense (requires --selection v2)")
+    ap.add_argument("--mm-max-iterations", type=int, default=3, help="multimodal frontend rounds (accept/rollback)")
+    ap.add_argument("--contact-segments", default=None,
+                    help="forceartgs.contact_segments/v1 annotation (operator / video); omit = unknown contact")
     ap.add_argument("--render-min-blocks", type=int, default=6,
                     help="independent held-out time blocks required before render evidence may veto (spec 8.3)")
     ap.add_argument("--assume-physical-joint", default=None, metavar="APPROVAL_NOTE",

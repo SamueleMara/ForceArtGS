@@ -119,9 +119,27 @@ def base_motion(tab: PointTable, s_core, iv) -> dict:
 
 
 def tool_proximity(tab: PointTable, moving, robot: dict | None, radius_m=0.05) -> dict:
-    """Fraction of moving-proposal 3D observations within ``radius_m`` of the measured tool shaft (TCP->EE)."""
+    """Fraction of moving-proposal 3D observations within ``radius_m`` of the measured tool shaft (TCP->EE).
+
+    With ``robot['tool']`` (a ``tcp_support.ToolModel``) the test is tool OCCUPANCY (inside the capsule that starts one
+    radius above the tip), so object points touched by the tip are not counted as tool."""
     if not robot or robot.get("p_tcp_w") is None:
         return dict(status="NO_ROBOT_DATA")
+    if robot.get("tool") is not None:
+        from .tcp_support import tool_distance
+        tool = robot["tool"]
+        p_tcp, p_ee = np.asarray(robot["p_tcp_w"], float), np.asarray(robot["p_ee_w"], float)
+        inside, total = 0, 0
+        for t in range(min(tab.T, len(p_tcp))):
+            if not (np.isfinite(p_tcp[t]).all() and np.isfinite(p_ee[t]).all()):
+                continue
+            X = tab.X[t, moving]
+            X = X[np.isfinite(X).all(1)]
+            if len(X):
+                inside += int((tool_distance(X, p_tcp[t], p_ee[t], tool) < tool.radius_m).sum())
+                total += len(X)
+        return dict(status="OK", radius_m=tool.radius_m, test="tool capsule occupancy", fraction_near_tool=float(
+            inside / max(total, 1)), n_obs=total)
     p_tcp, p_ee = np.asarray(robot["p_tcp_w"], float), np.asarray(robot.get("p_ee_w", robot["p_tcp_w"]), float)
     near, total = 0, 0
     for t in range(min(tab.T, len(p_tcp))):

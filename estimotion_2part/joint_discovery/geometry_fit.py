@@ -115,8 +115,10 @@ def refine_anchors(kind, axis, origin, q, X0, obs: TrackObservations, K, T_CW, n
         D = np.zeros((len(idx), 2, 3))
         D[:, 0, 0], D[:, 0, 2] = fx / zz, -fx * xc[:, 0] / zz ** 2
         D[:, 1, 1], D[:, 1, 2] = fy / zz, -fy * xc[:, 1] / zz ** 2
-        Juv = D @ M / noise.sigma_px
-        ruv = (uv - obs.uv[idx]) / noise.sigma_px
+        su = noise.sigma_px if getattr(obs, "uv_sigma_scale", None) is None else \
+            noise.sigma_px * obs.uv_sigma_scale[idx][:, None, None]
+        Juv = D @ M / su
+        ruv = (uv - obs.uv[idx]) / (su[:, :, 0] if np.ndim(su) else su)
         wuv = (dof + 1) / (dof + np.sum(ruv ** 2, 1) / 2)
         H = np.einsum("mki,mkj->mij", Juv, Juv) * wuv[:, None, None]
         g = np.einsum("mki,mk->mi", Juv, ruv) * wuv[:, None]
@@ -203,6 +205,7 @@ def fit_geometry(kind, axis0, origin0, q0, anchors, fit_tracks, weights, problem
     dz = (obs.depth_valid[sel] & obs.mask_valid[sel] & np.isfinite(obs.z[sel])) if problem.use_depth else np.zeros(len(sel), bool)
     sz = problem.sigma_z[sel]
     sw = np.sqrt(np.clip(weights[tr], 0, 1))
+    uv_scale = None if getattr(obs, "uv_sigma_scale", None) is None else obs.uv_sigma_scale[sel]
     uv_obs = obs.uv[sel]
     z_obs = np.nan_to_num(obs.z[sel])
     ts = obs.frame_map.timestamp_s
@@ -215,6 +218,8 @@ def fit_geometry(kind, axis0, origin0, q0, anchors, fit_tracks, weights, problem
         xw = apply_joint(kind, a, o, q[t], Xi)
         uv, z, _ = project_stacked(xw, cam, problem.K, problem.T_CW)
         r_uv = ((uv - uv_obs) / noise.sigma_px) * sw[:, None]
+        if uv_scale is not None:
+            r_uv = r_uv / uv_scale[:, None]
         r_z = (((z - z_obs) / sz) * sw)[dz]
         parts = [r_uv.ravel(), r_z]
         if use_prior:
@@ -269,6 +274,19 @@ def fit_geometry(kind, axis0, origin0, q0, anchors, fit_tracks, weights, problem
             qn = np.where(rt >= 0, qcol[np.clip(rt + sh, 0, T - 1)], -1)
             m = qn >= 0
             add(er[m], qn[m])
+        # rows whose value depends on several q (e.g. a variable-projected sticking anchor over a segment)
+        deps = getattr(extra, "row_q_deps", None)
+        if deps is not None:
+            if len(deps) != n_extra:
+                raise ValueError("extra.row_q_deps must list the q dependencies of every extra row")
+            rr, cc = [], []
+            for i, d in enumerate(deps):
+                qc_ = qcol[np.asarray(d, int)]
+                qc_ = qc_[qc_ >= 0]
+                rr.append(np.full(len(qc_), er[i]))
+                cc.append(qc_)
+            if rr:
+                add(np.concatenate(rr), np.concatenate(cc))
     n_rows = n_uv + n_z + n_prior + n_extra
     n_cols = L.n_global + 3 * len(fit_tracks)
     S = sparse.coo_matrix((np.ones(sum(len(r) for r in rows)), (np.concatenate(rows), np.concatenate(cols))),

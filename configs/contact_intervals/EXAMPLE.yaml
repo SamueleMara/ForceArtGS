@@ -1,0 +1,41 @@
+# forceartgs.contact_segments/v1 -- an INDEPENDENT annotation (operator knowledge of the demonstration or video
+# annotation). Never derived from force thresholds or from a joint fit. Endpoints are exact source_frame_index values of
+# the reconstructed frame map (inclusive). Overlaps, non-exact endpoints, missing TCP on confirmed frames, sigma <= 0
+# and rigid_grasp are errors -- never silently changed into another mode.
+schema: forceartgs.contact_segments/v1
+frame_id: base_link
+frame_index_type: source_frame_index
+scene_id: example_scene
+source: operator_confirmed_demo_protocol
+notes: "Operator knows the robot kept one material point during grasp_A, pushed a face during push_B"
+segments:
+  - segment_id: grasp_A              # exact zero slip: ONE structural canonical anchor for the whole segment
+    start_source_frame: 100
+    end_source_frame: 140
+    contact_state: contact_confirmed
+    slip_mode: stick_hard
+    provenance: operator_label
+    contact_model: unilateral_point   # unilateral_point | grasp | unknown  (grasp -> no single-point friction cone)
+    sigma_tcp_position_m: 0.005
+  - segment_id: regrasp_A2           # after a release: a NEW anchor (never bridged across the gap)
+    start_source_frame: 146
+    end_source_frame: 170
+    contact_state: contact_confirmed
+    slip_mode: stick_soft             # near-zero slip; drift reported against Sigma_stick
+    provenance: operator_label
+    sigma_tcp_position_m: 0.005
+    sigma_stick_soft_m: 0.02
+  - segment_id: push_B               # the parent model: contact point slides over the observed face
+    start_source_frame: 172
+    end_source_frame: 190
+    contact_state: contact_confirmed
+    slip_mode: sliding
+    provenance: independent_video_annotation
+    sigma_tcp_position_m: 0.005
+    sigma_contact_surface_m: 0.004
+  - segment_id: uncertain_C          # unknown contact: proposals only, never a residual
+    start_source_frame: 192
+    end_source_frame: 200
+    contact_state: contact_unknown
+    slip_mode: sliding
+    provenance: none

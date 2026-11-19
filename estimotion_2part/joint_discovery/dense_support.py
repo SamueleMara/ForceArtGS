@@ -466,7 +466,8 @@ def export_dense(stack: ImageStack, labels, score, ev, out_dir, authority_id: st
 
 
 def run_dense_support(scene_root, authority: JointAuthority, authority_id: str, cameras, out_dir, train_mask,
-                      cfg: DenseConfig = DenseConfig(), seeds=None, seed_report=None, robot=None) -> dict:
+                      cfg: DenseConfig = DenseConfig(), seeds=None, seed_report=None, robot=None,
+                      extra_seed_fn=None) -> dict:
     """G1 entry point. ``train_mask`` [N images, time-major (t, camera)] marks training targets."""
     import torch
     t0 = time.time()
@@ -478,6 +479,12 @@ def run_dense_support(scene_root, authority: JointAuthority, authority_id: str, 
     train_mask = np.asarray(train_mask, bool)
     if len(train_mask) != len(stack.stems):
         raise ValueError("train_mask must cover every (time, camera) image")
+    if extra_seed_fn is not None:                  # e.g. TCP contact pixel seeds (multimodal frontend)
+        extra, extra_rep = extra_seed_fn(stack)
+        seeds = dict(seeds or {})
+        for key, pts in extra.items():
+            seeds.setdefault(key, []).extend(pts)
+        seed_report = dict(seed_report or {}, tcp_pixel_seeds=extra_rep)
     prior, seed_counts = seed_prior_maps(stack, seeds, cfg)
     with torch.no_grad():
         ev = dense_evidence(stack, authority, train_mask, cfg)

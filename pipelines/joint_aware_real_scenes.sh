@@ -2,6 +2,7 @@
 # Joint-aware reconstruction on the real scenes (both R and P branches per scene; no vanilla stages).
 #   bash pipelines/joint_aware_real_scenes.sh [budget smoke|coarse|full] [out_root]
 # Env: SCENES="name ..." subset, STAGES (default all), DISC_ROOT (overnight discovery outputs),
+#      MULTIMODAL=1 (pre-3DGS RGB-D + TCP contact-mode frontend, configs/contact_intervals/<scene>.yaml), MM_ITERS,
 #      EXPORT_ARGS="--export-parttwin [--export-diagnostic] [--dynamics-spec S.yaml]" for the G8 PArtTwin1D export.
 # Reuses each scene's 2026-11-18 overnight discovery run (cluster-robust z + observability policy, cam_001+cam_002),
 # its AllTracker observation tables (dense seeds) and robot archive (tool exclusion). Outputs on the SSD only.
@@ -33,10 +34,15 @@ for row in "${TABLE[@]}"; do
   IFS='|' read -r name frames obs <<< "$row"
   [[ -n "${SCENES:-}" && " $SCENES " != *" $name "* ]] && continue
   disc="$DISC_ROOT/$name/NEW_cluster_obs_cam001_002"
-  log "$name start"
+  MM=()
+  if [[ "${MULTIMODAL:-0}" == 1 ]]; then
+    MM=(--multimodal-frontend --mm-max-iterations "${MM_ITERS:-3}")
+    [[ -f "configs/contact_intervals/$name.yaml" ]] && MM+=(--contact-segments "configs/contact_intervals/$name.yaml")
+  fi
+  log "$name start ${MM[*]}"
   "$PY" pipelines/joint_aware_reconstruction.py --scene "$REAL/$name" --frames "$frames" --cameras cam_001 cam_002 \
       --output-root "$OUT" --discovery-run "$disc" --observations "$obs/obs_cam_001.npz" "$obs/obs_cam_002.npz" \
-      --robot-archive "$DISC_ROOT/$name/robot_archive.npz" --stage "$STAGES" --budget "$BUDGET" ${EXPORT_ARGS:-} \
+      --robot-archive "$DISC_ROOT/$name/robot_archive.npz" --stage "$STAGES" --budget "$BUDGET" ${EXPORT_ARGS:-} "${MM[@]}" \
       >> "$OUT/$name.$BUDGET.log" 2>&1
   rc=$?
   IFS=: read -r fa fb fk <<< "$frames"

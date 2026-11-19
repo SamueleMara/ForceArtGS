@@ -51,6 +51,8 @@ def whitened_residuals(kind, axis, origin, q, anchors, obs: TrackObservations, K
     r_z = np.full(obs.n_obs, np.nan)
     uvv = obs.uv_valid[idx]
     r_uv[idx[uvv]] = (uv_pred[uvv] - obs.uv[idx[uvv]]) / noise.sigma_px
+    if getattr(obs, "uv_sigma_scale", None) is not None:
+        r_uv[idx[uvv]] /= obs.uv_sigma_scale[idx[uvv]][:, None]
     if use_depth:
         dz = obs.depth_valid[idx] & obs.mask_valid[idx] & np.isfinite(obs.z[idx])
         sz = depth_sigma(obs.z[idx[dz]], noise, obs.depth_edge[idx[dz]], obs.depth_cos[idx[dz]])

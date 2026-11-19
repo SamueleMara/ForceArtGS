@@ -94,7 +94,7 @@ def robot_evidence_v2(contact=None, calibration=None) -> dict:
 
 def run_selection_v2(obs, calibs, cfg, out_dir, *, scene=None, fit_tr=None, partition=None, acf=None,
                      test_obs=None, robot=None, contact=None, wrench_calibration=None, legacy=None,
-                     source_files=None, log=print) -> dict:
+                     source_files=None, log=print, support_override=None, robot_evidence_override=None) -> dict:
     v2 = cfg.selection_v2
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -115,8 +115,9 @@ def run_selection_v2(obs, calibs, cfg, out_dir, *, scene=None, fit_tr=None, part
         fit_tr = fit_joint_hypotheses(train, calibs, cfg, ref=ref, log=log)
     noise = fit_tr.problem.noise
     # ------------------------------------------------------------- support + motion field (training only)
-    support = candidate_independent_support(train, noise)
-    _log(f"[v2] candidate-independent support {support['counts']}", log)
+    support = candidate_independent_support(train, noise) if support_override is None else support_override
+    _log(f"[v2] candidate-independent support {support['counts']}"
+         + (" (multimodal frontend: TCP-updated)" if support_override is not None else ""), log)
     tab = PointTable(train, noise, calibs)
     tr_t = partition.train_times
     bnd = sorted({b[0] for b, h in zip(partition.blocks, partition.heldout) if not h} | {tr_t[-1]})
@@ -152,7 +153,7 @@ def run_selection_v2(obs, calibs, cfg, out_dir, *, scene=None, fit_tr=None, part
     sep = prediction_separation(fit_tr.candidates, train, calibs, support["M_proposal"], partition,
                                 k_sigma=v2.separation_k_sigma)
     ho = heldout_block_preference(fit_tr, test, partition, support["M_proposal"], min_blocks=v2.min_independent_blocks)
-    robot_ev = robot_evidence_v2(contact, wrench_calibration)
+    robot_ev = robot_evidence_v2(contact, wrench_calibration) if robot_evidence_override is None else robot_evidence_override
     fits = {k: dict(axis=np.asarray(c.axis_w).tolist(), origin=None if c.origin_w is None else np.asarray(c.origin_w).tolist(),
                     q_span=float(np.nanmax(c.q) - np.nanmin(c.q))) for k, c in fit_tr.candidates.items()}
     dec = select_physical_joint(
@@ -233,6 +234,11 @@ def run_selection_v2(obs, calibs, cfg, out_dir, *, scene=None, fit_tr=None, part
                thresholds=dict(cfg.selection_v2.__dict__), legacy_decision=legacy,
                export_contract="URDF/USD/MJCF producers must require physics_joint_export_ready=true; "
                                "working_motion_model is never a certified physical joint")
+    ce, fe = robot_ev.get("contact", {}), robot_ev.get("force", {})
+    sel.update(joint_type_identified=dec.physical_joint_status.startswith("IDENTIFIED_"),
+               joint_geometry_validated=bool(dec.physics_joint_export_ready),
+               contact_assumption_satisfied=ce.get("assumption_satisfied"),
+               contact_evidence_used=bool(ce.get("used_in_fit")), force_evidence_used=bool(fe.get("used_in_fit")))
     write_json(out / "joint_selection_v2.json", sel)
     write_json(out / "regression_report.json", dict(
         legacy_decision=legacy, v2_status=dec.physical_joint_status, v2_working_model=dec.working_motion_model,

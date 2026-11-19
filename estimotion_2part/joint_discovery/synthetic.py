@@ -254,3 +254,181 @@ def make_sliding_contact(sc: SyntheticScene, mu=0.3, force_n=6.0, force_noise=0.
     cal.gravity_model = Provenanced(None, "VERIFIED", "synthetic: no gravity")
     cal.clock = Provenanced(dict(offset_s=0.0, uncertainty_s=0.0), "VERIFIED", "synthetic")
     return rec, tl, cal, dict(x0=x0, n0_out=n0_out, f_obj=f_obj, slip=slip, mu=mu)
+
+
+def make_tcp_contact(kind="revolute", mode="stick_hard", T=30, max_angle_deg=30.0, max_disp_m=0.15, sigma_tcp=0.002,
+                     seed=0, axis=None, hinge=None, anchor=None, slide=(-0.08, 0.08), release_at=None, drift_m=0.0,
+                     state="contact_confirmed", provenance="operator_label", fps=10.0):
+    """Analytic TCP contact on a revolute lid (top face z = 0.13) or prismatic drawer (front face y = -0.21).
+
+    ``mode``: stick_* -> constant canonical anchor (+ linear canonical drift ``drift_m`` along x);
+    sliding -> the canonical contact slides along x over ``slide``. ``release_at``: the TCP releases at that time
+    (2 frames without contact) and re-grasps at a different anchor. Returns a dict with the frame map, TCP, ground
+    truth, observed surface points (canonical = world at q = 0) and a contact-segment annotation document."""
+    rng = np.random.default_rng(seed)
+    s = np.linspace(0, 1, T)
+    prof = 3 * s ** 2 - 2 * s ** 3
+    if kind == "revolute":
+        u = normalize(np.array([1.0, 0.0, 0.0]) if axis is None else axis)
+        o = np.array([0.0, 0.1, 0.13]) if hinge is None else np.asarray(hinge, float)
+        q = -np.radians(max_angle_deg) * prof
+        gx, gy = np.meshgrid(np.linspace(-0.15, 0.15, 25), np.linspace(-0.1, 0.1, 17))
+        surf = np.c_[gx.ravel(), gy.ravel(), np.full(gx.size, 0.13)]
+        base = np.array([0.0, -0.05, 0.13]) if anchor is None else np.asarray(anchor, float)
+    else:
+        u = normalize(np.array([0.0, -1.0, 0.0]) if axis is None else axis)
+        o = None
+        q = max_disp_m * prof
+        gx, gz = np.meshgrid(np.linspace(-0.13, 0.13, 25), np.linspace(0.02, 0.08, 9))
+        surf = np.c_[gx.ravel(), np.full(gx.size, -0.21), gz.ravel()]
+        base = np.array([0.0, -0.21, 0.05]) if anchor is None else np.asarray(anchor, float)
+    c = np.repeat(base[None], T, 0)
+    if mode == "sliding":
+        c[:, 0] = slide[0] + (slide[1] - slide[0]) * s
+    elif drift_m:
+        c[:, 0] += drift_m * s
+    contact = np.ones(T, bool)
+    if release_at is not None:
+        contact[release_at:release_at + 2] = False
+        c[release_at + 2:, 0] += 0.06
+    p = np.stack([apply_joint(kind, u, o, q[t], c[t]) for t in range(T)]) + rng.normal(0, sigma_tcp, (T, 3))
+    p[~contact] = np.nan
+    fm = FrameMap(np.arange(T), np.arange(T) * 2, np.arange(T) / fps, provenance="synthetic")
+    src = fm.source_frame_index
+    if release_at is None:
+        spans = [(0, T - 1)]
+    else:
+        spans = [(0, release_at - 1), (release_at + 2, T - 1)]
+    doc = dict(schema="forceartgs.contact_segments/v1", frame_id="world", frame_index_type="source_frame_index",
+               scene_id="synthetic", source="synthetic ground truth",
+               segments=[dict(segment_id=f"seg{k}", start_source_frame=int(src[a]), end_source_frame=int(src[b]),
+                              contact_state=state, slip_mode=mode, provenance=provenance,
+                              sigma_tcp_position_m=max(sigma_tcp, 1e-4) * 1.0, sigma_contact_surface_m=0.003,
+                              sigma_stick_soft_m=0.02, contact_model="unilateral_point")
+                         for k, (a, b) in enumerate(spans)])
+    return dict(frame_map=fm, p_tcp=p, q=q, axis=u, origin=o, kind=kind, canonical_path=c, surface_points=surf,
+                camera_centers=np.array([[-0.1, -0.9, 0.6], [0.5, -0.7, 0.5]]), segments_doc=doc, contact=contact)
+
+
+def make_contact_record(sc: SyntheticScene, mode="stick_hard", anchor=None, sigma_tcp=0.001, force="min_effort",
+                        force_n=6.0, force_noise_deg=5.0, verified=True, state="contact_confirmed",
+                        provenance="operator_label", seed=0, tool_points=0):
+    """TCP + wrench consistent with the scene's ground-truth joint. ``mode`` stick_hard/stick_soft: one canonical
+    material point; sliding: the canonical point slides along x over the observed face. ``force``: 'min_effort'
+    (push along the material velocity), 'normal' (push into the face) or None. Returns (ContactRecord,
+    WrenchCalibration, segment annotation doc)."""
+    from .rigid_kinematics import body_velocity, exp_so3
+    from .tcp_contact import ContactRecord, joint_rate, tcp_velocity
+    from .wrench_calibration import Provenanced, WrenchCalibration
+    rng = np.random.default_rng(seed)
+    fm = sc.obs.frame_map
+    T = fm.T
+    s = np.linspace(0, 1, T)
+    if sc.gt_kind == "revolute":
+        base = np.array([0.0, -0.05, 0.13]) if anchor is None else np.asarray(anchor, float)
+        n0 = np.array([0.0, 0.0, 1.0])
+    else:
+        base = np.array([0.0, -0.21, 0.05]) if anchor is None else np.asarray(anchor, float)
+        n0 = np.array([0.0, -1.0, 0.0])
+    c = np.repeat(base[None], T, 0)
+    if mode == "sliding":
+        c[:, 0] = -0.08 + 0.16 * s
+    p = np.stack([apply_joint(sc.gt_kind, sc.gt_axis, sc.gt_origin, sc.gt_q[t], c[t]) for t in range(T)])
+    p = p + rng.normal(0, sigma_tcp, p.shape)
+    ts = fm.timestamp_s
+    v = tcp_velocity(p, ts)
+    vm = body_velocity(sc.gt_kind, sc.gt_axis, sc.gt_origin, joint_rate(sc.gt_q, ts), p)
+    if sc.gt_kind == "revolute":
+        R = exp_so3(normalize(sc.gt_axis)[None] * sc.gt_q[:, None])
+        nW = np.einsum("tij,j->ti", R, n0)
+    else:
+        nW = np.tile(n0, (T, 1))
+    if force == "min_effort":
+        d = vm / np.maximum(np.linalg.norm(vm, axis=1, keepdims=True), 1e-9)
+        d[np.linalg.norm(vm, axis=1) < 1e-6] = -nW[np.linalg.norm(vm, axis=1) < 1e-6]
+    else:
+        d = -nW
+    d = d + rng.normal(0, np.radians(force_noise_deg), d.shape)
+    f_obj = force_n * d / np.linalg.norm(d, axis=1, keepdims=True)
+    R_W_EE = np.tile(np.eye(3)[None], (T, 1, 1))
+    F_rec = -f_obj                                           # reaction on the robot, sensor axes = world axes
+    p_ee = p + 0.19 * nW                                     # tool approaches along the outward face normal
+    rec = ContactRecord(ts, p, v, np.zeros(T, bool), np.c_[F_rec, np.zeros((T, 3))] if force else None, R_W_EE,
+                        np.eye(4), "synthetic", "synthetic", dict(hardware_sync_verified=verified), [], p_ee_w=p_ee)
+    cal = WrenchCalibration(dataset_id="synthetic", tool_id="synthetic")
+    if verified:
+        cal.R_EE_S = Provenanced(np.eye(3).tolist(), "VERIFIED", "synthetic")
+        cal.recorded_quantity = Provenanced("object_on_robot", "VERIFIED", "synthetic")
+        cal.tare_S = Provenanced([0.0, 0.0, 0.0], "VERIFIED", "synthetic", dict(sigma_N=[0.05] * 3))
+        cal.tests["tare"] = dict(status="PASS", reason="synthetic zero tare")
+        cal.gravity_model = Provenanced(None, "VERIFIED", "synthetic: no gravity")
+        cal.clock = Provenanced(dict(offset_s=0.0, uncertainty_s=0.0), "VERIFIED", "synthetic")
+    doc = dict(schema="forceartgs.contact_segments/v1", frame_id="world", frame_index_type="source_frame_index",
+               scene_id="synthetic", source="synthetic ground truth",
+               segments=[dict(segment_id="seg0", start_source_frame=int(fm.source_frame_index[0]),
+                              end_source_frame=int(fm.source_frame_index[-1]), contact_state=state, slip_mode=mode,
+                              provenance=provenance, sigma_tcp_position_m=max(3 * sigma_tcp, 0.002),
+                              sigma_contact_surface_m=0.004, sigma_stick_soft_m=0.02,
+                              contact_model="unilateral_point")])
+    return rec, cal, doc
+
+
+class SplatImageSource:
+    """Textured synthetic images for track-recovery tests: dense random-intensity surface points of the scene's base
+    and moving part (moved by the ground-truth joint), splatted with a z-buffer; depth and object mask included."""
+
+    def __init__(self, sc: SyntheticScene, n_texture=6000, seed=0, radius_px=2):
+        rng = np.random.default_rng(seed)
+        self.sc = sc
+        self.radius = radius_px
+        base = box_surface(rng, [0, 0, 0.05], [0.3, 0.2, 0.1], n_texture)
+        if sc.gt_kind == "revolute":
+            mov = box_surface(rng, [0, 0, 0.115], [0.3, 0.2, 0.03], n_texture // 2)
+        else:
+            mov = box_surface(rng, [0, -0.02, 0.05], [0.26, 0.16, 0.06], n_texture // 2)
+            mov[:, 1] -= 0.11
+        self.base, self.mov = base, mov
+        self.ib = rng.uniform(40, 215, len(base))
+        self.im = rng.uniform(40, 215, len(mov))
+        self.cache = {}
+
+    def _render(self, cam, t):
+        key = (cam, t)
+        if key in self.cache:
+            return self.cache[key]
+        sc = self.sc
+        cal = sc.calibs[cam]
+        mov = apply_joint(sc.gt_kind, sc.gt_axis, sc.gt_origin, np.full(len(self.mov), sc.gt_q[t]), self.mov)
+        P = np.concatenate([self.base, mov])
+        I = np.concatenate([self.ib, self.im])
+        xc = (P - cal.T_WC[:3, 3]) @ cal.T_WC[:3, :3]
+        z = xc[:, 2]
+        u = cal.K[0, 0] * xc[:, 0] / z + cal.K[0, 2]
+        v = cal.K[1, 1] * xc[:, 1] / z + cal.K[1, 2]
+        img = np.full((cal.height, cal.width), 20.0, np.float32)
+        dep = np.zeros((cal.height, cal.width))
+        msk = np.zeros((cal.height, cal.width), bool)
+        order = np.argsort(-z)                                   # far to near: near overwrites
+        r = self.radius
+        for k in order:
+            if z[k] <= 0.05:
+                continue
+            uu, vv = int(round(u[k])), int(round(v[k]))
+            if not (r <= uu < cal.width - r and r <= vv < cal.height - r):
+                continue
+            img[vv - r:vv + r + 1, uu - r:uu + r + 1] = I[k]
+            dep[vv - r:vv + r + 1, uu - r:uu + r + 1] = z[k]
+            msk[vv - r:vv + r + 1, uu - r:uu + r + 1] = True
+        import cv2
+        img = cv2.GaussianBlur(img, (3, 3), 0.8)
+        self.cache[key] = (img, dep, msk)
+        return self.cache[key]
+
+    def gray(self, cam, t):
+        return self._render(cam, t)[0]
+
+    def depth(self, cam, t):
+        return self._render(cam, t)[1]
+
+    def mask(self, cam, t):
+        return self._render(cam, t)[2]

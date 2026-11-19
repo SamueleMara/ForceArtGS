@@ -140,6 +140,84 @@ class SelectionV2Config:
                                  "tests/test_joint_physical_selection_v2.py; not fitted to any real scene")
 
 
+SLIP_MODES = ("sliding", "stick_soft", "stick_hard")
+MECHANICAL_MODELS = ("none", "min_effort_tangent")
+
+
+@dataclass
+class ContactModeConfig:
+    """Unified TCP contact: ``sliding`` (parent model) with ``stick_soft`` / ``stick_hard`` specialisations.
+
+    Uncertainties are calibration placeholders: ``None`` means not calibrated. A diagnostic fallback is then used
+    and every result is flagged UNVERIFIED_PRIOR_SCALE (never physics-export ready)."""
+    enabled: bool = True
+    default_mode: str = "sliding"                 # sliding | stick_soft | stick_hard   (rigid_grasp: not implemented)
+    require_operator_mode_confirmation: bool = True
+    sigma_tcp_position_m: float | None = None
+    sigma_contact_surface_m: float | None = None
+    sigma_stick_soft_m: float | None = None
+    fallback_sigma_tcp_position_m: float = 0.015  # user-stated acceptable TCP error 1-2 cm (unverified scale)
+    fallback_sigma_contact_surface_m: float = 0.01
+    fallback_sigma_stick_soft_m: float = 0.02
+    intervals_file: str | None = None
+    min_segment_samples: int = 3
+    contradiction_chi2_per_dof: float = 9.0       # mean whitened^2 above this on a confirmed segment -> contradicted
+    surface_patch_radius_m: float = 0.03
+    surface_min_points: int = 8
+
+
+@dataclass
+class TcpSupportConfig:
+    enabled: bool = True
+    tool_geometry_source: str = "metadata/robot_tool.json"
+    seed_contact_object_surface: bool = True
+    exclude_occluding_robot_geometry: bool = True
+    tool_radius_m: float = 0.02                   # crude capsule TCP->EE (no measured tool mesh): APPROXIMATE
+    tool_ambiguity_margin_m: float = 0.015
+    tool_extend_m: float = 0.05
+    seed_radius_m: float = 0.04
+    proposal_k_sigma: float = 5.0                 # unconfirmed-contact proposals: relaxed motion test (vs 7 sigma)
+
+
+@dataclass
+class ForceModeConfig:
+    enabled: bool = True
+    require_verified_wrench: bool = True
+    use_signed_alignment_diagnostic: bool = True
+    mode_aware_friction: bool = True
+    mechanical_model: str = "none"                # none | min_effort_tangent (explicitly assumed actuation model)
+    min_force_n: float = 1.0
+    eps_slip_mps: float = 0.003
+    mu_max: float = 1.5
+    mu_static_max: float = 1.0
+    min_direction_separation_deg: float = 10.0
+    sigma_direction_deg: float = 15.0
+    n_null: int = 200
+
+
+@dataclass
+class FrontendValidationConfig:
+    use_frozen_temporal_folds: bool = True
+    compare_on_common_observations: bool = True
+    forbid_test_time_anchor_refit: bool = True
+    min_relative_improvement: float = 0.002       # held-out NLL must improve by this fraction to accept a round
+    max_support_loss_fraction: float = 0.2        # a round may not drop more than this fraction of moving support
+
+
+@dataclass
+class MultimodalFrontendConfig:
+    enabled: bool = False
+    max_iterations: int = 4
+    track_refinement: bool = True
+    ncc_min: float = 0.85
+    max_recover_per_round: int = 4000
+    dense_masks: bool = True
+    contact: ContactModeConfig = field(default_factory=ContactModeConfig)
+    tcp_support: TcpSupportConfig = field(default_factory=TcpSupportConfig)
+    force: ForceModeConfig = field(default_factory=ForceModeConfig)
+    validation: FrontendValidationConfig = field(default_factory=FrontendValidationConfig)
+
+
 @dataclass
 class JointDiscoveryConfig:
     mode: str = "legacy"
@@ -165,6 +243,7 @@ class JointDiscoveryConfig:
     depth_evidence: DepthEvidenceSection = field(default_factory=DepthEvidenceSection)
     enable_physical_selection: bool = False   # Stage E: contact/force terms in candidate scoring (gated)
     selection_v2: SelectionV2Config = field(default_factory=SelectionV2Config)
+    multimodal_frontend: MultimodalFrontendConfig = field(default_factory=MultimodalFrontendConfig)
     output_schema_version: int = 1             # 2 when comparison.selection == observable_physical_v2
 
     # ----------------------------------------------------------------- validation
@@ -192,6 +271,28 @@ class JointDiscoveryConfig:
             if not (0.1 <= self.selection_v2.heldout_fraction <= 0.5):
                 raise ValueError("selection_v2.heldout_fraction must be in [0.1, 0.5]")
             self.output_schema_version = 2
+        mf = self.multimodal_frontend
+        if mf.contact.default_mode == "rigid_grasp":
+            raise ValueError("contact.default_mode rigid_grasp: NOT_IMPLEMENTED (needs an independently verified 6-DoF "
+                             "grasp transform and an SE(3) solver); it is never reinterpreted as stick_hard")
+        if mf.contact.default_mode not in SLIP_MODES:
+            raise ValueError(f"multimodal_frontend.contact.default_mode must be one of {SLIP_MODES}")
+        if mf.force.mechanical_model not in MECHANICAL_MODELS:
+            raise ValueError(f"multimodal_frontend.force.mechanical_model must be one of {MECHANICAL_MODELS}")
+        if not mf.force.require_verified_wrench:
+            raise ValueError("multimodal_frontend.force.require_verified_wrench cannot be disabled")
+        v = mf.validation
+        if not (v.use_frozen_temporal_folds and v.compare_on_common_observations and v.forbid_test_time_anchor_refit):
+            raise ValueError("multimodal_frontend.validation leakage guards cannot be disabled")
+        for name in ("sigma_tcp_position_m", "sigma_contact_surface_m", "sigma_stick_soft_m"):
+            val = getattr(mf.contact, name)
+            if val is not None and not (val > 0):
+                raise ValueError(f"multimodal_frontend.contact.{name} must be > 0 (a structural hard stick is not "
+                                 "sigma = 0)")
+        if mf.enabled and self.comparison.selection != "observable_physical_v2":
+            raise ValueError("multimodal_frontend requires comparison.selection: observable_physical_v2")
+        if mf.max_iterations < 1:
+            raise ValueError("multimodal_frontend.max_iterations must be >= 1")
         if self.enable_appearance or self.enable_coarse_renderer:
             # Not silently ignored: these paths are diagnostics only in this version.
             pass
@@ -224,6 +325,8 @@ class JointDiscoveryConfig:
 
     def to_dict(self) -> dict:
         d = asdict(self)
+        if not self.multimodal_frontend.enabled:                # keep legacy / v2 config hashes bit-identical
+            d.pop("multimodal_frontend", None)
         if self.comparison.selection == "heldout_predictive":   # legacy: keep config hashes bit-identical
             d.pop("selection_v2", None)
             d.pop("output_schema_version", None)

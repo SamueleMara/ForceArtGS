@@ -373,6 +373,10 @@ def select_physical_joint(*, motion_evidence, model_fits, common_support, attach
         return PhysicalDecision(status, working, not status.startswith("IDENTIFIED_"), ready, sel, reasons, ev, unc,
                                 codes, cf)
 
+    if ((robot_evidence or {}).get("contact") or {}).get("assumption_failed_segments"):
+        codes.append("CONTACT_MODE_CONTRADICTED")
+        reasons.append("declared contact mode contradicted by every candidate on segments "
+                       f"{robot_evidence['contact']['assumption_failed_segments']} (rows excluded from the fit)")
     # ---------------------------------------------------------------- 1. significant motion?
     trans = rot.get("net_centroid_translation_norm_m")
     tnull = null.get("net_translation_q95_m")
@@ -448,7 +452,20 @@ def select_physical_joint(*, motion_evidence, model_fits, common_support, attach
             reasons.append(f"held-out block preference: {ho.get('status')}")
         cf = dict(prismatic=f"rejected: a slide has zero rotation, the measured net rotation CI "
                             f"{np.round(rot.get('net_rotation_ci95_deg'), 1).tolist()} deg excludes 0 and the null")
-        ready = (not [x for x in codes if x in ("CAMERA_AXIS_DISAGREEMENT",)]) and hinge.get("status") == "OK"
+        rob = robot_evidence or {}
+        cdis = (rob.get("contact") or {}).get("discrimination") or {}
+        fmech = (rob.get("force") or {}).get("mechanical") or {}
+        if cdis.get("status") == "OK" and cdis.get("rejected") == "revolute":
+            reasons.append("independently confirmed contact contradicts the revolute fit (CONTACT_MODE_CONTRADICTED)")
+            codes.append("CONTACT_CONTRADICTS_SELECTED")
+            return decide("MODEL_INCONSISTENT", "none", None)
+        if fmech.get("status") == "OK" and fmech.get("favours") == "prismatic":
+            codes.append("FORCE_DISAGREES")
+            reasons.append("verified force under the declared mechanical model favours the slide")
+        if (rob.get("contact") or {}).get("unverified_scale"):
+            codes.append("UNVERIFIED_PRIOR_SCALE")
+        ready = (not [x for x in codes if x in ("CAMERA_AXIS_DISAGREEMENT", "FORCE_DISAGREES", "UNVERIFIED_PRIOR_SCALE",
+                                                "CONTACT_MODE_CONTRADICTED")]) and hinge.get("status") == "OK"
         return decide("IDENTIFIED_REVOLUTE", "revolute", "revolute", ready=ready)
     # ---------------------------------------------------------------- 4/5. translation without measurable rotation
     imp = attachment_evidence.get("implied", {})
@@ -462,6 +479,24 @@ def select_physical_joint(*, motion_evidence, model_fits, common_support, attach
                                    implied_min_hinge_rotation_deg=implied, plausible_hinges_excluded=bool(excluded),
                                    support_noise_ratio=noise_ratio, per_camera_axes_consistent=cam_axes_ok)
     positive_guide = guide.get("verdict") == "GUIDE_ALIGNED"
+    rob = robot_evidence or {}
+    cdis = (rob.get("contact") or {}).get("discrimination") or {}
+    fmech = (rob.get("force") or {}).get("mechanical") or {}
+    # grounded robot evidence may replace an unobservable guide (hidden drawer rails), never the rotation exclusion
+    cont = rob.get("contact") or {}
+    contact_slider = (cdis.get("status") == "OK" and cdis.get("favours") == "prismatic") or \
+        bool(cont.get("prismatic_consistent_stick") and not cont.get("assumption_failed_segments"))
+    force_slider = fmech.get("status") == "OK" and fmech.get("favours") == "prismatic"
+    if contact_slider:
+        reasons.append("independently confirmed contact: one material point under the TCP moves as the slide predicts "
+                       "(positive support only together with the excluded plausible hinges below)")
+    if force_slider:
+        reasons.append("verified force under the declared mechanical model favours the slide beyond null controls")
+    positive_guide = positive_guide or contact_slider or force_slider
+    if (rob.get("contact") or {}).get("unverified_scale") and (contact_slider and not force_slider and
+                                                                guide.get("verdict") != "GUIDE_ALIGNED"):
+        positive_guide = False
+        codes.append("UNVERIFIED_PRIOR_SCALE")
     if rot.get("rotation_detected") and not sa.get("axis_identifiable"):
         codes.append("ROTATION_WITHOUT_STABLE_AXIS")
         reasons.append("net rotation exceeds the null but its axis is not stable across intervals")

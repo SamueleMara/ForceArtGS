@@ -1,0 +1,36 @@
+# Multimodal pre-3DGS frontend (FORCEARTGS_MULTIMODAL_TCP_FORCE_SLIP_MODES_CODEX_IMPLEMENTATION.md).
+# Unknown keys are rejected. sigma_* = null means "not calibrated": a fallback is used and results are flagged
+# UNVERIFIED_PRIOR_SCALE (never physics-export ready).
+joint_discovery:
+  mode: calibrated_joint_aware
+  comparison:
+    selection: observable_physical_v2
+    uncertainty_method: cluster_robust
+    remote_hinge_policy: observability
+  multimodal_frontend:
+    enabled: true
+    max_iterations: 4
+    track_refinement: true          # NCC recovery of lost moving-track observations (2D only), training times only
+    ncc_min: 0.85
+    contact:
+      enabled: true
+      default_mode: sliding         # sliding | stick_soft | stick_hard   (rigid_grasp: rejected, not implemented)
+      require_operator_mode_confirmation: true
+      sigma_tcp_position_m: null    # calibrate (user-stated acceptable TCP error 1-2 cm -> fallback 0.015, unverified)
+      sigma_contact_surface_m: null
+      sigma_stick_soft_m: null
+      intervals_file: null          # e.g. configs/contact_intervals/<scene>.yaml (operator / video annotation)
+    tcp_support:
+      enabled: true
+      tool_geometry_source: metadata/robot_tool.json
+      tool_radius_m: 0.02           # no measured tool mesh: capsule radius is an APPROXIMATION
+      tool_ambiguity_margin_m: 0.015
+    force:
+      enabled: true
+      require_verified_wrench: true # cannot be disabled
+      mechanical_model: none        # none | min_effort_tangent (explicitly ASSUMED actuation model)
+    validation:
+      use_frozen_temporal_folds: true
+      compare_on_common_observations: true
+      forbid_test_time_anchor_refit: true
+      min_relative_improvement: 0.002

@@ -700,6 +700,45 @@ def _apply_depth_evidence(obs, calibs, cfg, scene, tcp_npz, out_dir):
     return out, det
 
 
+def cmd_multimodal_refine(args) -> int:
+    from .multimodal_frontend import run_multimodal_frontend
+    from .track_refinement import SceneImageSource
+    cfg = load_joint_discovery_config(args.config or {"mode": "calibrated_joint_aware"})
+    cfg.comparison.selection = "observable_physical_v2"
+    cfg.multimodal_frontend.enabled = True
+    if args.max_iterations:
+        cfg.multimodal_frontend.max_iterations = args.max_iterations
+    if args.no_track_refinement:
+        cfg.multimodal_frontend.track_refinement = False
+    src_npz = args.from_run / "tracks_observations.npz"
+    obs = TrackObservations.load(src_npz)
+    cfg.cameras = list(obs.camera_ids)
+    cfg.validate()
+    calibs, audit = load_scene_cameras(args.scene, obs.camera_ids)
+    files = {str(src_npz): _sha256(src_npz), "calibration_audit": json.dumps(audit, sort_keys=True, default=str)}
+    rec = cal = None
+    if args.robot_archive is not None:
+        from .tcp_contact import load_robot_contact_record
+        from .wrench_calibration import WrenchCalibration
+        rec = load_robot_contact_record(args.scene, obs.frame_map, tcp_npz=args.robot_archive)   # fail closed
+        files[str(args.robot_archive)] = _sha256(args.robot_archive)
+        try:
+            cal = WrenchCalibration.from_scene_metadata(args.scene)
+        except Exception as e:  # noqa: BLE001 -- force then ABSTAINs; TCP constraints are unaffected
+            _log(f"[mm] no wrench calibration ({e}): force evidence ABSTAIN")
+    if args.contact_segments is not None:
+        files[str(args.contact_segments)] = _sha256(args.contact_segments)
+        if rec is None:
+            raise SystemExit("--contact-segments needs --robot-archive (a calibrated TCP trajectory)")
+    legacy = json.loads((args.from_run / "model_selection.json").read_text()).get("decision") \
+        if (args.from_run / "model_selection.json").is_file() else None
+    images = None if args.no_track_refinement else SceneImageSource(args.scene, obs.frame_map)
+    run_multimodal_frontend(obs, calibs, cfg, args.output, scene=args.scene, images=images, rec=rec,
+                            segments_source=args.contact_segments, wrench_calibration=cal, legacy=legacy,
+                            source_files=files, log=_log)
+    return 0
+
+
 def cmd_select_v2(args) -> int:
     from .selection_v2 import run_selection_v2
     cfg = load_joint_discovery_config(args.config or {"mode": "calibrated_joint_aware"})
@@ -849,8 +888,21 @@ def main(argv=None):
     sv.add_argument("--tcp-npz", type=Path, default=None, help="robot archive: tool proximity + robot gate report")
     sv.add_argument("--no-depth", action="store_true")
     sv.add_argument("--output", required=True, type=Path)
+    mm = sub.add_parser("multimodal-refine", help="iterative pre-3DGS RGB-D + TCP contact-mode + verified-force "
+                                                  "frontend; writes a NEW directory, never edits the source run")
+    mm.add_argument("--scene", required=True, type=Path)
+    mm.add_argument("--from-run", required=True, type=Path, help="discovery run (tracks_observations.npz)")
+    mm.add_argument("--robot-archive", type=Path, default=None, help="TCP/wrench archive (omit = visual-only)")
+    mm.add_argument("--contact-segments", type=Path, default=None,
+                    help="forceartgs.contact_segments/v1 YAML/JSON (operator / video annotation); omit = unknown contact")
+    mm.add_argument("--config", default=None)
+    mm.add_argument("--max-iterations", type=int, default=None)
+    mm.add_argument("--no-track-refinement", action="store_true")
+    mm.add_argument("--output", required=True, type=Path)
     args = ap.parse_args(argv)
 
+    if args.cmd == "multimodal-refine":
+        return cmd_multimodal_refine(args)
     if args.cmd == "select-v2":
         return cmd_select_v2(args)
     if args.cmd == "summarize":

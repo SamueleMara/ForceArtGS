@@ -301,6 +301,8 @@ class TrackObservations:
     track_query_time: np.ndarray  # [N]
     provenance: dict = field(default_factory=dict)
     depth_cos: np.ndarray | None = None  # [M] |cos| of depth incidence angle, NaN unknown
+    uv_sigma_scale: np.ndarray | None = None  # [M] optional per-observation pixel-sigma multiplier (recovered tracks);
+                                              # None = legacy (every observation uses noise.sigma_px)
 
     def __post_init__(self):
         M = len(self.track)
@@ -329,6 +331,8 @@ class TrackObservations:
     def select_obs(self, keep: np.ndarray) -> "TrackObservations":
         keep = np.asarray(keep, bool)
         kw = {name: getattr(self, name)[keep] for name in OBS_FIELDS}
+        if self.uv_sigma_scale is not None:
+            kw["uv_sigma_scale"] = self.uv_sigma_scale[keep]
         return TrackObservations(self.camera_ids, self.frame_map, track_camera=self.track_camera,
                                  track_local_id=self.track_local_id, track_query_time=self.track_query_time,
                                  provenance=dict(self.provenance), **kw)
@@ -341,6 +345,8 @@ class TrackObservations:
         new_of_old[old] = np.arange(len(old))
         obs_keep = track_keep[self.track]
         kw = {name: getattr(self, name)[obs_keep] for name in OBS_FIELDS}
+        if self.uv_sigma_scale is not None:
+            kw["uv_sigma_scale"] = self.uv_sigma_scale[obs_keep]
         kw["track"] = new_of_old[kw["track"]]
         return TrackObservations(self.camera_ids, self.frame_map, track_camera=self.track_camera[old],
                                  track_local_id=self.track_local_id[old], track_query_time=self.track_query_time[old],
