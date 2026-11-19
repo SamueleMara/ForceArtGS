@@ -563,6 +563,7 @@ def st_art(r: Run):
                      "--pipeline.model.optimize-joint-params", "False",
                      "--pipeline.model.optimize-rotation-offset", "False",
                      "--pipeline.model.enable-gs-refinement", "True",
+                     "--pipeline.model.hard-part-ids", "True", "--pipeline.model.trainable-weights", "False",
                      "--pipeline.model.fg-mask-lambda", HP["fg_mask_lambda"],
                      "--pipeline.model.sensor-depth-lambda", HP["depth_lambda_art"],
                      "--pipeline.model.camera-optimizer.mode", "off",
@@ -801,6 +802,18 @@ def st_video(r: Run):
     r.set("video", "PASSED" if any(v.endswith("comparison") for v in res.values()) else "NOT_RUN", branches=res)
 
 
+def _copy_comparison(src_branch: Path, dst: Path):
+    """Copy the branch's FreeArtGS comparison folder (video stage) next to the final outputs; the original stays in
+    <branch>/splatfacto-art/comparison (vanilla layout)."""
+    src = src_branch / "splatfacto-art" / "comparison"
+    if not src.is_dir():
+        return None
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst)
+    return str(dst)
+
+
 def st_final(r: Run):
     sel_path = r.root / "selection.json"
     if not sel_path.is_file():
@@ -811,16 +824,19 @@ def st_final(r: Run):
     accepted = sel.get("status", "").startswith("IDENTIFIED_") if v2 else sel.get("status") == "IDENTIFIED"
     if not accepted:
         st = sel.get("status")
+        # no physical asset: final/ holds only the per-branch DIAGNOSTIC comparisons
+        comps = {k: _copy_comparison(r.branch(k), r.root / "final" / "diagnostics" / k / "comparison")
+                 for k in r.branches()}
         if v2 and st == "TYPE_UNOBSERVABLE":
             wk = sel.get("working_motion_model")
             r.set("final", "ABSTAIN", reason="TYPE_UNOBSERVABLE: no physical joint; the working model is an "
                                              "approximation for appearance only",
                   working_motion_model=wk, working_branch=str(r.branch(wk)) if wk in BRANCHES else None,
-                  diagnostics={k: str(r.branch(k)) for k in r.branches()})
+                  diagnostics={k: str(r.branch(k)) for k in r.branches()}, diagnostic_comparisons=comps)
         else:
             r.set("final", "BLOCKED" if st == "MODEL_INCONSISTENT" else "ABSTAIN",
                   reason=f"selection is {st}: diagnostic branch outputs only",
-                  diagnostics={k: str(r.branch(k)) for k in r.branches()})
+                  diagnostics={k: str(r.branch(k)) for k in r.branches()}, diagnostic_comparisons=comps)
         return
     k = sel["selected"]
     b = r.branch(k)
@@ -846,7 +862,8 @@ def st_final(r: Run):
         physics_joint_export_ready=bool(sel.get("physics_joint_export_ready")) if v2 else False))
     if v2:
         shutil.copy2(sel["selection_v2"], fin / "joint_selection_v2.json")
-    r.set("final", "PASSED", selected=k, final_dir=str(fin),
+    comp = _copy_comparison(b, fin / "comparison")
+    r.set("final", "PASSED", selected=k, final_dir=str(fin), comparison=comp,
           physics_joint_export_ready=bool(sel.get("physics_joint_export_ready")) if v2 else False)
 
 

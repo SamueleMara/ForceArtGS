@@ -12,8 +12,9 @@ physical_joint_status IDENTIFIED_* AND physics_joint_export_ready=true, and fina
 user-approved --assumed-physical-joint note (recorded as 'assumed' provenance). --diagnostic-branch writes a uniquely
 named DIAGNOSTIC handoff (TYPE_UNOBSERVABLE / ambiguous scenes), never a physical twin.
 
-Hard membership: every Gaussian must have w < 0.01 or w > 0.99 (splatfacto-art renders alpha(1-w) / alpha w). Rows in
-between make an exact two-PLY split impossible (spec 4.3) and the adapter ABSTAINS. The render gap of the hard split
+Membership: Gaussians with w < 0.01 or w > 0.99 go to one part unchanged. Rows in between are split SOFTLY (operator
+decision 2026-11-19): written to both PLYs with opacity logit(alpha * p_part), p = (1-w, w), which is exactly how
+splatfacto-art renders them (alpha(1-w) static copy + alpha w moving copy). The render gap of the hard split
 (max opacity factor change min(w, 1-w)) is recorded. Each output PLY keeps the source vertex dtype for the standard
 3DGS fields only (the derived uint8 display colours red/green/blue are dropped, explicitly recorded); no value changes.
 """
@@ -70,7 +71,16 @@ def _checkpoint_vertices(art: Path, v_export):
     for n, c in cols:
         vert[n] = np.asarray(c, np.float32)
     cross = {n: float(np.abs(np.asarray(v_export[n], np.float64) - vert[n]).max())
-             for n, _ in cols if n in v_export.dtype.names and not n.startswith("n")}
+             for n, _ in cols if n in v_export.dtype.names and not n.startswith("n") and not n.startswith("rot_")}
+    # quaternions are compared as ROTATIONS: ns-export writes them normalised (and q ~ -q), while the checkpoint stores
+    # the unnormalised optimiser values (norms drift far from 1 over long trainings). The output PLY keeps the exact
+    # stored values; standard 3DGS renderers normalise.
+    if all(f"rot_{i}" in v_export.dtype.names for i in range(4)):
+        qa = np.stack([vert[f"rot_{i}"] for i in range(4)], 1).astype(np.float64)
+        qb = np.stack([v_export[f"rot_{i}"] for i in range(4)], 1).astype(np.float64)
+        qa /= np.linalg.norm(qa, axis=1, keepdims=True)
+        qb /= np.linalg.norm(qb, axis=1, keepdims=True)
+        cross["rotation_normalised_sign_invariant"] = float(np.minimum(np.abs(qa - qb).max(1), np.abs(qa + qb).max(1)).max())
     if max(cross.values()) > 1e-6:
         raise HandoffAbstain(f"ns-export PLY and checkpoint disagree beyond float32 rounding: {cross}")
     w = 1 / (1 + np.exp(-sd[[k for k in sd if k.endswith("part_weights")][0]].numpy().astype(np.float64).ravel()))
@@ -125,26 +135,44 @@ def build_handoff(run: Path, out: Path, diagnostic_branch=None, assumed_note=Non
     if len(w_txt) != len(v) or np.abs(w_txt - w_ck).max() > 1e-6:
         raise HandoffAbstain("3dgs_part_weight.txt does not match the checkpoint part weights row for row")
     inter = (w_ck > HARD_EPS) & (w_ck < 1 - HARD_EPS)
-    if inter.any():
-        raise HandoffAbstain(f"{int(inter.sum())} of {len(w_ck)} Gaussians have intermediate membership "
-                             f"(w in ({HARD_EPS}, {1 - HARD_EPS})): strict two-PLY export impossible (spec 4.3)")
-    moving = w_ck >= 0.5
-    gap = float(np.minimum(w_ck, 1 - w_ck).max())
+    # Soft (probability-weighted) membership split, exact w.r.t. the trained renderer: splatfacto-art draws every
+    # Gaussian twice, a static copy with opacity alpha*(1-w) and a moving copy with alpha*w (w = sigmoid(part logit),
+    # i.e. the two-part softmax). Hard Gaussians (w <= eps or >= 1-eps) go to one part UNCHANGED (bitwise); a Gaussian
+    # with w in (eps, 1-eps) is written to BOTH PLYs with its opacity re-expressed as logit(alpha * p_part).
+    hard_moving = w_ck >= 1 - HARD_EPS
+    hard_static = w_ck <= HARD_EPS
     keep = list(vert.dtype.names)
     out.mkdir(parents=True, exist_ok=True)
-    rows = {}
-    for nm, m in (("static", ~moving), ("moving", moving)):
-        idx = np.flatnonzero(m)
-        sub = vert[idx]
+    alpha = 1 / (1 + np.exp(-vert["opacity"].astype(np.float64)))
+    rows, probs, soft_flags = {}, {}, {}
+    for nm, hard, p_part in (("static", hard_static | (inter & ~hard_moving), 1 - w_ck),
+                             ("moving", hard_moving | inter, w_ck)):
+        idx = np.flatnonzero(hard)
+        sub = vert[idx].copy()
+        soft = inter[idx]
+        a = np.clip(alpha[idx][soft] * p_part[idx][soft], 1e-7, 1 - 1e-7)
+        sub["opacity"][soft] = np.log(a / (1 - a)).astype(np.float32)
         PlyData([PlyElement.describe(sub, "vertex")], text=False).write(str(out / f"{nm}_canonical.ply"))
-        rows[nm] = idx
+        rows[nm], probs[nm], soft_flags[nm] = idx, p_part[idx], soft
+    gap = float(np.minimum(w_ck[~inter], 1 - w_ck[~inter]).max()) if (~inter).any() else 0.0
+    n_soft = int(inter.sum())
+    # unique ids: the moving copy of a soft-split Gaussian is a NEW Gaussian (uid = N + row) whose parent is the row
+    n_gauss = len(w_ck)
+    uids = {"static": rows["static"].astype(np.int64),
+            "moving": np.where(soft_flags["moving"], n_gauss + rows["moving"], rows["moving"]).astype(np.int64)}
+    parents = {"static": np.full(len(rows["static"]), -1, np.int64),
+               "moving": np.where(soft_flags["moving"], rows["moving"], -1).astype(np.int64)}
     np.savez(out / "gaussian_lineage.npz",
-             **{f"{nm}_gaussian_uid": rows[nm].astype(np.int64) for nm in rows},
-             **{f"{nm}_parent_uid": np.full(len(rows[nm]), -1, np.int64) for nm in rows},
+             **{f"{nm}_gaussian_uid": uids[nm] for nm in rows},
+             **{f"{nm}_parent_uid": parents[nm] for nm in rows},
              **{f"{nm}_unresolved": np.zeros(len(rows[nm]), np.uint8) for nm in rows},
              **{f"{nm}_part_weight": w_ck[rows[nm]] for nm in rows},
-             note=np.array("uid = row of splatfacto-art/object_3dgs.ply (= checkpoint row); weights are the frozen "
-                           "splatfacto-art memberships (all < 0.01 or > 0.99)"))
+             **{f"{nm}_membership_probability": probs[nm] for nm in rows},
+             **{f"{nm}_soft_split": soft_flags[nm].astype(np.uint8) for nm in rows},
+             note=np.array("uid = row of splatfacto-art/object_3dgs.ply (= checkpoint row). Gaussians with soft_split=1 "
+                           "appear in BOTH parts with opacity logit(alpha * membership_probability): the static copy "
+                           "keeps uid = row, the moving copy has uid = N + row and parent_uid = row. All others are "
+                           "byte-identical copies of the checkpoint row"))
     t_ref = auth.reference_time_index
     fm_rows = [dict(original_frame=int(auth.rgbd_frame_index[t]), source_frame_index=int(auth.source_frame_index[t]),
                     timestamp_s=float(auth.timestamp_s[t]), q=float(auth.q[t]), q_valid=bool(auth.q_valid[t]),
@@ -187,6 +215,11 @@ def build_handoff(run: Path, out: Path, diagnostic_branch=None, assumed_note=Non
                     canonical_anchor_original_frame=int(auth.rgbd_frame_index[t_ref]),
                     canonical_anchor_timestamp_s=float(auth.timestamp_s[t_ref]), candidate_id=cand, status=status,
                     notes=dict(selection=sel, physical_joint=phys,
+                               membership_split=dict(
+                                   method="soft (two-part softmax = sigmoid) opacity-weighted duplication" if n_soft
+                                   else "hard", n_soft_split_gaussians=n_soft, n_total=int(len(w_ck)), eps=HARD_EPS,
+                                   note="each output Gaussian belongs to exactly one part file; soft-split Gaussians are "
+                                        "duplicated with opacity alpha*p_part, equal to the splatfacto-art renderer"),
                                multimodal_provenance=sel.get("multimodal") or dict(status="NOT_RUN",
                                                                                     note="visual-only selection"),
                                dropped_ply_fields=list(DERIVED_DROPPED), checkpoint=str(ck),
@@ -200,10 +233,12 @@ def build_handoff(run: Path, out: Path, diagnostic_branch=None, assumed_note=Non
                                                     (sel.get("render_evidence") or {}).get("per_branch", {}).get(branch)),
                         frame_equivalence_checked=man["stages"]["blend"]["status"] == "PASSED", hard_membership=True,
                         soft_render_gap=dict(max_opacity_factor_change=gap,
-                                             note="hard split drops alpha*min(w,1-w) per Gaussian vs the soft renderer")))
+                                             note="for HARD Gaussians only: alpha*min(w,1-w) <= eps dropped; soft-split "
+                                                  "Gaussians are exact")))
     atomic_write_json(out / "articulated_3dgs_handoff.json", handoff)
     return dict(handoff=str(out / "articulated_3dgs_handoff.json"), status=status, branch=branch,
-                n_static=int(len(rows["static"])), n_moving=int(len(rows["moving"])), soft_render_gap=gap)
+                n_static=int(len(rows["static"])), n_moving=int(len(rows["moving"])), soft_render_gap=gap,
+                n_soft_split=n_soft)
 
 
 def main(argv=None):

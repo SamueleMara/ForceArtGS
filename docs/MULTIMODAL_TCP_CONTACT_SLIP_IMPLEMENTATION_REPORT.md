@@ -115,3 +115,27 @@ filled from that run**.
 - **Track recovery** neither replaces bad raw observations nor recovers tracks with no 3D anchor.
 - **Spec E ablations V3–V5** (stick / force) cannot run on the real data: there is no sticking demonstration and no
   verified wrench.
+
+## Export update (2026-11-19, full-budget fridge)
+
+- **Quaternion cross-check.** After 30k iterations the checkpoint quaternions are far from unit norm (0.34–2.4), and
+  ns-export writes them normalised. The producer's cross-check now compares rotations (normalised, q ≡ −q): 7.7e-8.
+  The output PLYs keep the exact checkpoint values.
+- **Soft membership split** (operator decision). On the fridge, 7,540 of 387,467 Gaussians have w in (0.01, 0.99).
+  Instead of abstaining, the producer writes them to BOTH PLYs with opacity logit(α·p_part), p = (1−w, w): the
+  two-part softmax. This is exactly the splatfacto-art renderer, which draws α(1−w) static plus α·w moving copies.
+  Verified opacity error is 4.3e-7, and hard Gaussians are byte-identical in every field except the quaternion
+  normalisation. Lineage: the moving copy gets uid N + row and parent_uid = row (PArtTwin `parent_uid` semantics).
+  The record is in handoff `notes.membership_split`.
+- **Fridge full:** export PASSED as a diagnostic asset, `BLOCKED_MISSING_PHYSICS`, visual bitwise check true.
+- **Discrete part ids in the final phase** (operator decision). Densification already copied `part_weights` from the
+  parent. The soft weights came from TRAINING: on the fridge, blend 7.45% → art 1.95% intermediate. Changes:
+  - `splatfacto-art --pipeline.model.hard-part-ids True` snaps the blend weights to the two-part argmax and freezes
+    them, so clones and splits inherit the parent id.
+  - Fixed a latent bug: densify/cull rebuild parameters as `nn.Parameter` (`requires_grad=True`), which silently
+    unfroze `trainable_weights=False`. Part weights are now re-frozen after every refinement.
+  - The controller's art stage passes `--pipeline.model.hard-part-ids True --pipeline.model.trainable-weights False`.
+  - This is a submodule change (`reconstruction/nerfstudio`, `models/splatfacto_art.py`); commit and push it to
+    `nerfstudio-local` first, then update the pointer.
+  - In the 2026-11-19 overnight batch, the fridge and the black box art stage ran before this change (soft weights,
+    exported with the soft split). The robot dog, suitcase and drawer use hard ids.
