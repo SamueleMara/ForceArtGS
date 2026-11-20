@@ -1,0 +1,18 @@
+# G9 EXPLORATORY real-data estimation: uses the canonical robot record (existing force export + robot archive +
+# declared conventions) with every DECLARED / ESTIMATED calibration quantity listed as an assumption. Estimates are
+# conditional and never production-exported. Joint-space only (no validated mass-model mesh exists): no link tensor.
+schema: forceartgs.dynamics_config/v1
+pipeline:
+  force_policy: exploratory
+  allow_diagnostic_kinematics: false
+model:
+  terms: {inertia: true, viscous: true, coulomb: true, static: false, gravity: false, bias: false}
+  parameter_source: joint_space_only          # gravity = effective basis A cos q + B sin q (never a mass / COM)
+fitting:
+  compare_frozen_viscous_baselines: [IntegralLS, Backprop]
+  n_starts: 4
+identifiability:
+  force_lag_sweep_s: 0.01                     # exact row join: residual offset bounded by half a 50 Hz row
+  force_scale_sweep_rel: 0.05                 # sensor scale factor: no calibration evidence (declared 5 %)
+  contact_point_sweep_m: 0.015                # TCP / registration: 1-2 cm accepted by the operator
+  use_second_window_tare_sweep: true

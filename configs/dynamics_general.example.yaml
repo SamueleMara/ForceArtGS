@@ -1,0 +1,72 @@
+# ForceArtGS G9 dynamics configuration (forceartgs.dynamics_config/v1). Copy and fill the EVIDENCE paths; no
+# physical value is defaulted. Enabled terms that the data cannot identify make the run UNIDENTIFIABLE (diagnostic
+# only) -- choose a simpler model explicitly, or supply a verified prior / better excitation.
+schema: forceartgs.dynamics_config/v1
+pipeline:
+  enabled: true
+  only_after_final_articulated_reconstruction: true
+  visual_handoff_input: auto_verified
+  allow_diagnostic_kinematics: false        # TYPE_UNOBSERVABLE / MODEL_INCONSISTENT: no fit at all
+  on_missing_calibration: abstain           # abstain | diagnostic_only (numbers labelled NOT_PHYSICAL)
+  on_missing_geometry: joint_space_diagnostic
+model:
+  kind: general_rigid_1dof
+  terms: {inertia: true, viscous: true, coulomb: true, static: true, gravity: true, bias: false}
+  parameter_source: geometry_coupled        # geometry_coupled | joint_space_only
+  automatic_term_selection: false
+  quasistatic: false
+  static_friction: {solver: karnopp_hybrid, velocity_band_magnitude: null}
+  gravity:
+    source: verified_world_gravity
+    vector_world_mps2: null                 # e.g. [0, 0, -9.81] in base_link -- ONLY with a measured registration
+    calibration_file: null                  # JSON {status: MEASURED, method: ...}; without it gravity is UNVERIFIED
+  integrator_max_step_s: 0.002              # computational default (step convergence is reported)
+mass_model:
+  mode: uniform_shell                       # uniform_solid (watertight) | uniform_shell (panels / lids)
+  mesh: null                                # validated canonical moving-part surface at q = 0, frame W
+  mesh_units: m
+  geometry_frame: W
+  shell_thickness_m: null
+  source_provenance: null                   # {source: ..., tool_exclusion: ..., mesh_std_m: ...}
+  allow_collision_proxy_as_mass_geometry: false
+  mesh_is_collision_proxy: false
+  reflected_actuator_inertia: null          # number, or none_passive_mechanism; null blocks the full inertial
+  user_link_inertial: null                  # {mass_kg, com_m, inertia_com_kg_m2, provenance, joint_space_std}
+fitting:
+  methods: [general_integral_ls, general_rollout_fit]
+  compare_frozen_viscous_baselines: [IntegralLS]   # frozen viscous baselines: IntegralLS, Backprop, AKF, PINN, MLP
+  use_multiple_interactions: true
+  robust_loss: huber
+  seed: 0
+  n_starts: 4
+  measured_force_uncertainty_required: true
+  holdout_mode: independent_episodes
+  auto_lag_fit: false
+  model_variants: null                      # opt-in, scored on withheld episodes, e.g.
+                                            # {viscous_only: {coulomb: false, static: false, gravity: false}}
+contact:
+  inherit_upstream_slip_mode: true
+  require_contact_provenance: true
+  force_on_object_only: true
+  use_pure_sensor_torque: false
+identifiability:
+  propagate_joint_geometry_uncertainty: true
+  propagate_calibration_uncertainty: true
+  require_excitations: true
+  on_unidentifiable_enabled_parameter: block_identified_export
+  force_lag_sweep_s: 0.02
+  force_scale_sweep_rel: 0.05
+  force_bias_sweep: null
+export:
+  write_joint_space_result: true
+  reconstruct_link_inertia_when_supported: true
+  production_requires_heldout_real_prediction: true
+  allow_assumption_preview: false
+  canonical_builder: parttwin1d
+  prefer_imported_single_exporter: true
+  write_urdf: true
+  write_usd: true
+  write_mjcf: true
+  mechanical_spec: null                     # forceartgs.g9.mechanical_spec/v1: collision meshes, physical stops,
+                                            # velocity/effort limits, static-link inertial, registration (MEASURED)
+episodes: null

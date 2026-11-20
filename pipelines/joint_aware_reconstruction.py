@@ -44,7 +44,7 @@ from estimotion_2part.joint_discovery.integration_contract import (  # noqa: E40
 
 SUBMODULE = REPO / "reconstruction" / "nerfstudio"
 STAGES = ("audit", "discover", "multimodal_refine", "select", "authority", "dense", "build", "parts", "blend", "art", "refine", "compare", "video",
-          "final", "export")
+          "final", "export", "dynamics", "final_physics_export")
 PARTTWIN_ROOT = Path(os.environ.get("PARTTWIN1D_ROOT", str(Path.home() / "PArtTwin1D")))
 PARTTWIN_PY = os.environ.get("PARTTWIN1D_PYTHON", str(Path.home() / "miniconda3/envs/parttwin_sim/bin/python"))
 SIM_PY = os.environ.get("PARTTWIN_SIM_PYTHON", str(Path.home() / ".venvs/rigeuler-sim-export/bin/python"))
@@ -923,9 +923,57 @@ def st_export(r: Run):
           physics="measured spec given" if r.args.dynamics_spec else "none: visual + kinematics only")
 
 
+def st_dynamics(r: Run):
+    """G9 (opt-in --dynamics-config): general 1-DoF dynamics + geometry-constrained inertia from the accepted final
+    joint authority and the recorded force (forceartgs_g9; pinned ForceArtGS-Physics). No 3DGS training."""
+    if not r.args.dynamics_config:
+        r.set("dynamics", "NOT_RUN", reason="opt-in: pass --dynamics-config")
+        return
+    out = r.root / "dynamics" / "g9"
+    cmd = [sys.executable, "-m", "forceartgs_g9.cli", "dynamics", "--run", r.root, "--scene", r.scene,
+           "--dynamics-config", r.args.dynamics_config]
+    tcp = r.m.get("discovery", {}).get("robot_archive") or r.args.robot_archive
+    for flag, val in (("--physics-library", r.args.physics_library), ("--robot-archive", tcp),
+                      ("--contact-segments", r.args.contact_segments), ("--force-calibration", r.args.force_calibration),
+                      ("--mass-model-spec", r.args.mass_model_spec), ("--dynamics-episodes", r.args.dynamics_episodes),
+                      ("--force-export", r.args.force_export)):
+        if val:
+            cmd += [flag, val]
+    run_cmd(cmd, r.root / "logs" / "dynamics.log", r.env, r.args.dry_run)
+    if r.args.dry_run:
+        return
+    vs = sorted(out.glob("v[0-9][0-9][0-9]"))
+    man = json.loads((vs[-1] / "g9_manifest.json").read_text())
+    r.set("dynamics", "PASSED" if man["status"] != "BLOCKED" else "BLOCKED", g9_dir=str(vs[-1]),
+          g9_status=man["status"], blocked=man["blocked"], readiness=man["readiness"])
+
+
+def st_final_physics_export(r: Run):
+    """G9 -> shared PArtTwin1D builder with the G9 physics spec v1 (the LAST step); engine parity checks."""
+    if not r.args.dynamics_config:
+        r.set("final_physics_export", "NOT_RUN", reason="opt-in: pass --dynamics-config")
+        return
+    g = r.m["stages"].get("dynamics", {}).get("g9_dir")
+    if not g:
+        r.set("final_physics_export", "NOT_RUN", reason="run the dynamics stage first")
+        return
+    env = dict(r.env)
+    env.pop("FORCEARTGS_JOINT_AWARE_TRIPWIRE", None)
+    cmd = [sys.executable, "-m", "forceartgs_g9.cli", "final-physics-export", "--run", r.root, "--g9-dir", g]
+    if r.args.physics_library:
+        cmd += ["--physics-library", r.args.physics_library]
+    run_cmd(cmd, r.root / "logs" / "final_physics_export.log", env, r.args.dry_run)
+    if r.args.dry_run:
+        return
+    res = json.loads((Path(g) / "final_physics_export.json").read_text()) if (Path(g) / "final_physics_export.json"
+                                                                             ).is_file() else {}
+    r.set("final_physics_export", res.get("status", "FAILED"), claim=res.get("claim"), reason=res.get("reason"),
+          missing=res.get("missing"), readiness=res.get("readiness"))
+
+
 FUNCS = dict(audit=st_audit, discover=st_discover, multimodal_refine=st_multimodal_refine, select=st_select, authority=st_authority, dense=st_dense, build=st_build,
              parts=st_parts, blend=st_blend, art=st_art, refine=st_refine, compare=st_compare, video=st_video,
-             final=st_final, export=st_export)
+             final=st_final, export=st_export, dynamics=st_dynamics, final_physics_export=st_final_physics_export)
 
 
 def main(argv=None):
@@ -963,6 +1011,14 @@ def main(argv=None):
                          "recorded as 'assumed' provenance (never needed under v2)")
     ap.add_argument("--allow-inconsistent-diagnostics", action="store_true",
                     help="MODEL_INCONSISTENT: still train both candidate branches as diagnostics (never exported)")
+    ap.add_argument("--dynamics-config", default=None,
+                    help="G9 (opt-in): forceartgs.dynamics_config/v1 YAML -> stages dynamics + final_physics_export")
+    ap.add_argument("--physics-library", default=None, help="pinned ForceArtGS-Physics checkout (default ~/ForceArtGS-Physics)")
+    ap.add_argument("--force-calibration", default=None, help="G9: measured force-calibration record (per-gate evidence)")
+    ap.add_argument("--mass-model-spec", default=None, help="G9: mass-model YAML (mode, validated moving-part mesh, ...)")
+    ap.add_argument("--dynamics-episodes", default=None, help="G9: independent held-out episodes manifest")
+    ap.add_argument("--force-export", default=None,
+                    help="G9: export_force_contact_annotations.py output for the canonical robot record")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
     if not args.allow_non_ssd and not str(Path(args.output_root).resolve()).startswith(SSD):
