@@ -1,0 +1,7 @@
+{
+  "status": "DECLARED_OPERATOR",
+  "method": "operator statement 2026-11-20: the dataset base_link z axis is the true vertical; g = (0, 0, -9.81) m/s^2 in base_link",
+  "g_world_mps2": [0.0, 0.0, -9.81],
+  "frame": "base_link",
+  "note": "a declaration, not a measured gravity registration: usable under force_policy exploratory only"
+}

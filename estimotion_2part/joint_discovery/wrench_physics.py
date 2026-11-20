@@ -25,11 +25,8 @@ class WrenchConvention:
 
     @property
     def object_side_multiplier(self) -> float:
-        if self.recorded_quantity == "object_on_robot":
-            return -1.0
-        if self.recorded_quantity == "robot_on_object":
-            return 1.0
-        raise ValueError(f"unknown recorded wrench quantity {self.recorded_quantity!r}; refusing to guess a sign")
+        from .force_convention import sign_from_recorded_quantity        # the one shared sign contract
+        return sign_from_recorded_quantity(self.recorded_quantity)
 
     @property
     def calibrated(self) -> bool:

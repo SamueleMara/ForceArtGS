@@ -45,7 +45,7 @@ class _ZOH:
         return self.levels[idx]
 
 
-def accepted_kinematics(run_root, allow_diagnostic=False) -> dict:
+def accepted_kinematics(run_root, allow_diagnostic=False, declared_joint_type=None, declaration_note=None) -> dict:
     """Select the accepted final branch (or the diagnostic working model) and load its authority."""
     from estimotion_2part.joint_discovery.integration_contract import JointAuthority
     run = Path(run_root)
@@ -61,6 +61,12 @@ def accepted_kinematics(run_root, allow_diagnostic=False) -> dict:
     st = sel["status"]
     kin = STATUS_MAP.get(st, "UNKNOWN")
     kind = sel.get("selected") if kin == "IDENTIFIED" else sel.get("working_motion_model")
+    if declared_joint_type is not None and kin != "IDENTIFIED":
+        if not declaration_note:
+            raise ValueError("--declared-joint-type needs --declaration-note (who declared it, when)")
+        kind, kin = declared_joint_type, "OPERATOR_DECLARED"
+    elif declared_joint_type is not None and declared_joint_type != kind:
+        raise ValueError(f"declared joint type {declared_joint_type} contradicts the IDENTIFIED {kind}: refusing")
     if kind not in ("revolute", "prismatic"):
         return dict(status=kin, selection_status=st, kind=None, reason=f"no branch for status {st}",
                     selection=sel)
@@ -70,11 +76,17 @@ def accepted_kinematics(run_root, allow_diagnostic=False) -> dict:
     meta = json.loads((adir / "authority.json").read_text())
     v2 = json.loads(Path(sel["selection_v2"]).read_text()) if sel.get("selection_v2") else {}
     obs = {}
+    unc = v2.get("uncertainty") or {}
+    if unc.get("axis_cone95_deg") is not None:          # 2-D 95 % cone radius -> 1-sigma per tilt direction
+        obs["axis_sigma_deg"] = float(unc["axis_cone95_deg"]) / 2.4477
+    if unc.get("hinge_line_sd_m") is not None:
+        obs["hinge_line_sigma_m"] = float(unc["hinge_line_sd_m"])
     for k in ("axis_sigma_deg", "hinge_line_sigma_m"):
         for blk in (v2.get("evidence", {}), v2.get("observability", {}), v2):
-            if isinstance(blk, dict) and blk.get(k) is not None:
+            if k not in obs and isinstance(blk, dict) and blk.get(k) is not None:
                 obs[k] = blk[k]
                 break
+    obs["source"] = "joint_selection_v2.uncertainty (upstream statistical, cluster/bootstrap)" if unc else None
     hand_name = "accepted" if kin == "IDENTIFIED" and sel.get("physics_joint_export_ready") else f"diagnostic_{kind}"
     hand = run / "parttwin_handoff" / hand_name / "articulated_3dgs_handoff.json"
     return dict(status=kin, selection_status=st, kind=kind, authority=auth, authority_dir=str(adir),
@@ -84,7 +96,9 @@ def accepted_kinematics(run_root, allow_diagnostic=False) -> dict:
                 multimodal=dict(force_evidence_used=v2.get("force_evidence_used"),
                                 contact_evidence_used=v2.get("contact_evidence_used")),
                 visual_handoff=str(hand) if hand.is_file() else None,
-                diagnostic=kin != "IDENTIFIED", allow_diagnostic=allow_diagnostic, scene=man.get("scene"))
+                diagnostic=kin != "IDENTIFIED", allow_diagnostic=allow_diagnostic, scene=man.get("scene"),
+                declaration_note=declaration_note if kin == "OPERATOR_DECLARED" else None,
+                support_centroid=meta.get("support_centroid_world"))
 
 
 def force_audit(scene, authority, robot_archive, contact_segments, use_torque=False) -> dict:
@@ -196,8 +210,9 @@ GATE_TRANSLATION = {
                         "test of R_ee_sensor", "assumption; supported by the positive-work check"),
     "force_sign": (("force_sign", "positive_work"), "reference push of known direction", "assumption; a wrong sign "
                    "is caught by positive work and by physically inconsistent fits"),
-    "tare": (("tare_initial", "tare_second_window", "force_noise_sigma_N"), "documented tare procedure / two "
-             "separated contact-free windows within noise", "second-window residual swept as a force bias"),
+    "tare": (("tare_initial", "tare_second_window", "tare_independent_window", "tare_not_duplicated",
+              "force_noise_sigma_N"), "documented tare procedure / an operator-designated second contact-free window "
+             "within noise", "threshold-conditioned post-contact residual used as a declared bias SCENARIO"),
     "tool_gravity_compensation": (("tool_gravity_change",), "tool + sensor mass and COM, or a measured bound",
                                   "bounded by the EE-orientation change per kg of tool mass"),
     "time_sync": (("row_association", "recorded_timestamps", "hardware_clock_offset"), "measured camera-robot "
@@ -220,9 +235,13 @@ def record_force_audit(rec, authority, cfg) -> dict:
     ev["positive_work"] = positive_work_check(rec, authority)
     sig = np.asarray(rec["force_sigma_N"], float)
     tw = ev["tare_second_window"]
-    tare_ok = None
-    if tw["status"] == "ESTIMATED":
-        tare_ok = bool(np.all(np.abs(np.asarray(tw["value"]["mean_N"])) <= np.maximum(3 * np.asarray(
+    ti = ev.get("tare_independent_window", {})
+    tare_ok = None                       # only an INDEPENDENT (operator-designated) window can verify drift
+    if ti.get("status") in ("INDEPENDENT_WINDOW_CONSISTENT", "INDEPENDENT_WINDOW_DRIFT"):
+        tare_ok = ti["status"] == "INDEPENDENT_WINDOW_CONSISTENT"
+    tare_diag = None
+    if tw["status"] == "THRESHOLD_CONDITIONED_DIAGNOSTIC":
+        tare_diag = bool(np.all(np.abs(np.asarray(tw["value"]["mean_N"])) <= np.maximum(3 * np.asarray(
             tw["value"]["se_N"]), sig)))
     tg = ev["tool_gravity_change"]["value"] or {}
     bound = tg.get("force_bound_N_per_kg_tool")
@@ -235,8 +254,9 @@ def record_force_audit(rec, authority, cfg) -> dict:
             st = ("CALIBRATION_ASSUMPTION_CONTRADICTED" if ev["positive_work"]["status"] == "DATA_CONTRADICTS" else
                   "CALIBRATION_ASSUMPTION_UNVERIFIED")
         elif g == "tare":
-            st = "ESTIMATED_STABLE" if tare_ok else ("ESTIMATED_DRIFT" if tare_ok is False else
-                                                     "CALIBRATION_ASSUMPTION_UNVERIFIED")
+            st = ("ESTIMATED_INDEPENDENT_WINDOW_STABLE" if tare_ok else "ESTIMATED_INDEPENDENT_WINDOW_DRIFT"
+                  if tare_ok is False else ("ESTIMATED_INITIAL_TARE_THRESHOLD_CONDITIONED_CONSISTENT" if tare_diag
+                                            else "CALIBRATION_ASSUMPTION_UNVERIFIED"))
         elif g == "tool_gravity_compensation":
             st = "ESTIMATED_BOUNDED" if bound is not None and bound <= float(np.min(sig)) else \
                 "CALIBRATION_ASSUMPTION_UNVERIFIED"
@@ -263,6 +283,7 @@ def record_force_audit(rec, authority, cfg) -> dict:
                    if v["status"] not in ("NOT_NEEDED",)]
     return dict(schema="forceartgs.g9.force_audit/v2", status=status, policy=policy, gates=gates, failing=failing,
                 assumptions_used=assumptions, positive_work=ev["positive_work"],
+                tare_independent_window_stable=tare_ok, tare_threshold_conditioned_consistent=tare_diag,
                 tare_second_window_stable=tare_ok, tool_gravity_bound_N_per_kg=bound,
                 record_sources=rec["sources"], segments=[], info=dict(record=rec["schema"]),
                 policy_note="exploratory: declared / estimated quantities are USED as stated, listed here, never "
@@ -330,39 +351,85 @@ def record_interactions(rec, authority, cfg, meta) -> list:
     return out
 
 
-def record_perturbations(rec, authority, cfg, interactions) -> dict:
-    """Evidence-based input sweeps (linearised in the identifiability report)."""
+def record_perturbations(rec, authority, cfg, interactions, observability=None) -> dict:
+    """Declared SYMMETRIC scenarios 'family|+/-' built from the record (linearised in the identifiability report;
+    never treated as standard deviations):
+      contact point (revolute only; Q_P = a.F does not depend on it): +/- d along the lever, the path tangent and
+          the hinge axis -- the TCP / tool uncertainty;
+      hinge axis tilt (two perpendicular directions) and hinge-line offset (revolute): the upstream JOINT
+          uncertainty (joint_selection_v2), separate from the TCP so nothing is double counted;
+      threshold-conditioned post-contact tare residual: +/- the residual mean as a force bias scenario."""
     idc = cfg["identifiability"]
     a = np.asarray(authority.axis_world, float)
+    a = a / np.linalg.norm(a)
     o = np.zeros(3) if authority.origin_world is None else np.asarray(authority.origin_world, float)
     F, P = rec["F_object_base_N"], rec["p_tcp_base_m"]
+    rev = authority.joint_type == "revolute"
     out = {}
 
-    def eff_from(it, Fx, Px):
+    def eff_from(it, Fx=None, Px=None, ax=None, ox=None):
         s0, s1 = it.meta["_record_slice"]
-        f, p = Fx[s0:s1], Px[s0:s1]
-        Q = f @ a if authority.joint_type == "prismatic" else np.einsum("j,nj->n", a, np.cross(p - o, f))
-        return _ZOH(it.effort.t_s, Q, "perturbed")
+        f = (F if Fx is None else Fx)[s0:s1]
+        p = (P if Px is None else Px)[s0:s1]
+        aa = a if ax is None else ax / np.linalg.norm(ax)
+        oo = o if ox is None else ox
+        Q = f @ aa if not rev else np.einsum("j,nj->n", aa, np.cross(p - oo, f))
+        return _ZOH(it.effort.t_s, Q, "scenario")
+    u1 = np.cross(a, [1.0, 0, 0] if abs(a[0]) < 0.9 else [0, 1.0, 0])
+    u1 /= np.linalg.norm(u1)
+    u2 = np.cross(a, u1)
     d = idc.get("contact_point_sweep_m")
-    if d and authority.joint_type == "revolute":
+    if d and rev:
         r = P - o
         r = r - np.outer(r @ a, a)
-        u = r / np.maximum(np.linalg.norm(r, axis=1, keepdims=True), 1e-9)
-        out[f"contact_point_lever_+{d * 100:.1f}cm"] = lambda it, u=u: eff_from(it, F, P + d * u)
+        lev = r / np.maximum(np.linalg.norm(r, axis=1, keepdims=True), 1e-9)
+        tan = np.cross(a, lev)
+        for name, dirv in (("lever", lev), ("tangent", tan), ("axial", np.tile(a, (len(P), 1)))):
+            for sg, k in (("+", 1.0), ("-", -1.0)):
+                out[f"tcp_contact_{name}_{d * 100:.1f}cm|{sg}"] = (lambda it, dirv=dirv, k=k:
+                                                                    eff_from(it, Px=P + k * d * dirv))
+    obs = observability or {}
+    sa = obs.get("axis_sigma_deg")
+    if sa:
+        th = np.deg2rad(sa)
+        for name, u in (("u1", u1), ("u2", u2)):
+            for sg, k in (("+", 1.0), ("-", -1.0)):
+                out[f"hinge_axis_tilt_{name}_{sa:.2f}deg|{sg}"] = (lambda it, u=u, k=k:
+                                                                    eff_from(it, ax=a + k * np.tan(th) * u))
+    so = obs.get("hinge_line_sigma_m")
+    if so and rev:
+        for name, u in (("u1", u1), ("u2", u2)):
+            for sg, k in (("+", 1.0), ("-", -1.0)):
+                out[f"hinge_line_offset_{name}_{so * 100:.1f}cm|{sg}"] = (lambda it, u=u, k=k:
+                                                                          eff_from(it, ox=o + k * so * u))
     if idc.get("use_second_window_tare_sweep"):
         tw = rec["evidence"]["tare_second_window"]
-        if tw["status"] == "ESTIMATED":
+        if tw["status"] == "THRESHOLD_CONDITIONED_DIAGNOSTIC":
             b_s = np.asarray(tw["value"]["mean_N"], float)
             b_obj = rec["object_side_multiplier"] * np.einsum("nij,j->ni", rec["R_base_ee"], b_s)
-            out["tare_second_window_residual"] = lambda it: eff_from(it, F - b_obj, P)
+            for sg, k in (("+", 1.0), ("-", -1.0)):
+                out[f"tare_threshold_conditioned_residual|{sg}"] = (lambda it, k=k: eff_from(it, Fx=F - k * b_obj))
     return out
 
 
+def _com_dir(auth, centroid):
+    """Unit direction hinge -> moving-support centroid, perpendicular to the axis (the assumed COM direction)."""
+    if auth.joint_type != "revolute" or centroid is None or auth.origin_world is None:
+        return None, None
+    a = np.asarray(auth.axis_world, float)
+    a = a / np.linalg.norm(a)
+    r = np.asarray(centroid, float) - np.asarray(auth.origin_world, float)
+    r = r - (r @ a) * a
+    n = float(np.linalg.norm(r))
+    return (r / n, n) if n > 1e-6 else (None, None)
+
+
 def build_inputs(run_root, scene, cfg, *, robot_archive=None, contact_segments=None, force_export=None,
-                 log=print) -> G9Inputs:
+                 declared_joint_type=None, declaration_note=None, log=print) -> G9Inputs:
     from .. import physics_lib
     physics_lib.provenance()
-    kin = accepted_kinematics(run_root, cfg["pipeline"]["allow_diagnostic_kinematics"])
+    kin = accepted_kinematics(run_root, cfg["pipeline"]["allow_diagnostic_kinematics"], declared_joint_type,
+                              declaration_note)
     if kin.get("kind") is None:
         fa = dict(status="NOT_EVALUATED", reason=kin["reason"], failing=["kinematics"])
         return G9Inputs(Path(scene).name, "revolute", np.array([0, 0, 1.0]), None, kin["status"], False,
@@ -377,7 +444,7 @@ def build_inputs(run_root, scene, cfg, *, robot_archive=None, contact_segments=N
         rec = build_robot_record(scene, fx, robot_archive, contact_segments)
         fa = record_force_audit(rec, auth, cfg)
         its = record_interactions(rec, auth, cfg, meta)
-        extra_pert = record_perturbations(rec, auth, cfg, its)
+        extra_pert = record_perturbations(rec, auth, cfg, its, kin["observability"])
         fa["interaction_windows"] = [dict(name=i.name, **{k: v for k, v in i.meta.items() if not k.startswith("_")})
                                      for i in its]
         if fa["status"] in ("EXPLORATORY_ASSUMPTIONS_ACCEPTED", "VERIFIED"):
@@ -417,7 +484,8 @@ def build_inputs(run_root, scene, cfg, *, robot_archive=None, contact_segments=N
         if cal is not None and cal.is_file():
             c = json.loads(cal.read_text())
             verified = c.get("status") == "MEASURED"
-            prov = f"{cal.name}: status {c.get('status')} ({c.get('method')})"
+            prov = (f"DECLARED by the operator: {c.get('method')} ({cal.name})" if c.get("status") == "DECLARED_OPERATOR"
+                    else f"{cal.name}: status {c.get('status')} ({c.get('method')})")
         grav = GravityField(tuple(gcfg["vector_world_mps2"]), verified, prov, "base_link")
     mesh_p = resolve_path(cfg, cfg["mass_model"]["mesh"])
     mesh = TriMesh.read_obj(mesh_p, cfg["mass_model"]["mesh_units"]) if mesh_p is not None else None
@@ -442,11 +510,22 @@ def build_inputs(run_root, scene, cfg, *, robot_archive=None, contact_segments=N
                                                authority_dir=kin["authority_dir"], authority_id=kin["authority_id"],
                                                world_frame=kin["world_frame"], q_units=auth.q_units,
                                                failure_codes=kin["failure_codes"], multimodal=kin["multimodal"],
-                                               branch=kin["kind"], diagnostic=kin["diagnostic"]),
+                                               branch=kin["kind"], diagnostic=kin["diagnostic"],
+                                               declaration_note=kin.get("declaration_note")),
                     train=train, heldout=[], force_audit=fa, gravity=grav, mass_mesh=mesh,
                     mass_mesh_provenance=dict(source=str(mesh_p)) if mesh_p else None,
                     axis_std_rad=float(np.deg2rad(obs.get("axis_sigma_deg") or 0.0)),
                     origin_std_m=float(obs.get("hinge_line_sigma_m") or 0.0),
                     anchor_frame=int(auth.rgbd_frame_index[auth.reference_time_index]),
                     visual_handoff=kin["visual_handoff"], mechanical_spec=mech, excitation_only=excit,
-                    input_hashes=hashes, extra_perturbations=extra_pert)
+                    input_hashes=hashes, extra_perturbations=extra_pert,
+                    com_direction=_com_dir(auth, kin.get("support_centroid"))[0],
+                    com_lever_m=_com_dir(auth, kin.get("support_centroid"))[1],
+                    record_context=None if rec is None else dict(
+                        rec=rec, joint_type=auth.joint_type, axis=np.asarray(auth.axis_world, float),
+                        origin=None if auth.origin_world is None else np.asarray(auth.origin_world, float),
+                        q_src=np.asarray(auth.source_frame_index)[np.asarray(auth.q_valid, bool)],
+                        q=np.asarray(auth.q, float)[np.asarray(auth.q_valid, bool)],
+                        q_std=(auth.q_sigma[np.asarray(auth.q_valid, bool)] if auth.q_sigma is not None else
+                               _q_noise(auth, np.asarray(auth.q_valid, bool))),
+                        observability=kin["observability"]))

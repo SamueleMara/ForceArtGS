@@ -194,12 +194,12 @@ work catches a flipped sign, windows, categories, no mesh requirement. G9 total:
 ### 8.2 Real exploratory estimates (joint-space; conditional on §8.1; no independent held-out episode exists)
 
 **Fridge — kinematics IDENTIFIED_REVOLUTE.** Window: rows 220–296.
-- **The effort is at the sensor noise floor:** SNR 1.15. The door moves 0.33 rad after an impulsive 2.6 N contact
+- **The effort is at the sensor noise floor:** SNR 1.15 *(superseded, see §9: this mixed the pulse and the coast; pulse SNR 25.7, coast SNR 1.26)*. The door moves 0.33 rad after an impulsive 2.6 N contact
   at rows 229–232, then coasts with |F| 0.07–0.4 N.
 - **Fit:** the full and no-static models fit at 1.3 σ (adequacy PASS); the models without the configuration load
   fail (χ²/dof 47).
-- **No parameter is identifiable.** τ = M/c = 0.25 ± 0.07 s (27 % rel. std). The effective configuration load
-  (gB 0.13 N·m, CI includes 0) is consistent with gravity on a hinge tilted 6° from vertical.
+- **No parameter is identifiable.** τ = M/c = 0.25 ± 0.07 s (27 % rel. std): **not identified**. The effective configuration load
+  (gB 0.13 N·m, CI includes 0) is NOT evidence of gravity: a constant bias explains the same misfit (§9).
 - **Frozen viscous baselines** (IntegralLS 0.002 kg·m², 0.027 N·m·s; Backprop 0.012, 0.025) are also
   "NOT separately identifiable".
 - **Diagnosis:** this demonstration does not carry enough force information. Calibration is not the limit.
@@ -207,7 +207,7 @@ work catches a flipped sign, windows, categories, no mesh requirement. G9 total:
 **Orange suitecase — kinematics TYPE_UNOBSERVABLE; prismatic working model, KINEMATICS_NOT_ACCEPTED.** Window: rows
 124–228.
 - **Data quality:** SNR 62, positive work 1.00.
-- **Viscous-only fit:** c = 20.7 [17.9, 23.6] N·s/m (identifiable), M = 18.1 [6.8, 29.5] kg (not identifiable),
+- **Viscous-only fit:** c = 20.7 [17.9, 23.6] N·s/m (statistically resolved *in this rejected model* only; not physically interpretable), M = 18.1 [6.8, 29.5] kg (not identifiable),
   adequacy FAIL (χ²/dof 4.0).
 - **With the effective constant load:** rms 1.2 σ, adequacy PASS, but c, Fc and the constant load are confounded
   (one direction).
@@ -224,3 +224,33 @@ direction: no parameter is identifiable in any variant.
 **Notes on the outputs:**
 - Fridge `dynamics/g9/v001` is the pre-safeguard degenerate fit, superseded by v002–v006.
 - The certified-policy runs from earlier (v000) remain as the certification record.
+
+## 9. Corrections (2026-11-20, `FORCEARTGS_G9_CORRECTIONS_CODEX_20261120.md`)
+
+Details, before / after tables and tests: `docs/G9_CORRECTIONS_AUDIT.md`.
+
+**What changed:**
+- **Sign:** one contract (`force_convention.py`), used by G9 and the frontend. F_obj = s R F_corr with an EXPLICIT s
+  from metadata; missing / malformed → error; applied once (typed stages).
+- **Pulse vs coast:** evaluated separately on native rows (`impulse_coast.py`).
+- **Load vs gravity:** the joint-space load is `effective_configuration_load`; candidate models A / B / C / D with LR
+  tests (`load_models.py`).
+- **Uncertainty:** statistical CIs separated from DECLARED scenarios (no quadrature); ±5 % force scale is an
+  unvalidated stress test.
+- **Verdicts:** two dimensions, `parameter_statistically_resolved_in_this_model` and
+  `physically_interpretable_validated`.
+- **Frontend:** consumes the same canonical record (opt-in exploratory policy; certified unchanged); R/P ablation
+  driver.
+
+**Real verdicts, by category:**
+
+| category | content |
+|---|---|
+| measured | force samples, TCP poses, recorded timestamps, the q trajectories |
+| conditional | every fitted dynamics number (exploratory policy) |
+| rejected models | viscous-only fridge and suitcase fits (adequacy FAIL) |
+| not identifiable | every fridge, suitcase and black-box physical parameter |
+
+- **Fridge:** the main pulse is an aliased impact transient, so IMPULSE_UNRESOLVED; the coast is at the force noise
+  floor.
+- **Suitcase:** damping is model-dependent (20.7 vs 135 N·s/m) on an unaccepted joint.

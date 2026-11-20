@@ -41,7 +41,8 @@ def apply_force_calibration(fa: dict, calibration_file) -> dict:
 
 def run_dynamics_stage(run_root, scene, dynamics_config, *, physics_library=None, robot_archive=None,
                        contact_segments=None, force_calibration=None, mass_model_spec=None, episodes=None,
-                       force_export=None, allow_diagnostic_kinematics=False, log=print) -> dict:
+                       force_export=None, allow_diagnostic_kinematics=False, declared_joint_type=None,
+                       declaration_note=None, log=print) -> dict:
     from .adapters.forceartgs_g9 import build_inputs
     prov = physics_lib.load(physics_library)
     cfg = load_dynamics_config(dynamics_config)
@@ -58,7 +59,8 @@ def run_dynamics_stage(run_root, scene, dynamics_config, *, physics_library=None
             mm["mesh"] = str(base / mm["mesh"])
         cfg["mass_model"].update(mm)
     inp = build_inputs(run_root, scene, cfg, robot_archive=robot_archive, contact_segments=contact_segments,
-                       force_export=force_export, log=log)
+                       force_export=force_export, declared_joint_type=declared_joint_type,
+                       declaration_note=declaration_note, log=log)
     inp.force_audit = apply_force_calibration(inp.force_audit, force_calibration)
     if inp.force_audit.get("status") == "VERIFIED" and not inp.train and inp.excitation_only:
         inp.train, inp.excitation_only = inp.excitation_only, []

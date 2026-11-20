@@ -27,6 +27,10 @@ def main(argv=None) -> int:
     d.add_argument("--dynamics-episodes", default=None)
     d.add_argument("--allow-diagnostic-kinematics", action="store_true",
                    help="fit the working model of a TYPE_UNOBSERVABLE joint (labelled KINEMATICS_NOT_ACCEPTED)")
+    d.add_argument("--declared-joint-type", default=None, choices=("revolute", "prismatic"),
+                   help="operator-declared joint type for a TYPE_UNOBSERVABLE scene (OPERATOR_DECLARED_KINEMATICS: "
+                        "conditional, never certified)")
+    d.add_argument("--declaration-note", default=None, help="who declared it and when (required with the above)")
     d.add_argument("--force-export", default=None,
                    help="export_force_contact_annotations.py output dir (default <results>/contact_annotations/<scene>)")
     f = sub.add_parser("final-physics-export")
@@ -71,7 +75,8 @@ def main(argv=None) -> int:
                                robot_archive=a.robot_archive, contact_segments=a.contact_segments,
                                force_calibration=a.force_calibration, mass_model_spec=a.mass_model_spec,
                                episodes=a.dynamics_episodes, force_export=a.force_export,
-                               allow_diagnostic_kinematics=a.allow_diagnostic_kinematics)
+                               allow_diagnostic_kinematics=a.allow_diagnostic_kinematics,
+                               declared_joint_type=a.declared_joint_type, declaration_note=a.declaration_note)
         print(json.dumps(dict(out_dir=r["out_dir"], status=r["manifest"]["status"],
                               status_categories=r["manifest"].get("status_categories"), blocked=r["manifest"]["blocked"],
                               reused=r.get("reused")), indent=1))

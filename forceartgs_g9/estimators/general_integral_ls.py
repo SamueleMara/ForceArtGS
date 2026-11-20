@@ -102,6 +102,15 @@ def general_integral_ls(interactions, spec: ModelSpec, v_eps=None) -> dict:
                     J = J - spec.mass_model.reflected() * dq            # declared reflected inertia is known
                 else:
                     cols["M"] = dq
+                    if spec.parameter_source == "joint_space_gravity_coupled" and t_.gravity and \
+                            spec.joint_type == "prismatic":
+                        ga = float(np.asarray(spec.gravity.g_world, float) @ (np.asarray(spec.joint_axis, float) /
+                                                                              np.linalg.norm(spec.joint_axis)))
+                        cols["M"] = dq - ga * 0.5 * T ** 2         # G_P = -M g.a shares the mass column
+            if t_.gravity and spec.parameter_source == "joint_space_gravity_coupled" and spec.joint_type == "revolute":
+                A1, B1 = spec._g_js_coeffs({"mu": 1.0})
+                cols["mu"] = cumulative_trapezoid(cumulative_trapezoid(A1 * np.cos(qq) + B1 * np.sin(qq), tt, initial=0),
+                                                  tt, initial=0)
             if t_.viscous:
                 cols["c"] = cumulative_trapezoid(dq, tt, initial=0)
             if t_.coulomb:
@@ -147,7 +156,7 @@ def general_integral_ls(interactions, spec: ModelSpec, v_eps=None) -> dict:
     coef_u, *_ = np.linalg.lstsq(Xn, y, rcond=None)
     coef_u = coef_u / sc
     lo = np.full(X.shape[1], -np.inf)
-    nonneg = {"alpha", "M", "c", "Fc"}
+    nonneg = {"alpha", "M", "c", "Fc", "mu"}
     for j, nm in enumerate(names):
         if nm in nonneg:
             lo[j] = 0.0

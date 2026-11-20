@@ -43,7 +43,8 @@ def _ev(status, value=None, source=None, method=None, note=None):
     return d
 
 
-def build_robot_record(scene, force_export_dir, robot_archive, contact_segments=None) -> dict:
+def build_robot_record(scene, force_export_dir, robot_archive, contact_segments=None,
+                       independent_tare_windows=None) -> dict:
     """Arrays at the native recorded rows + an evidence table. Raises FileNotFoundError when an input is missing
     (the caller reports DATA_UNAVAILABLE)."""
     scene, fx, arc = Path(scene), Path(force_export_dir), Path(robot_archive)
@@ -65,18 +66,35 @@ def build_robot_record(scene, force_export_dir, robot_archive, contact_segments=
     if missing:
         raise ValueError(f"robot archive lacks rows {missing[:5]} of the force export (no interpolation)")
     sel = np.array([index[int(s)] for s in src])
+    from .force_convention import (SensorCorrForce, load_scene_convention, sensor_corr_to_object_base,
+                                   validate_rotation)
     T_ee = np.asarray(z["T_base_ee"], float)[sel]
     T_tcp = np.asarray(z["T_base_tcp"], float)[sel]
+    validate_rotation(T_ee[:, :3, :3], "robot archive T_base_ee rotation")
     wf = ann.get("wrench_frame") or {}
-    R_es = np.asarray(wf.get("R_ee_force_sensor", np.eye(3)), float)
+    if "R_ee_force_sensor" not in wf:
+        raise ValueError(f"{js_p}: wrench_frame.R_ee_force_sensor absent (the sensor rotation is never assumed)")
+    R_es = validate_rotation(wf["R_ee_force_sensor"], "R_ee_force_sensor")
     conv = json.loads((meta / "contact_force_convention.json").read_text())
-    mult = float(conv.get("object_side_force_multiplier", -1))
-    F_obj = mult * np.einsum("nij,jk,nk->ni", T_ee[:, :3, :3], R_es, Fs)
+    mult, sign_prov = load_scene_convention(meta)                 # explicit multiplier only; raises otherwise
+    F_obj_t = sensor_corr_to_object_base(SensorCorrForce(Fs, source=str(csv_p)), T_ee[:, :3, :3], R_es, mult,
+                                         rotation_source=f"DECLARED: {wf.get('alignment_source')}",
+                                         sign_prov=sign_prov)
+    F_obj = F_obj_t.values
     P = T_tcp[:, :3, 3]
+    # no double tare: the archive's raw wrench minus the export tare must reproduce the exported corrected force
+    thr0 = ann.get("thresholds") or {}
+    F_raw = np.asarray(z["wrench"], float)[sel][:, :3] if "wrench" in z.files else None
+    tare_check = None
+    if F_raw is not None and thr0.get("tare_N") is not None:
+        d = np.abs(F_raw - np.asarray(thr0["tare_N"], float) - Fs)
+        tare_check = dict(max_abs_N=float(d.max()), consistent=bool(d.max() <= 1e-3),
+                          rule="F_sensor_raw - tare_export == F_sensor_corr (export rounding 1e-5 N)")
     thr = ann.get("thresholds") or {}
     sigma = np.asarray(thr.get("sigma_N", [np.nan] * 3), float)
     tare = np.asarray(thr.get("tare_N", [np.nan] * 3), float)
-    # tare stability in a SECOND, separated contact-free window: force-absent rows after the last contact row
+    # THRESHOLD-CONDITIONED diagnostic: force-absent rows after the last contact. Rows were SELECTED by a force
+    # threshold, which biases the window towards low residual force -> never independent tare verification.
     contact_rows = np.flatnonzero(state == "contact")
     late = np.zeros(len(src), bool)
     if len(contact_rows):
@@ -86,12 +104,26 @@ def build_robot_record(scene, force_export_dir, robot_archive, contact_segments=
     # contact segments (operator labels): rows inside are contact-confirmed
     in_seg = np.zeros(len(src), bool)
     segs = []
+    free_windows = list(independent_tare_windows or [])
     if contact_segments and Path(contact_segments).is_file():
         import yaml
         doc = yaml.safe_load(Path(contact_segments).read_text())
         segs = doc.get("segments") or []
         for s in segs:
             in_seg |= (src >= int(s["start_source_frame"])) & (src <= int(s["end_source_frame"]))
+        free_windows += [(int(w["start_source_frame"]), int(w["end_source_frame"]))
+                         for w in (doc.get("contact_free_windows") or [])]     # operator-designated, predeclared
+    indep = None
+    if free_windows:
+        m = np.zeros(len(src), bool)
+        for a0, b0 in free_windows:
+            m |= (src >= a0) & (src <= b0)
+        if m.sum() >= 10:
+            mu, se = Fs[m].mean(0), Fs[m].std(0) / np.sqrt(m.sum())
+            sig0 = np.asarray((ann.get("thresholds") or {}).get("sigma_N", [np.inf] * 3), float)
+            ok = bool(np.all(np.abs(mu) <= np.maximum(3 * se, sig0)))
+            indep = dict(windows=[list(w) for w in free_windows], n=int(m.sum()), mean_N=mu.tolist(),
+                         se_N=se.tolist(), status="INDEPENDENT_WINDOW_CONSISTENT" if ok else "INDEPENDENT_WINDOW_DRIFT")
     cams = json.loads((meta / "cameras.json").read_text())
     frames = {c.get("coordinate_frame") for c in cams["cameras"]}
     tool = json.loads((meta / "robot_tool.json").read_text()) if (meta / "robot_tool.json").is_file() else {}
@@ -107,18 +139,28 @@ def build_robot_record(scene, force_export_dir, robot_archive, contact_segments=
         "tare_initial": _ev("ESTIMATED", tare.tolist(), method=thr.get("noise_model") or "baseline mean",
                             note=f"first {thr.get('baseline_duration_s')} s contact-free baseline"),
         "force_noise_sigma_N": _ev("ESTIMATED", sigma.tolist(), method="1.4826 x MAD per axis over the baseline"),
-        "tare_second_window": (_ev("ESTIMATED", dict(mean_N=late_mean.tolist(), se_N=late_se.tolist(),
-                                                     n=int(late.sum())),
-                                   method="mean of force-absent rows after the last contact (separated window)")
+        "tare_second_window": (_ev("THRESHOLD_CONDITIONED_DIAGNOSTIC", dict(mean_N=late_mean.tolist(),
+                                                                            se_N=late_se.tolist(), n=int(late.sum())),
+                                   method="mean of rows classified force-absent after the last contact",
+                                   note="rows selected BY a force threshold: a consistency diagnostic, never "
+                                        "independent drift verification")
                                if late_mean is not None else _ev("NOT_ESTABLISHED",
                                                                  note="fewer than 10 force-absent rows after contact")),
+        "tare_independent_window": (_ev(indep["status"], indep, method="mean force over operator-designated / "
+                                        "predeclared contact-free windows (not threshold-selected)")
+                                    if indep else _ev("NOT_ESTABLISHED", note="no operator-designated contact-free "
+                                                      "window (contact_free_windows in the segments file)")),
+        "tare_not_duplicated": (_ev("VERIFIED_BY_CONSTRUCTION" if tare_check["consistent"] else "INCONSISTENT",
+                                    tare_check) if tare_check else _ev("NOT_ESTABLISHED",
+                                                                       note="no raw wrench in the robot archive")),
         "tool_gravity_change": _ev("ESTIMATED", dict(max_rotation_deg=rot_deg, force_bound_N_per_kg_tool=g_per_kg),
                                    method="EE orientation change from the baseline; tool mass unknown, so the bound "
                                           "is per kg of tool + sensor mass",
                                    note=gc.get("reason")),
         "sensor_axes": _ev("DECLARED", R_es.tolist(), source=wf.get("alignment_source")),
-        "force_sign": _ev("DECLARED", mult, source=conv.get("confirmation_source"),
-                          note=f"recorded quantity {conv.get('recorded_quantity')}"),
+        "force_sign": _ev("DECLARED", mult, source=sign_prov["sign_source"],
+                          note=f"recorded quantity {conv.get('recorded_quantity')}; metadata sha256 "
+                               f"{sign_prov['metadata_sha256'][:16]}; confirmed by {conv.get('confirmation_source')}"),
         "torque_origin": _ev("NOT_ESTABLISHED", note=wf.get("torque_origin") or "unspecified; torques unused"),
         "tcp_offset": _ev("DECLARED", tool.get("T_ee_tcp"), source=tool.get("calibration_source"),
                           note=tool.get("reference_assumption")),
@@ -136,9 +178,14 @@ def build_robot_record(scene, force_export_dir, robot_archive, contact_segments=
                                  source=str(contact_segments) if segs else None,
                                  note="operator-validated force + visual estimate; outside: per-row force state"),
     }
+    if tare_check is not None and not tare_check["consistent"]:
+        raise ValueError(f"force export {csv_p} does not equal raw wrench - export tare (max {tare_check['max_abs_N']:.3g} "
+                         "N): refusing a possibly double-tared / mismatched input")
     return dict(schema=SCHEMA, scene=scene.name, source_frame_index=src, timestamp_s=ts, F_sensor_corr_N=Fs,
                 F_object_base_N=F_obj, p_tcp_base_m=P, R_base_ee=T_ee[:, :3, :3], contact_state=state,
                 in_contact_segment=in_seg, force_sigma_N=sigma, object_side_multiplier=mult,
+                F_sensor_raw_N=F_raw if F_raw is not None else np.full_like(Fs, np.nan),
+                force_conversion=F_obj_t.provenance,
                 T_world_base=np.eye(4) if frames == {"base_link"} else None, evidence=evidence,
                 sources=dict(force_export_csv=str(csv_p), force_export_csv_sha256=_sha(csv_p),
                              force_export_json_sha256=_sha(js_p), robot_archive=str(arc),
@@ -167,7 +214,8 @@ def positive_work_check(rec, authority, min_force_sigma=3.0) -> dict:
     a = np.asarray(authority.axis_world, float)
     o = np.zeros(3) if authority.origin_world is None else np.asarray(authority.origin_world, float)
     idx = {int(s): i for i, s in enumerate(rec["source_frame_index"])}
-    rows = [(k, idx[int(s)]) for k, s in enumerate(src) if int(s) in idx]
+    ok_row = rec["in_contact_segment"] & (rec["contact_state"] == "contact")      # contact-confirmed + force-valid
+    rows = [(k, idx[int(s)]) for k, s in enumerate(src) if int(s) in idx and ok_row[idx[int(s)]]]
     F, P = rec["F_object_base_N"], rec["p_tcp_base_m"]
     sig = float(np.nanmax(rec["force_sigma_N"]))
     pw = []
@@ -183,4 +231,6 @@ def positive_work_check(rec, authority, min_force_sigma=3.0) -> dict:
     return dict(status=("DATA_CONSISTENT" if frac is not None and frac >= 0.8 else
                         "DATA_CONTRADICTS" if frac is not None and frac <= 0.2 else "INCONCLUSIVE"),
                 fraction_positive_work=frac, n_samples=int(len(big)),
-                method="sign of Q q' on force-active rows (largest 75 % of |Q q'|); pushing does positive work")
+                method="sign of Q q' on contact-confirmed, force-valid rows (largest 75 % of |Q q'|); a "
+                       "DIAGNOSTIC of the declared sign: it never changes, infers or certifies the multiplier, and it "
+                       "is not a joint-type selector (sliders and hinges both show positive power)")

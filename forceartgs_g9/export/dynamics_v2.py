@@ -96,6 +96,20 @@ def parameter_table(terms, joint_type, fit, ident, spec, *, physical_claim: bool
             entry["M_eff"] = phys.get("M")
         if t == "bias":
             entry["note"] = "nuisance generalized load: never a sensor tare, never exported as friction"
+        if t == "gravity" and spec is not None and spec.parameter_source == "joint_space_only":
+            entry["label"] = "effective_configuration_load"
+            entry["physical_gravity"] = False
+            entry["note"] = ("joint-space A cos q + B sin q (R) / constant (P): an EFFECTIVE configuration-dependent "
+                             "load (gravity on a tilted hinge, a closer, a cable, a residual force ...), never "
+                             "gravitational torque; only geometry_coupled + calibrated gravity is physical gravity")
+        # two separate verdict dimensions per fitted parameter
+        for n, v in e.items():
+            if v.get("fitted_or_fixed") == "fitted":
+                pi = par.get(n, {})
+                v["parameter_statistically_resolved_in_this_model"] = bool(
+                    pi.get("statistically_resolved_in_this_model", pi.get("identifiable")))
+                v["scenario_sensitive"] = pi.get("scenario_sensitive")
+                v["physically_interpretable_validated"] = False          # set by core.verdicts()
         if not physical_claim:
             entry["not_physical"] = label
         out[t] = entry

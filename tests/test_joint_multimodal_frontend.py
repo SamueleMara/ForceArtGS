@@ -139,3 +139,72 @@ class Frontend_Units(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def canonical_record_from(sc, rec, scale=1.0, rotate=None):
+    """A canonical robot record (robot_record.py format) built from the synthetic recording: force converted ONCE
+    by the shared force_convention contract (reaction on robot, s = -1)."""
+    from estimotion_2part.joint_discovery.force_convention import SensorCorrForce, sensor_corr_to_object_base
+    fm = sc.obs.frame_map
+    F = np.asarray(rec.wrench_sensor[:, :3], float) * scale
+    if rotate is not None:
+        F = F @ np.asarray(rotate, float).T
+    f = sensor_corr_to_object_base(SensorCorrForce(F), rec.R_WS, np.eye(3), -1.0, rotation_source="synthetic")
+    n = len(fm.source_frame_index)
+    return dict(source_frame_index=np.asarray(fm.source_frame_index), timestamp_s=np.asarray(fm.timestamp_s),
+                F_object_base_N=f.values, p_tcp_base_m=np.asarray(rec.p_tcp_w), contact_state=np.full(n, "contact"),
+                in_contact_segment=np.ones(n, bool), force_sigma_N=np.array([0.05, 0.05, 0.05]),
+                force_conversion=f.provenance, T_world_base=np.eye(4))
+
+
+class SharedRobotRecord(unittest.TestCase):
+    def test_alignment_same_signed_force_and_row_mismatch(self):
+        from estimotion_2part.joint_discovery.frontend_robot_record import (RecordAlignmentError,
+                                                                            align_record_to_frame_map)
+        sc = make_scene("revolute", seed=1, T=30, n_moving=150, max_angle_deg=30)
+        rec, cal, doc = make_contact_record(sc, "stick_hard", verified=False)
+        R = canonical_record_from(sc, rec)
+        al = align_record_to_frame_map(R, sc.obs.frame_map, p_tcp_w=rec.p_tcp_w, T_WB=rec.T_WB)
+        np.testing.assert_array_equal(al["f_object_w"], R["F_object_base_N"])
+        np.testing.assert_allclose(al["f_object_w"], -np.asarray(rec.wrench_sensor[:, :3]))   # once, s = -1
+        bad = dict(R, source_frame_index=R["source_frame_index"] + 1000)
+        with self.assertRaises(RecordAlignmentError):
+            align_record_to_frame_map(bad, sc.obs.frame_map)
+        shifted = dict(R, p_tcp_base_m=R["p_tcp_base_m"] + 0.01)
+        with self.assertRaises(RecordAlignmentError):                   # TCP of another row / archive
+            align_record_to_frame_map(shifted, sc.obs.frame_map, p_tcp_w=rec.p_tcp_w)
+
+    def test_certified_unchanged_and_exploratory_diagnostic(self):
+        sc = make_scene("revolute", seed=1, T=30, n_moving=150, max_angle_deg=30)
+        rec, cal, doc = make_contact_record(sc, "stick_hard", verified=False)
+        R = canonical_record_from(sc, rec)
+        outs = {}
+        with tempfile.TemporaryDirectory() as td:
+            for name, kw, c in (("plain", {}, cfg()),
+                                ("certified_record", dict(robot_record=R, force_policy="certified"), cfg()),
+                                ("exploratory", dict(robot_record=R, force_policy="exploratory"),
+                                 cfg("min_effort_tangent")),
+                                ("exploratory_wrong_axis", dict(robot_record=canonical_record_from(
+                                    sc, rec, rotate=[[0, -1, 0], [1, 0, 0], [0, 0, 1]]), force_policy="exploratory"),
+                                 cfg("min_effort_tangent")),
+                                ("exploratory_low_force", dict(robot_record=canonical_record_from(sc, rec, scale=0.01),
+                                                               force_policy="exploratory"), cfg("min_effort_tangent"))):
+                sel = run_multimodal_frontend(sc.obs, sc.calibs, c, Path(td) / name, rec=rec, segments_source=doc,
+                                              wrench_calibration=cal, log=lambda m: None, **kw)
+                acc = Path(td) / name / "accepted"
+                outs[name] = dict(sel=sel, files=sorted(p.name for p in acc.iterdir()),
+                                  usage=json.loads((acc / "force_usage.json").read_text()) if (acc / "force_usage.json").is_file()
+                                  else None,
+                                  align=(Path(td) / name / "robot" / "canonical_record_alignment.json").is_file())
+        p, c_, e = outs["plain"]["sel"], outs["certified_record"]["sel"], outs["exploratory"]["sel"]
+        self.assertEqual(p["physical_joint_status"], c_["physical_joint_status"])        # certified unchanged
+        self.assertEqual(p["physics_joint_export_ready"], c_["physics_joint_export_ready"])
+        self.assertTrue(outs["certified_record"]["align"])
+        self.assertFalse(outs["certified_record"]["usage"]["conditional"])
+        for k in ("exploratory", "exploratory_wrong_axis", "exploratory_low_force"):
+            s = outs[k]["sel"]
+            self.assertFalse(s["physics_joint_export_ready"])                         # never promoted
+            self.assertIn("EXPLORATORY_FORCE_DIAGNOSTIC", s["failure_codes"])
+            self.assertTrue(outs[k]["usage"]["conditional"])
+            self.assertIn("exploratory_force_diagnostics.json", outs[k]["files"])
+            self.assertFalse(s.get("force_evidence_used") and s["physical_joint_status"].startswith("IDENTIFIED_P"))

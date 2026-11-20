@@ -58,7 +58,9 @@ def fake_dataset(td, sign=-1.0, n=300, seg=(100, 220)):
     T = np.tile(np.eye(4), (n, 1, 1))
     q = np.cumsum(np.where(push, 0.002, 0.0))              # moves only while pushed (+y)
     T[:, :3, 3] = np.c_[np.zeros(n), q, np.full(n, 0.3)]
-    np.savez(td / "robot_archive.npz", T_base_ee=T, T_base_tcp=T, source_row=rows, wrench=np.c_[F_rec, np.zeros((n, 3))])
+    tare = np.array([0.001, 0.002, 0.0])
+    np.savez(td / "robot_archive.npz", T_base_ee=T, T_base_tcp=T, source_row=rows,
+             wrench=np.c_[F_rec + tare, np.zeros((n, 3))])        # raw = corrected + export tare (no double tare)
     (td / "seg.yaml").write_text("schema: forceartgs.contact_segments/v1\nsource: test\nsegments:\n"
                                  f"  - {{segment_id: c0, start_source_frame: {seg[0]}, end_source_frame: {seg[1]}, "
                                  "contact_state: contact_confirmed, slip_mode: sliding, provenance: operator_label}\n")
@@ -81,7 +83,11 @@ class RobotRecord(unittest.TestCase):
             self.assertEqual(ev["sensor_axes"]["status"], "DECLARED")
             self.assertEqual(ev["row_association"]["status"], "VERIFIED_BY_CONSTRUCTION")
             self.assertEqual(ev["hardware_clock_offset"]["status"], "NOT_ESTABLISHED")
-            self.assertEqual(ev["tare_second_window"]["status"], "ESTIMATED")
+            self.assertEqual(ev["tare_second_window"]["status"], "THRESHOLD_CONDITIONED_DIAGNOSTIC")
+            self.assertEqual(ev["tare_independent_window"]["status"], "NOT_ESTABLISHED")
+            self.assertEqual(ev["tare_not_duplicated"]["status"], "VERIFIED_BY_CONSTRUCTION")
+            self.assertEqual(rec["force_conversion"]["sign"], -1.0)
+            self.assertIn("metadata_sha256", rec["force_conversion"])
             push = rec["contact_state"] == "contact"
             self.assertAlmostEqual(float(np.median(rec["F_object_base_N"][push, 1])), 2.0, delta=0.05)  # object side
 
@@ -95,7 +101,9 @@ class RobotRecord(unittest.TestCase):
             self.assertEqual(exp["status"], "EXPLORATORY_ASSUMPTIONS_ACCEPTED")
             self.assertNotIn("VERIFIED", [g["status"] for g in exp["gates"].values()])   # never upgraded
             self.assertEqual(exp["positive_work"]["status"], "DATA_CONSISTENT")
-            self.assertEqual(exp["gates"]["tare"]["status"], "ESTIMATED_STABLE")
+            # threshold-selected rows are a consistency diagnostic, never independent drift verification
+            self.assertEqual(exp["gates"]["tare"]["status"], "ESTIMATED_INITIAL_TARE_THRESHOLD_CONDITIONED_CONSISTENT")
+            self.assertIsNone(exp["tare_independent_window_stable"])
             for g in exp["gates"].values():
                 self.assertIn("additional_verification_for_certified_export", g)
                 self.assertIn("needed_for_joint_space_estimation", g)
@@ -120,7 +128,8 @@ class RobotRecord(unittest.TestCase):
             self.assertTrue(all(i.meta["source_rows"][0] > 50 or i.meta["source_rows"][1] < 50 for i in its2))
             pert = record_perturbations(rec, auth, load_dynamics_config(
                 {"identifiability": {"contact_point_sweep_m": 0.01}}), its)
-            self.assertIn("tare_second_window_residual", pert)
+            self.assertIn("tare_threshold_conditioned_residual|+", pert)
+            self.assertIn("tare_threshold_conditioned_residual|-", pert)
 
     def test_exploratory_fit_categories_and_no_mesh_requirement(self):
         from forceartgs_g9.core import G9Inputs, run_g9
@@ -149,6 +158,42 @@ class RobotRecord(unittest.TestCase):
             self.assertIsNone(r["physics_spec_v1"])                       # never production from exploratory
             self.assertTrue((Path(td) / "g9" / "robot_record" / "canonical_robot_record.npz").is_file())
             self.assertIn(r["table"]["viscous"]["status"], ("estimated_conditional", "not_identifiable"))
+
+
+    def test_fail_closed_inputs(self):
+        with tempfile.TemporaryDirectory() as td:
+            td, auth = fake_dataset(td)
+            (td / "scene" / "metadata" / "contact_force_convention.json").write_text(json.dumps({}))
+            with self.assertRaises(ValueError):                    # no multiplier -> hard error, no default
+                build_robot_record(td / "scene", td / "force", td / "robot_archive.npz", td / "seg.yaml")
+        with tempfile.TemporaryDirectory() as td:
+            td, auth = fake_dataset(td)
+            z = dict(np.load(td / "robot_archive.npz"))
+            z["wrench"] = z["wrench"] - np.r_[0.001, 0.002, 0.0, 0, 0, 0]          # export would tare twice
+            np.savez(td / "robot_archive.npz", **z)
+            with self.assertRaises(ValueError):
+                build_robot_record(td / "scene", td / "force", td / "robot_archive.npz", td / "seg.yaml")
+        with tempfile.TemporaryDirectory() as td:
+            td, auth = fake_dataset(td)
+            z = dict(np.load(td / "robot_archive.npz"))
+            np.savez(td / "robot_archive.npz", **{k: v[:-10] for k, v in z.items()})   # rows missing
+            with self.assertRaises(ValueError):
+                build_robot_record(td / "scene", td / "force", td / "robot_archive.npz", td / "seg.yaml")
+
+    def test_independent_designated_window_and_record_is_stable(self):
+        with tempfile.TemporaryDirectory() as td:
+            td, auth = fake_dataset(td)
+            rec = build_robot_record(td / "scene", td / "force", td / "robot_archive.npz", td / "seg.yaml",
+                                     independent_tare_windows=[(240, 290)])
+            self.assertEqual(rec["evidence"]["tare_independent_window"]["status"], "INDEPENDENT_WINDOW_CONSISTENT")
+            cfg = load_dynamics_config({"pipeline": {"force_policy": "exploratory"}})
+            fa = record_force_audit(rec, auth, cfg)
+            self.assertEqual(fa["gates"]["tare"]["status"], "ESTIMATED_INDEPENDENT_WINDOW_STABLE")
+            rec2 = build_robot_record(td / "scene", td / "force", td / "robot_archive.npz", td / "seg.yaml")
+            np.testing.assert_array_equal(rec["F_object_base_N"], rec2["F_object_base_N"])   # re-export: same sign
+            csv_bytes = (td / "force" / "contact_annotations.csv").read_bytes()
+            build_robot_record(td / "scene", td / "force", td / "robot_archive.npz", td / "seg.yaml")
+            self.assertEqual(csv_bytes, (td / "force" / "contact_annotations.csv").read_bytes())   # export untouched
 
 
 if __name__ == "__main__":

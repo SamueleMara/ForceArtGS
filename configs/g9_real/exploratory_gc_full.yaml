@@ -1,0 +1,23 @@
+# G9 EXPLORATORY real-data estimation: uses the canonical robot record (existing force export + robot archive +
+# declared conventions) with every DECLARED / ESTIMATED calibration quantity listed as an assumption. Estimates are
+# conditional and never production-exported. Joint-space only (no validated mass-model mesh exists): no link tensor.
+schema: forceartgs.dynamics_config/v1
+pipeline:
+  force_policy: exploratory
+  allow_diagnostic_kinematics: false
+model:
+  terms: {inertia: true, viscous: true, coulomb: true, static: true, gravity: true, bias: false}
+  parameter_source: joint_space_gravity_coupled   # declared vertical; P: G=-M g.a, R: one mass moment mu (COM toward the moving-support centroid)
+  gravity: {source: verified_world_gravity, vector_world_mps2: [0.0, 0.0, -9.81], calibration_file: gravity_base_link_declared.json}
+fitting:
+  load_model_comparison: true           # A base / B +bias / C +effective load / D both (diagnostic table)
+  compare_frozen_viscous_baselines: [IntegralLS, Backprop]
+  n_starts: 4
+identifiability:
+  # DECLARED SENSITIVITY SCENARIOS (symmetric +/-, linearised): reported per family, never added in quadrature and
+  # never called a standard deviation. Only a CALIBRATED uncertainty (none exists yet) would enter as one.
+  force_lag_sweep_s: 0.01                     # sub-row hardware offset scenario (rows are joined exactly)
+  force_scale_sweep_rel: 0.05                 # UNVALIDATED stress test (no sensor-scale calibration); null disables
+  contact_point_sweep_m: 0.015                # TCP / tool: lever, tangent and axial excursions (revolute only)
+  use_second_window_tare_sweep: true          # threshold-conditioned post-contact residual as a bias scenario
+  # hinge axis tilt / hinge-line offset scenarios come from joint_selection_v2.uncertainty (upstream statistical)

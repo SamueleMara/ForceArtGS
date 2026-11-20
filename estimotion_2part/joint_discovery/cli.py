@@ -733,9 +733,27 @@ def cmd_multimodal_refine(args) -> int:
     legacy = json.loads((args.from_run / "model_selection.json").read_text()).get("decision") \
         if (args.from_run / "model_selection.json").is_file() else None
     images = None if args.no_track_refinement else SceneImageSource(args.scene, obs.frame_map)
+    extra = {}
+    if getattr(args, "force_export", None) is not None:        # opt-in: the canonical robot record shared with G9
+        from .robot_record import build_robot_record
+        if args.robot_archive is None:
+            raise SystemExit("--force-export needs --robot-archive")
+        extra = dict(robot_record=build_robot_record(args.scene, args.force_export, args.robot_archive,
+                                                     args.contact_segments),
+                     force_policy=args.force_policy)
+        files[str(args.force_export / "contact_annotations.csv")] = _sha256(args.force_export / "contact_annotations.csv")
+    if getattr(args, "ablation", False):
+        from .frontend_ablation import run_ablation
+        if not extra:
+            raise SystemExit("multimodal-ablation needs --force-export and --robot-archive")
+        res = run_ablation(obs, calibs, cfg, args.output, scene=args.scene, rec=rec, record=extra["robot_record"],
+                           segments_source=args.contact_segments, wrench_calibration=cal, images=images,
+                           legacy=legacy, source_files=files, log=_log)
+        print(json.dumps({k: res["variants"][k]["physical_joint_status"] for k in res["variants"]}))
+        return 0
     run_multimodal_frontend(obs, calibs, cfg, args.output, scene=args.scene, images=images, rec=rec,
                             segments_source=args.contact_segments, wrench_calibration=cal, legacy=legacy,
-                            source_files=files, log=_log)
+                            source_files=files, log=_log, **extra)
     return 0
 
 
@@ -899,7 +917,23 @@ def main(argv=None):
     mm.add_argument("--max-iterations", type=int, default=None)
     mm.add_argument("--no-track-refinement", action="store_true")
     mm.add_argument("--output", required=True, type=Path)
+    for sp in (mm,):
+        sp.add_argument("--force-export", type=Path, default=None,
+                        help="export_force_contact_annotations.py output: canonical robot record shared with G9")
+        sp.add_argument("--force-policy", default="certified", choices=("certified", "exploratory"))
+    ab = sub.add_parser("multimodal-ablation", help="RGB-D / +TCP / +TCP+conditional-force frontend ablation on "
+                                                    "identical held-out blocks; writes a NEW directory")
+    for a_, kw in (("--scene", dict(required=True, type=Path)), ("--from-run", dict(required=True, type=Path)),
+                   ("--robot-archive", dict(required=True, type=Path)),
+                   ("--contact-segments", dict(type=Path, default=None)), ("--config", dict(default=None)),
+                   ("--max-iterations", dict(type=int, default=None)), ("--output", dict(required=True, type=Path)),
+                   ("--force-export", dict(required=True, type=Path))):
+        ab.add_argument(a_, **kw)
+    ab.add_argument("--no-track-refinement", action="store_true")
+    ab.set_defaults(force_policy="exploratory", ablation=True)
     args = ap.parse_args(argv)
+    if args.cmd == "multimodal-ablation":
+        return cmd_multimodal_refine(args)
 
     if args.cmd == "multimodal-refine":
         return cmd_multimodal_refine(args)

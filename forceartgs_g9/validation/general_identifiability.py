@@ -20,7 +20,7 @@ from ..estimators.general_integral_ls import moving_segments, velocity_estimate
 
 REL_STD_LIMIT = 0.10          # preregistered (same 10 % threshold as the frozen viscous diagnostic)
 CORR_LIMIT = 0.95
-POSITIVE = ("alpha", "M", "c", "Fc", "dFs", "Fs")
+POSITIVE = ("alpha", "M", "c", "Fc", "dFs", "Fs", "mu")
 
 
 def _neff_factor(res_by_it) -> tuple:
@@ -83,7 +83,7 @@ def structural_checks(interactions, spec) -> dict:
     if t_.gravity:
         if spec.joint_type == "prismatic" and t_.bias:
             out["confounds"].append(("gravity", "b", "PRISMATIC_GRAVITY_IS_CONSTANT: gravity load and bias collinear"))
-        if spec.joint_type == "prismatic" and spec.parameter_source == "joint_space_only":
+        if spec.joint_type == "prismatic" and spec.parameter_source == "joint_space_only":   # coupled: no confound
             out["confounds"].append(("gP", "Fc" if t_.coulomb else "force_offset",
                                      "PRISMATIC_EFFECTIVE_GRAVITY_CONSTANT: an effective constant load is not "
                                      "separable from offsets without the geometry coupling"))
@@ -147,51 +147,75 @@ def diagnose_general(fit: dict, interactions, spec, *, perturb: dict | None = No
     struct = structural_checks(interactions, spec)
     sysd = systematic_shifts(fit, interactions, perturb) if perturb else {}
     eff_scale = float(np.sqrt(np.mean(np.concatenate([np.asarray(it.effort.levels) ** 2 for it in P.its]))))
+    fams = scenario_families(sysd)
     report = {}
     for j, nm in enumerate(names):
         e = fit["estimates"][nm]
         val = e["value"]
         stat = e["std"] * (infl if "interval95" not in e else 1.0)
-        sys_tot = math.sqrt(sum(v[nm] ** 2 for v in sysd.values())) if sysd else 0.0
-        tot = math.hypot(stat, sys_tot) if math.isfinite(stat) else math.inf
+        # declared scenarios are NOT standard deviations: per family the signed shifts, the largest single-family
+        # excursion and a deterministic linear worst-case sum (labelled), never combined in quadrature
+        fam_rep = {f: dict(shifts={k: v[nm] for k, v in d.items()}, max_abs=max(abs(v[nm]) for v in d.values()),
+                           label="DECLARED_SCENARIO") for f, d in fams.items()}
+        worst_single = max((v["max_abs"] for v in fam_rep.values()), default=0.0)
+        linear_sum = float(sum(v["max_abs"] for v in fam_rep.values()))
         reasons = []
         if nm in POSITIVE:
-            rel = tot / abs(val) if val != 0 else math.inf
-            ok = rel <= REL_STD_LIMIT
-            if not ok:
-                reasons.append(f"relative std {rel:.3g} > {REL_STD_LIMIT}")
+            rel = stat / abs(val) if val != 0 else math.inf
+            resolved = rel <= REL_STD_LIMIT
+            if not resolved:
+                reasons.append(f"statistical relative std {rel:.3g} > {REL_STD_LIMIT}")
             if e.get("at_lower_bound"):
-                ok = False
+                resolved = False
                 reasons.append("estimate at its physical bound (0): not determined away from the bound")
+            sens = worst_single / abs(val) if val != 0 else math.inf
+            sensitive = sens > REL_STD_LIMIT
         else:
             rel = None
-            ok = tot <= 0.05 * eff_scale
-            if not ok:
-                reasons.append(f"std {tot:.3g} > 5% of the effort RMS {eff_scale:.3g}")
+            resolved = stat <= 0.05 * eff_scale
+            if not resolved:
+                reasons.append(f"statistical std {stat:.3g} > 5% of the effort RMS {eff_scale:.3g}")
+            sensitive = worst_single > 0.05 * eff_scale
         if "interval95" in e and not math.isfinite(e["interval95"][1]):
-            ok = False
+            resolved = False
             reasons.append("profile interval unbounded above")
         hi_corr = [other for k, other in enumerate(names)
                    if k != j and np.isfinite(corr[j, k]) and abs(corr[j, k]) > CORR_LIMIT]
         if hi_corr:
             # the marginal std already contains the correlation; it explains a failure, it is not one by itself
             msg = f"|corr| > {CORR_LIMIT} with {hi_corr}"
-            reasons.append(msg + (": only a combination is determined" if not ok else " (marginal std still small)"))
+            reasons.append(msg + (": only a combination is determined" if not resolved else
+                                  " (marginal std still small)"))
         for (p, why) in struct["unidentifiable"]:
             if p == nm:
-                ok = False
+                resolved = False
                 reasons.append(why)
         for cf in struct["confounds"]:
             if nm in cf[:2] or (nm in ("gA", "gB", "gP") and "gravity" in cf[:2]):
                 if cf[1] == "force_offset":
                     reasons.append(f"WARNING {cf[2]}")
                 else:
-                    ok = False
+                    resolved = False
                     reasons.append(cf[2])
-        report[nm] = dict(estimate=val, std_statistical=stat, std_systematic=sys_tot, std_total=tot,
-                          rel_std=rel, ci95=[val - 1.96 * tot, val + 1.96 * tot] if "interval95" not in e
-                          else e["interval95"], identifiable=bool(ok), reasons=reasons,
-                          failure_code=None if ok else "UNIDENTIFIABLE")
+        if sensitive:
+            worst = max(fam_rep, key=lambda f: fam_rep[f]["max_abs"])
+            reasons.append(f"scenario-sensitive: declared scenario {worst!r} moves the estimate by "
+                           f"{worst_single:.3g} (> {REL_STD_LIMIT:.0%})")
+        ok = bool(resolved and not sensitive)
+        ci_stat = [val - 1.96 * stat, val + 1.96 * stat] if "interval95" not in e else e["interval95"]
+        report[nm] = dict(estimate=val, std_statistical=stat, ci95_statistical=ci_stat,
+                          uncertainty_labels=dict(ci95_statistical="STATISTICAL", sensitivity_scenarios="DECLARED_SCENARIO",
+                                                  calibrated_uncertainty="CALIBRATED (none supplied)"),
+                          sensitivity_scenarios=fam_rep, scenario_worst_single_family=worst_single,
+                          scenario_linear_worst_case_sum=linear_sum,
+                          scenario_envelope=[val - worst_single, val + worst_single],
+                          calibrated_uncertainty=None,
+                          # backward-compatible keys: std_total / ci95 are the STATISTICAL quantities (no quadrature
+                          # with scenarios); std_systematic = largest single declared-scenario excursion
+                          std_systematic=worst_single, std_total=stat, ci95=ci_stat,
+                          rel_std=rel, statistically_resolved_in_this_model=bool(resolved),
+                          scenario_sensitive=bool(sensitive), identifiable=ok, reasons=reasons,
+                          failure_code=None if ok else ("SCENARIO_SENSITIVE" if resolved else "UNIDENTIFIABLE"))
     # scale-free combinations: a coasting / slowly pushed part can determine them when the absolute scale is not
     derived = {}
     iM = names.index("M") if "M" in names else (names.index("alpha") if "alpha" in names else None)
@@ -214,8 +238,16 @@ def diagnose_general(fit: dict, interactions, spec, *, perturb: dict | None = No
             C = np.nan_to_num(Cp)
             sd = float(math.sqrt(max(g @ C @ g, 0.0))) * infl
             rel = sd / abs(val) if val not in (0, math.inf) else math.inf
-            derived[lbl] = dict(estimate=val, std=sd, rel_std=rel, identifiable=bool(rel <= REL_STD_LIMIT),
-                                method="delta method on the rollout covariance (statistical only)")
+            dsc = {f: {k: float(g @ np.array([sh[n] for n in names])) for k, sh in d.items()} for f, d in fams.items()}
+            worst = max((max(abs(x2) for x2 in v.values()) for v in dsc.values()), default=0.0)
+            sens = worst / abs(val) if val not in (0, math.inf) else math.inf
+            derived[lbl] = dict(estimate=val, std=sd, rel_std=rel, std_label="STATISTICAL",
+                                statistically_resolved_in_this_model=bool(rel <= REL_STD_LIMIT),
+                                sensitivity_scenarios=dsc, scenario_worst_single_family=worst,
+                                scenario_sensitive=bool(sens > REL_STD_LIMIT),
+                                identifiable=bool(rel <= REL_STD_LIMIT and sens <= REL_STD_LIMIT),
+                                method="delta method on the rollout covariance (statistical) + linearised declared "
+                                       "scenarios (DECLARED_SCENARIO, not a std)")
     all_ok = all(v["identifiable"] for v in report.values())
     return dict(status="PASS" if all_ok else "FAIL", parameters=report, derived_combinations=derived, rank=rank,
                 n_columns=int(J.shape[1]),
@@ -224,8 +256,10 @@ def diagnose_general(fit: dict, interactions, spec, *, perturb: dict | None = No
                 correlation={f"{a}~{b}": (None if not np.isfinite(corr[i, k]) else float(corr[i, k]))
                              for i, a in enumerate(names) for k, b in enumerate(names) if k > i},
                 residual_lag1_autocorrelation=rho, std_inflation_autocorrelation=infl,
-                structural=struct, systematic_shifts=sysd, thresholds=dict(rel_std=REL_STD_LIMIT, corr=CORR_LIMIT),
-                note="local information + declared systematic sweeps; necessary, not sufficient, for accuracy")
+                structural=struct, systematic_shifts=sysd, scenario_families=sorted(fams),
+                thresholds=dict(rel_std=REL_STD_LIMIT, corr=CORR_LIMIT),
+                note="STATISTICAL CIs from the fit covariance / profile (autocorrelation-inflated); declared scenarios "
+                     "reported separately (linearised shifts), never added in quadrature; necessary, not sufficient")
 
 
 # ----------------------------------------------------------------------------------------------- perturbations
@@ -238,13 +272,27 @@ class _Eff:
         return self.levels[idx]
 
 
+def scenario_families(shifts: dict) -> dict:
+    """Group 'family|+' / 'family|-' scenario names (an unsuffixed name is its own one-sided family)."""
+    fams = {}
+    for k, v in shifts.items():
+        f, _, sgn = k.partition("|")
+        fams.setdefault(f, {})[sgn or "+"] = v
+    return fams
+
+
 def standard_perturbations(lag_s=None, scale_rel=None, bias=None) -> dict:
-    """Declared input-uncertainty perturbations on the generalized effort (adapter adds geometric ones)."""
+    """Declared SYMMETRIC input scenarios on the generalized effort: 'family|+' and 'family|-' (adapter adds the
+    geometric ones). These are sensitivity scenarios, not calibrated uncertainties."""
     out = {}
     if lag_s:
-        out[f"force_lag_{lag_s * 1e3:.0f}ms"] = lambda it: _Eff(it.effort.t_s + lag_s, it.effort.levels)
+        for s_, sg in ((lag_s, "+"), (-lag_s, "-")):
+            out[f"force_lag_{lag_s * 1e3:.0f}ms|{sg}"] = (lambda it, s_=s_: _Eff(it.effort.t_s + s_, it.effort.levels))
     if scale_rel:
-        out[f"force_scale_{scale_rel:+.0%}"] = lambda it: _Eff(it.effort.t_s, it.effort.levels * (1 + scale_rel))
+        for r_, sg in ((scale_rel, "+"), (-scale_rel, "-")):
+            out[f"force_scale_{scale_rel:.0%}_UNVALIDATED_STRESS_TEST|{sg}"] = (
+                lambda it, r_=r_: _Eff(it.effort.t_s, it.effort.levels * (1 + r_)))
     if bias:
-        out[f"force_bias_{bias:+.3g}"] = lambda it: _Eff(it.effort.t_s, it.effort.levels + bias)
+        for b_, sg in ((bias, "+"), (-bias, "-")):
+            out[f"force_bias_{bias:.3g}|{sg}"] = (lambda it, b_=b_: _Eff(it.effort.t_s, it.effort.levels + b_))
     return out

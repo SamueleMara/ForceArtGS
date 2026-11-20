@@ -64,6 +64,9 @@ class G9Inputs:
     synthetic: bool = False
     moving_gaussian_xyz: Optional[np.ndarray] = None     # canonical moving Gaussian means (mass-mesh alignment)
     extra_perturbations: dict = field(default_factory=dict)   # evidence-based input sweeps (adapter)
+    com_direction: Optional[np.ndarray] = None                 # hinge -> moving-support centroid (perp. to axis)
+    com_lever_m: Optional[float] = None
+    record_context: Optional[dict] = None                      # canonical record + q for the impulse / coast analysis
 
 
 def _sig(obj) -> str:
@@ -116,9 +119,14 @@ def run_g9(inp: G9Inputs, cfg: dict, out_dir, log=print) -> dict:
                  "resolved G9 dynamics configuration (all toggles)")
     # ------------------------------------------------------------------ kinematics
     kin_ok = inp.kinematic_status == "IDENTIFIED"
+    kin_declared = inp.kinematic_status == "OPERATOR_DECLARED"     # conditional use only, never certified
     R["KINEMATICS_ACCEPTED"] = kin_ok
     diagnostic_kin = not kin_ok
-    if not kin_ok:
+    if kin_declared:
+        blocked.append("NOT_CERTIFIED_OPERATOR_DECLARED_KINEMATICS: joint type declared by the operator "
+                       f"({inp.kinematics_provenance.get('declaration_note')}); upstream status "
+                       f"{inp.kinematics_provenance.get('selection_status')}")
+    elif not kin_ok:
         blocked.append(f"BLOCKED_KINEMATICS: upstream status {inp.kinematic_status} (diagnostic only)")
         if not cfg["pipeline"]["allow_diagnostic_kinematics"]:
             notes.append("dynamics not fitted: allow_diagnostic_kinematics is false")
@@ -142,11 +150,12 @@ def run_g9(inp: G9Inputs, cfg: dict, out_dir, log=print) -> dict:
                        f"{'; '.join(fa.get('failing', [])[:9]) or fa.get('reason', '')}")
         diag_force = cfg["pipeline"]["on_missing_calibration"] == "diagnostic_only" and bool(inp.train)
     can_fit = bool(inp.train) and (force_ok or exploratory or diag_force) and (
-        kin_ok or cfg["pipeline"]["allow_diagnostic_kinematics"])
+        kin_ok or kin_declared or cfg["pipeline"]["allow_diagnostic_kinematics"])
     physical_claim = force_ok and kin_ok and not inp.force_audit.get("diagnostic")
     if exploratory:
         label = ("EXPLORATORY_CONDITIONAL: estimates conditional on the listed calibration assumptions"
-                 + ("" if kin_ok else f"; KINEMATICS_NOT_ACCEPTED ({inp.kinematic_status}, working model)"))
+                 + ("" if kin_ok else "; OPERATOR_DECLARED_KINEMATICS" if kin_declared else
+                    f"; KINEMATICS_NOT_ACCEPTED ({inp.kinematic_status}, working model)"))
     else:
         label = ("PHYSICAL" if physical_claim else
                  "NOT_PHYSICAL: " + ", ".join(x.split(":")[0] for x in blocked[:3]))
@@ -171,7 +180,7 @@ def run_g9(inp: G9Inputs, cfg: dict, out_dir, log=print) -> dict:
     # ------------------------------------------------------------------ model spec / gravity gate
     spec, fit, ls, ident, adeq, held, variants, baselines, conv = (None,) * 9
     try:
-        spec = ModelSpec(terms, inp.joint_type, src, mm, inp.gravity)
+        spec = ModelSpec(terms, inp.joint_type, src, mm, inp.gravity, **_js_kw(inp, exploratory))
     except GravityRegistrationError as e:
         blocked.append(f"BLOCKED_GRAVITY_REGISTRATION: {e}")
         can_fit = False
@@ -212,7 +221,7 @@ def run_g9(inp: G9Inputs, cfg: dict, out_dir, log=print) -> dict:
                 for name, tdict in var.items():
                     try:
                         vt = GeneralTerms(**tdict)
-                        vs = ModelSpec(vt, inp.joint_type, src, mm, inp.gravity)
+                        vs = ModelSpec(vt, inp.joint_type, src, mm, inp.gravity, **_js_kw(inp, exploratory))
                         vls = general_integral_ls(inp.train, vs)
                         vf = general_rollout_fit(inp.train, vs, theta0_from_ls(vls, vs, dict(effort=eff)),
                                                  n_starts=2, seed=0)
@@ -230,6 +239,27 @@ def run_g9(inp: G9Inputs, cfg: dict, out_dir, log=print) -> dict:
                 _write(est_dir / "frozen_viscous_baselines.json", dict(**baselines, label=label))
     elif not can_fit:
         _write(est_dir / "general_rollout_fit.json", dict(status="NOT_RUN", blocked=blocked, label=label))
+    if inp.record_context is not None:
+        from .validation.impulse_coast import analyze as _ic, plot as _icplot
+        rc = inp.record_context
+        ics = []
+        for it in (inp.train or inp.excitation_only):
+            w = it.meta.get("source_rows")
+            if not w:
+                continue
+            try:
+                an = _ic(rc["rec"], rc["joint_type"], rc["axis"], rc["origin"], rc["q_src"], rc["q"], rc["q_std"], w,
+                         observability=rc.get("observability"))
+                _icplot(an, out / f"impulse_coast_{it.name}.png")
+                an.pop("_plot", None)
+                an["interaction"] = it.name
+                ics.append(an)
+            except (ValueError, np.linalg.LinAlgError) as e:
+                ics.append(dict(interaction=it.name, verdict="ANALYSIS_FAILED", error=str(e)))
+        _write(out / "impulse_coast_analysis.json", dict(
+            schema="forceartgs.g9.impulse_coast/v1", windows=ics,
+            note="pulse and coast evaluated separately on native 50 Hz force rows; verdicts "
+                 "IMPULSE_INFORMATIVE / IMPULSE_UNRESOLVED / IMPULSE_NOT_INFORMATIVE"))
     _write(out / "general_identifiability.json", dict(fit_identifiability=ident, structural_from_data=struct,
                                                       step_convergence=conv, label=label) if ident or struct else
            dict(status="NOT_RUN", blocked=blocked))
@@ -243,6 +273,14 @@ def run_g9(inp: G9Inputs, cfg: dict, out_dir, log=print) -> dict:
     table = X.parameter_table(terms, inp.joint_type, fit if R["DYNAMICS_DIAGNOSTIC"] else
                               dict(blocked_reason="; ".join(blocked)), ident, spec, physical_claim=physical_claim,
                               label=label, exploratory=exploratory)
+    if (R["DYNAMICS_DIAGNOSTIC"] and cfg["fitting"].get("load_model_comparison") and
+            spec is not None and spec.parameter_source == "joint_space_only"):
+        from .validation.load_models import load_model_comparison
+        try:
+            lm = load_model_comparison(inp.train, terms, inp.joint_type)
+        except Exception as e:
+            lm = dict(status="FAILED", error=f"{type(e).__name__}: {e}")
+        _write(out / "load_model_comparison.json", dict(lm, label=label))
     params_ok = bool(R["DYNAMICS_DIAGNOSTIC"] and fit.get("converged") and ident and ident["status"] == "PASS"
                      and physical_claim and all(X.term_ok(table, t) for t in table))
     R["PARAMETERS_IDENTIFIED"] = params_ok
@@ -251,6 +289,7 @@ def run_g9(inp: G9Inputs, cfg: dict, out_dir, log=print) -> dict:
         blocked.append(f"BLOCKED_UNIDENTIFIABLE: enabled term(s) {bad} not identified (simpler model only by explicit "
                        f"user choice)" if bad else "BLOCKED_PARAMETERS: identifiability gate FAIL")
     held_ok = bool(held and held["status"] == "PASS")
+    verdicts(table, ident, adeq, kin_ok or kin_declared, force_ok and kin_ok, held_ok, struct)
     R["MODEL_VALIDATED"] = bool(params_ok and adeq and adeq["status"] == "PASS" and
                                 (held_ok or not cfg["export"]["production_requires_heldout_real_prediction"]))
     if params_ok and not R["MODEL_VALIDATED"]:
@@ -359,6 +398,46 @@ def run_g9(inp: G9Inputs, cfg: dict, out_dir, log=print) -> dict:
     return dict(manifest=man, fit=fit, ident=ident, recon=recon, table=table, spec=spec, held=held, adeq=adeq,
                 term_matrix=tm, physics_spec_v1=spec_v1 if production else None, out_dir=str(out),
                 baselines=baselines, variants=variants, ls=ls)
+
+
+def verdicts(table, ident, adeq, kin_ok, force_ok, held_ok, struct):
+    """physically_interpretable_validated needs: statistically resolved in this model, not scenario-sensitive,
+    adequate fit, sufficient excitation (no structural flag on it), an ACCEPTED joint, verified force and a passed
+    held-out validation. conditionally_interpretable drops the last two (exploratory meaning only)."""
+    unexcited = {p for p, _ in (struct or {}).get("unidentifiable", [])}
+    adeq_ok = bool(adeq and adeq.get("status") == "PASS")
+    for t, e in table.items():
+        for n, v in (e.get("parameters") or {}).items():
+            if v.get("fitted_or_fixed") != "fitted":
+                continue
+            base = bool(v.get("parameter_statistically_resolved_in_this_model") and not v.get("scenario_sensitive")
+                        and adeq_ok and kin_ok and n not in unexcited)
+            v["conditionally_interpretable"] = base
+            v["physically_interpretable_validated"] = bool(base and force_ok and held_ok)
+            why = []
+            if not v.get("parameter_statistically_resolved_in_this_model"):
+                why.append("not statistically resolved in this model")
+            if v.get("scenario_sensitive"):
+                why.append("sensitive to declared scenarios")
+            if not adeq_ok:
+                why.append(f"model adequacy {None if adeq is None else adeq.get('status')}")
+            if not kin_ok:
+                why.append("joint type not accepted (working model)")
+            if n in unexcited:
+                why.append("insufficient excitation")
+            if not force_ok:
+                why.append("force calibration not certified")
+            if not held_ok:
+                why.append("no passed independent held-out validation")
+            v["interpretation_blockers"] = why
+
+
+def _js_kw(inp, exploratory):
+    """Joint geometry for joint_space_gravity_coupled; DECLARED gravity only under the exploratory policy."""
+    g = inp.gravity
+    declared = bool(g is not None and not g.verified and str(g.provenance).startswith("DECLARED"))
+    return dict(joint_axis=inp.axis, joint_origin=inp.origin, com_direction=inp.com_direction,
+                com_lever_m=inp.com_lever_m, allow_unverified_gravity=bool(exploratory and declared))
 
 
 def exploratory_pre(fa):

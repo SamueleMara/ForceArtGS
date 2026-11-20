@@ -220,10 +220,8 @@ class WrenchCalibration:
         """Contact force by the robot on the object in world axes, plus the raw channel."""
         if self.R_EE_S.value is None:
             raise ValueError("R_EE_S unknown: refusing to rotate forces")
-        q = self.recorded_quantity.value
-        if q not in ("object_on_robot", "robot_on_object"):
-            raise ValueError("recorded quantity unknown: refusing to guess the force sign")
-        sign = -1.0 if q == "object_on_robot" else 1.0
+        from .force_convention import sign_from_recorded_quantity        # the one shared sign contract
+        sign = sign_from_recorded_quantity(self.recorded_quantity.value)
         F = np.asarray(F_rec_S, float)
         Fc = F - self.bias_S(R_B_EE)
         Rs = np.asarray(self.R_EE_S.value, float)

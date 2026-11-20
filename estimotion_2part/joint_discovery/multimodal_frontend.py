@@ -111,7 +111,12 @@ def heldout_nll(cands, noise, test_obs, calibs, track_set, use_depth=True) -> di
 
 class Frontend:
     def __init__(self, obs, calibs, cfg, out_dir, *, scene=None, images=None, rec=None, segments_source=None,
-                 wrench_calibration=None, legacy=None, source_files=None, log=print):
+                 wrench_calibration=None, legacy=None, source_files=None, log=print, robot_record=None,
+                 force_policy="certified"):
+        from .frontend_robot_record import POLICIES
+        if force_policy not in POLICIES:
+            raise ValueError(f"force_policy {force_policy!r} not in {POLICIES}")
+        self.robot_record, self.force_policy, self.force_conditional = robot_record, force_policy, False
         self.obs, self.calibs, self.cfg, self.scene = obs, calibs, cfg, scene
         self.mf = cfg.multimodal_frontend
         self.out = Path(out_dir)
@@ -166,6 +171,24 @@ class Frontend:
             if self.fgate["status"] == "PASS":
                 self.f_obj = self.cal.force_on_object_world(r.wrench_sensor[:, :3], r.R_WS)["f_object_w"]
         (out / "robot").mkdir(exist_ok=True)
+        self.record_alignment = None
+        if self.robot_record is not None:
+            # the canonical robot record (shared with G9): exact row join, same TCP rows, force converted once
+            from .frontend_robot_record import align_record_to_frame_map
+            al = align_record_to_frame_map(self.robot_record, self.obs.frame_map,
+                                           p_tcp_w=r.p_tcp_w if self.robot_ok else None,
+                                           T_WB=r.T_WB if self.robot_ok else None)
+            self.record_alignment = al
+            write_json(out / "robot" / "canonical_record_alignment.json",
+                       {k: v for k, v in al.items() if k not in ("f_object_w", "p_tcp_w", "contact_state",
+                                                                 "in_contact_segment", "recorded_timestamp_s")}
+                       | dict(force_policy=self.force_policy))
+            if self.force_policy == "exploratory" and self.robot_ok and self.mf.force.enabled and self.f_obj is None:
+                self.f_obj = al["f_object_w"]
+                self.force_conditional = True
+                self.fgate = dict(self.fgate, status="EXPLORATORY_CONDITIONAL", certified_gate=self.fgate.get("status"),
+                                  reason="canonical-record force used as CONDITIONAL evidence (declared sign / axes / "
+                                         "TCP); outputs are DIAGNOSTIC, never physics-export ready")
         write_json(out / "robot" / "force_calibration_gates.json", self.fgate)
         if self.robot_ok:
             np.savez(out / "robot" / "tcp_trajectory_world.npz", p_tcp_w=r.p_tcp_w, v_tcp_w=r.v_tcp_w,
@@ -177,6 +200,9 @@ class Frontend:
                   calibration={c: self.calibs[c].calib_sha for c in self.obs.camera_ids},
                   tool=None if self.tool is None else self.tool.to_json(),
                   wrench_calibration=None if self.cal is None else _sha(self.cal.to_json()))
+        if self.robot_record is not None:
+            fp["canonical_robot_record"] = self.record_alignment["fingerprint"]
+            fp["force_policy"] = self.force_policy
         write_json(out / "source_fingerprints.json", fp)
         self.fingerprints = fp
 
@@ -440,6 +466,19 @@ class Frontend:
         acc.mkdir(parents=True, exist_ok=True)
         rob = self._robot_evidence(st)
         write_json(acc / "force_candidate_comparison.json", rob["force"])
+        if self.force_conditional:
+            # conditional force never decides the physical selection: the selector sees ABSTAIN, the conditional
+            # candidate comparison is kept as a diagnostic next to it
+            write_json(acc / "exploratory_force_diagnostics.json", dict(rob["force"], policy="exploratory",
+                                                                         label="DIAGNOSTIC_CONDITIONAL"))
+            rob = dict(rob, force=dict(status="ABSTAIN", reason="exploratory force is diagnostic only",
+                                       used_in_fit=rob["force"].get("used_in_fit")))
+        write_json(acc / "force_usage.json", dict(
+            force_policy=self.force_policy, conditional=self.force_conditional,
+            canonical_robot_record=None if self.record_alignment is None else self.record_alignment["fingerprint"],
+            force_rows_in_fit=st["fitinfo"]["hook"].get("n_force_rows") if st.get("fitinfo") else None,
+            contact_rows_in_fit=st["fitinfo"]["hook"].get("n_contact_rows") if st.get("fitinfo") else None,
+            dense_masks="updated at the final controller stage only (not inside the frontend loop)"))
         robot_tool = None
         if self.robot_ok:
             robot_tool = dict(p_tcp_w=self.rec.p_tcp_w, p_ee_w=self.rec.p_ee_w, tool=self.tool)
@@ -449,6 +488,16 @@ class Frontend:
                                robot=robot_tool, legacy=self.legacy, source_files=self.fingerprints, log=self.log,
                                support_override=st["support"], robot_evidence_override=rob)
         import shutil
+        if self.force_conditional:
+            p_sel = acc / "selection" / "joint_selection_v2.json"
+            js = json.loads(p_sel.read_text())
+            js["physics_joint_export_ready"] = False
+            js["failure_codes"] = sorted(set(js.get("failure_codes", [])) | {"EXPLORATORY_FORCE_DIAGNOSTIC"})
+            js["force_policy"] = "exploratory"
+            js["diagnostic"] = True
+            write_json(p_sel, js)
+            sel = dict(sel, physics_joint_export_ready=False, failure_codes=js["failure_codes"],
+                       force_policy="exploratory", diagnostic=True)
         shutil.copy2(acc / "selection" / "joint_selection_v2.json", acc / "joint_selection_v2.json")
         # all-frame refit for the authority (selection already made on held-out blocks)
         full = self._concat(st["obs_tr"], self.test_obs)

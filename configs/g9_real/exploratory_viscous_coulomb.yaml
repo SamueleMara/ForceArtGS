@@ -9,10 +9,14 @@ model:
   terms: {inertia: true, viscous: true, coulomb: true, static: false, gravity: false, bias: false}
   parameter_source: joint_space_only          # gravity = effective basis A cos q + B sin q (never a mass / COM)
 fitting:
+  load_model_comparison: true           # A base / B +bias / C +effective load / D both (diagnostic table)
   compare_frozen_viscous_baselines: [IntegralLS, Backprop]
   n_starts: 4
 identifiability:
-  force_lag_sweep_s: 0.01                     # exact row join: residual offset bounded by half a 50 Hz row
-  force_scale_sweep_rel: 0.05                 # sensor scale factor: no calibration evidence (declared 5 %)
-  contact_point_sweep_m: 0.015                # TCP / registration: 1-2 cm accepted by the operator
-  use_second_window_tare_sweep: true
+  # DECLARED SENSITIVITY SCENARIOS (symmetric +/-, linearised): reported per family, never added in quadrature and
+  # never called a standard deviation. Only a CALIBRATED uncertainty (none exists yet) would enter as one.
+  force_lag_sweep_s: 0.01                     # sub-row hardware offset scenario (rows are joined exactly)
+  force_scale_sweep_rel: 0.05                 # UNVALIDATED stress test (no sensor-scale calibration); null disables
+  contact_point_sweep_m: 0.015                # TCP / tool: lever, tangent and axial excursions (revolute only)
+  use_second_window_tare_sweep: true          # threshold-conditioned post-contact residual as a bias scenario
+  # hinge axis tilt / hinge-line offset scenarios come from joint_selection_v2.uncertainty (upstream statistical)
