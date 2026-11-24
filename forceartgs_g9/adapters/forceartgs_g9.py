@@ -165,7 +165,7 @@ def force_audit(scene, authority, robot_archive, contact_segments, use_torque=Fa
                 policy="declarations (sensor axes, sign, TCP, operator contact labels) are provenance, not proof")
 
 
-def contact_efforts(authority, robot_archive, segments, multiplier=-1.0) -> list:
+def contact_efforts(authority, robot_archive, segments, *, multiplier) -> list:
     """Per contact segment: generalized effort Q(t) at 50 Hz and q(t) at the authority times (DIAGNOSTIC unless
     every force gate passed). Q = a.F (P) or a.((p - o) x F) (R), F = multiplier * R_WS F_sensor on the object."""
     from forceartgs_physics.forces.projection import generalized_effort
@@ -337,6 +337,7 @@ def record_interactions(rec, authority, cfg, meta) -> list:
                     tq = it.t_obs[qd > 0.5 * qd.max()] if qd.max() > 0 else it.t_obs
                     mv = (src[start:z] / 50.0 >= tq.min()) & (src[start:z] / 50.0 <= tq.max())
                     Qm = Q[start:z][mv] if mv.any() else Q[start:z]
+                    it.meta["effort_sigma"] = noise_eq
                     it.meta["effort_snr"] = dict(
                         rms_effort_while_moving=float(np.sqrt(np.mean(Qm ** 2))), noise_equivalent_effort=noise_eq,
                         snr=float(np.sqrt(np.mean(Qm ** 2)) / noise_eq) if noise_eq > 0 else None,
@@ -464,7 +465,9 @@ def build_inputs(run_root, scene, cfg, *, robot_archive=None, contact_segments=N
         if robot_archive and not (fx / "contact_annotations.csv").is_file():
             fa["note"] = f"no force export at {fx}: raw archive audit only (no canonical record)"
     if rec is None and fa.get("segments") and robot_archive:
-        its = contact_efforts(auth, robot_archive, fa["segments"])
+        from estimotion_2part.joint_discovery.force_convention import load_scene_convention
+        sign, _ = load_scene_convention(Path(scene) / "metadata")   # explicit metadata sign; raises if absent
+        its = contact_efforts(auth, robot_archive, fa["segments"], multiplier=sign)
         for it in its:
             it.meta.update(frontend_force_used=bool(kin["multimodal"]["force_evidence_used"]),
                            frontend_contact_used=bool(kin["multimodal"]["contact_evidence_used"]))
@@ -489,6 +492,24 @@ def build_inputs(run_root, scene, cfg, *, robot_archive=None, contact_segments=N
         grav = GravityField(tuple(gcfg["vector_world_mps2"]), verified, prov, "base_link")
     mesh_p = resolve_path(cfg, cfg["mass_model"]["mesh"])
     mesh = TriMesh.read_obj(mesh_p, cfg["mass_model"]["mesh_units"]) if mesh_p is not None else None
+    proxy, ref_pose = None, None
+    if mesh_p is not None and cfg["mass_model"].get("reference_q") is not None:
+        ref_pose = dict(status="DECLARED", q_ref=float(cfg["mass_model"]["reference_q"]),
+                        q_ref_source=f"mass_model.reference_q (declared with the mesh {mesh_p})")
+    if mesh is None and cfg["mass_model"].get("tentative_proxy") and kin["visual_handoff"]:
+        from ..dynamics.geometry_proxy import build_proxy
+        from ..validation.gravity_geometry_audit import ReferencePoseError, reference_pose_alignment
+        try:
+            ref_pose = reference_pose_alignment(kin["visual_handoff"], auth, Path(scene) / "metadata")
+        except (ReferencePoseError, KeyError) as e:
+            ref_pose = dict(status="FAIL", reasons=[f"{type(e).__name__}: {e}"], q_ref=None)
+        if ref_pose["status"] == "PASS":
+            proxy = build_proxy(kin["visual_handoff"], cfg["mass_model"]["tentative_proxy"])
+            proxy["provenance"]["q_ref"] = ref_pose["q_ref"]
+            mesh = proxy["mesh"]
+            cfg["mass_model"]["mode"] = proxy["mode"]               # solid_hull -> uniform_solid, shell -> shell
+        else:
+            log(f"[g9] tentative proxy refused: reference pose not verified ({ref_pose.get('reasons')})")
     mech = None
     mp = resolve_path(cfg, cfg["export"]["mechanical_spec"])
     if mp is not None:
@@ -513,12 +534,14 @@ def build_inputs(run_root, scene, cfg, *, robot_archive=None, contact_segments=N
                                                branch=kin["kind"], diagnostic=kin["diagnostic"],
                                                declaration_note=kin.get("declaration_note")),
                     train=train, heldout=[], force_audit=fa, gravity=grav, mass_mesh=mesh,
-                    mass_mesh_provenance=dict(source=str(mesh_p)) if mesh_p else None,
+                    mass_mesh_provenance=(dict(source=str(mesh_p)) if mesh_p else
+                                          (proxy["provenance"] if proxy else None)),
+                    moving_gaussian_xyz=None if proxy is None else proxy["points"],
                     axis_std_rad=float(np.deg2rad(obs.get("axis_sigma_deg") or 0.0)),
                     origin_std_m=float(obs.get("hinge_line_sigma_m") or 0.0),
                     anchor_frame=int(auth.rgbd_frame_index[auth.reference_time_index]),
                     visual_handoff=kin["visual_handoff"], mechanical_spec=mech, excitation_only=excit,
-                    input_hashes=hashes, extra_perturbations=extra_pert,
+                    input_hashes=hashes, extra_perturbations=extra_pert, reference_pose=ref_pose,
                     com_direction=_com_dir(auth, kin.get("support_centroid"))[0],
                     com_lever_m=_com_dir(auth, kin.get("support_centroid"))[1],
                     record_context=None if rec is None else dict(

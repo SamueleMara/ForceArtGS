@@ -3,7 +3,7 @@ visual handoff without any 3DGS training).
 
 Run directory: ``<forceartgs_run>/dynamics/g9/vNNN`` (same scene and branch). A version is reused only when its
 input signature (authority id, joint_states hash, robot archive, contact segments, mesh, config, physics library
-revision) is identical; any change writes the next version -- results are never silently overwritten.
+revision, G9 code fingerprint) is identical; any change writes the next version -- results are never silently overwritten.
 """
 from __future__ import annotations
 
@@ -42,12 +42,14 @@ def apply_force_calibration(fa: dict, calibration_file) -> dict:
 def run_dynamics_stage(run_root, scene, dynamics_config, *, physics_library=None, robot_archive=None,
                        contact_segments=None, force_calibration=None, mass_model_spec=None, episodes=None,
                        force_export=None, allow_diagnostic_kinematics=False, declared_joint_type=None,
-                       declaration_note=None, log=print) -> dict:
+                       declaration_note=None, declared_pulse_rows=None, log=print) -> dict:
     from .adapters.forceartgs_g9 import build_inputs
     prov = physics_lib.load(physics_library)
     cfg = load_dynamics_config(dynamics_config)
     if allow_diagnostic_kinematics:
         cfg["pipeline"]["allow_diagnostic_kinematics"] = True
+    if declared_pulse_rows:
+        cfg["identifiability"]["declared_pulse_rows"] = [list(map(int, w)) for w in declared_pulse_rows]
     if mass_model_spec:
         import yaml
         mm = yaml.safe_load(Path(mass_model_spec).read_text()) or {}

@@ -1,0 +1,18 @@
+# ForceTwin-adaptation: identifiability-first EFFECTIVE joint dynamics (I_eff, mu, b) on existing real runs.
+# Exploratory calibration (declared sign / axes / tare / vertical); never production-exported. The tentative hull
+# proxy is built only for the KNOWN-GRAVITY hypothesis and the conditional mass allocation -- never to force the
+# estimated inertia scale (the primary model is joint_space_only, independent of hull density).
+schema: forceartgs.dynamics_config/v1
+pipeline:
+  force_policy: exploratory
+  allow_diagnostic_kinematics: true
+model:
+  terms: {inertia: true, viscous: true, coulomb: true, static: false, gravity: false, bias: false}
+  parameter_source: joint_space_only
+  gravity: {source: verified_world_gravity, vector_world_mps2: [0.0, 0.0, -9.81], calibration_file: gravity_base_link_declared.json}
+mass_model:
+  mode: uniform_solid
+  tentative_proxy: solid_hull
+  reflected_actuator_inertia: none_passive_mechanism   # ASSUMPTION (passive object)
+fitting:
+  methods: [general_integral_ls, general_rollout_fit]

@@ -1,0 +1,31 @@
+# G10 PhysX refinement (estimator side, ForceArtGS). Diagnostic only: SAPIEN 3 PhysX CPU with an EXPLICIT friction
+# surrogate (not native PhysX joint friction, no stiction). Append-only <run>/dynamics/g9/physx_refinement/vNNN.
+free_forced_config: configs/g9_real/free_forced.yaml   # SAME segment classifier options + dynamics_config as G9
+mass_mode: uniform_solid          # G9 hull geometry for the URDF (reference density = geometric mean of the size prior)
+v0_prefix_samples: 4              # initial state: weighted quadratic on the first k q samples (same trajectory)
+min_samples: 4                    # q samples left for the rollout after the prefix
+heldout: last_if_multiple         # the latest admissible episode is held out (frozen theta) when there are >= 2
+physics:
+  engine: sapien_cpu_diagnostic
+  timestep: 0.001
+  friction_mode: external_effort_surrogate   # or frictionless_physx (then every friction bound must be 0)
+  python: null                    # SAPIEN interpreter; null -> this one if it has sapien, else $PARTTWIN1D_PYTHON / parttwin_sim
+loss:
+  huber_delta: 2.0
+  numeric_floor_q: 0.0003        # sigma_num: PhysX float32 q accumulation (~3e-4 relative over 3000 steps, measured)
+fitting:
+  rho_bounds: [0.1, 10.0]         # relative to the prior reference density (forced data only; free-only holds 1)
+  lam_max: 20.0                   # c / I_hi upper bound          [1/s]
+  gam_max: 20.0                   # Td / I_hi upper bound          [rad/s^2 | m/s^2]
+  effort_bound_factor: 3.0        # Td upper bound >= factor * max |Q| on the episodes
+  armature: 0.0                   # held fixed (no physical justification for reflected inertia on these objects)
+  seed: 0
+  maxiter: 30
+  popsize: 8
+  polish: true
+  tol: 0.001
+profile:                          # rho_s profile (forced data only); friction re-optimised at each grid point
+  n: 9
+  inner_maxiter: 15
+  inner_popsize: 6
+  inner_polish: true              # warm-started from the nearest finished point, then L-BFGS-B polish

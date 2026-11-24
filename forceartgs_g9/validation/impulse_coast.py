@@ -114,8 +114,10 @@ def fit_coast(t, q, s):
 
 
 def analyze(rec, joint_type, axis, origin, q_src, q, q_std, window, *, observability=None, k_primary=6.0,
-            lags=(0.01, 0.02), cam_gap_frames=1, pre_window_s=0.3, post_window_s=0.3) -> dict:
-    """One interaction window [lo, hi] (source rows)."""
+            lags=(0.01, 0.02), cam_gap_frames=1, pre_window_s=0.3, post_window_s=0.3,
+            declared_pulse_rows=None) -> dict:
+    """One interaction window [lo, hi] (source rows). declared_pulse_rows: optional [[a, b], ...] source-row ranges
+    reported IN ADDITION to the threshold-detected pulses (never replacing them)."""
     src = np.asarray(rec["source_frame_index"], int)
     lo, hi = window
     m = (src >= lo) & (src <= hi)
@@ -351,6 +353,50 @@ def analyze(rec, joint_type, axis, origin, q_src, q, q_std, window, *, observabi
         if coast is not None and coast_rep is None:
             coast_rep = coast
     out["coast"] = coast_rep
+    out["declared_pulses"] = []
+    for a0, b0 in (declared_pulse_rows or []):
+        loc = np.flatnonzero((src[rows] >= a0) & (src[rows] <= b0))
+        if not len(loc):
+            out["declared_pulses"].append(dict(rows=[int(a0), int(b0)], status="ROWS_OUTSIDE_WINDOW"))
+            continue
+        i0, i1 = int(loc[0]), int(loc[-1])
+        ps = pulse_stats(i0, i1)
+        others_ = [pulse_stats(x0, x1) for x0, x1 in pulses if x1 < i0 or x0 > i1]
+        prev_end = max([x["t_end"] for x in others_ if x["t_end"] <= ps["t_start"] and x["J_over_sigma"] >= 2],
+                       default=-np.inf)
+        next_start = min([x["t_start"] for x in others_ if x["t_start"] >= ps["t_end"] and x["J_over_sigma"] >= 2],
+                         default=np.inf)
+        vel, why = velocities(ps["t_start"], ps["t_end"], t_prev=prev_end, t_next=next_start)
+        lag_scan = {}
+        for lag in (0.01, 0.02, 0.04):
+            for sg in (1, -1):
+                v2, _ = velocities(ps["t_start"], ps["t_end"], shift=sg * lag, t_prev=prev_end, t_next=next_start)
+                lag_scan[f"{sg * lag * 1e3:+.0f}ms"] = None if v2 is None else dict(dv=v2["dv"], dv_sd=v2["dv_sd"])
+        d = dict(rows=[int(a0), int(b0)], pulse=ps, velocity=vel, velocity_unavailable=why,
+                 camera_force_lag_scan=dict(dv_by_q_shift=lag_scan, label="DECLARED_SCENARIO (q clock shifted)"),
+                 label="DECLARED ROW RANGE (operator-specified window; threshold detection reported separately)")
+        if vel is not None and vel["dv"]:
+            d["J_over_dqdot_CONDITIONAL_M"] = dict(
+                estimate=ps["J_Q"] / vel["dv"],
+                sd=abs(ps["J_Q"] / vel["dv"]) * math.hypot(ps["sigma_J_Q"] / abs(ps["J_Q"]) if ps["J_Q"] else math.inf,
+                                                         vel["dv_sd"] / abs(vel["dv"])),
+                dqdot_over_sigma=float(abs(vel["dv"]) / vel["dv_sd"]) if vel["dv_sd"] > 0 else math.inf,
+                sign_contradiction=bool(np.sign(ps["J_Q"]) != np.sign(vel["dv"])),
+                assumptions=["no dissipation / configuration load over the pulse", "accepted axis / hinge"])
+        obs = observability or {}
+        if obs.get("axis_sigma_deg"):
+            u = np.cross(a, [1.0, 0, 0] if abs(a[0]) < 0.9 else [0, 1.0, 0])
+            u /= np.linalg.norm(u)
+            th = math.tan(math.radians(obs["axis_sigma_deg"]))
+            d["axis_tilt_sensitivity"] = {}
+            for k_ in (1, 2):
+                for sg in (1, -1):
+                    psx = pulse_stats(i0, i1, effort_rows(rec, joint_type, a + sg * k_ * th * u, origin, rows))
+                    d["axis_tilt_sensitivity"][f"{'+' if sg > 0 else '-'}{k_}sigma"] = dict(
+                        tilt_deg=float(sg * k_ * obs["axis_sigma_deg"]), J_Q=psx["J_Q"],
+                        rel_change=float((psx["J_Q"] - ps["J_Q"]) / ps["J_Q"]) if ps["J_Q"] else None,
+                        label="DECLARED_SCENARIO")
+        out["declared_pulses"].append(d)
     out["joint_pulse_coast_fit"] = ("the standard G9 general_rollout_fit of this window (estimator_results/"
                                     "general_rollout_fit.json) uses the same native ZOH effort for pulse and coast "
                                     "with shared parameters")

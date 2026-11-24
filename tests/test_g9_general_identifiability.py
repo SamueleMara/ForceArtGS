@@ -202,7 +202,7 @@ class GateC(unittest.TestCase):
             fa = force_audit(td, auth, arc, seg)
             self.assertEqual(fa["status"], "FORCE_CALIBRATION_UNVERIFIED")
             self.assertEqual(fa["rejections"]["unknown_contact_excluded"], n - 61)
-            its = contact_efforts(auth, arc, fa["segments"])
+            its = contact_efforts(auth, arc, fa["segments"], multiplier=-1.0)     # explicit (test declares it)
             self.assertEqual(len(its), 1)
             self.assertGreaterEqual(its[0].t_obs.min(), 140 / 50.0)
             self.assertLessEqual(its[0].t_obs.max(), 200 / 50.0)

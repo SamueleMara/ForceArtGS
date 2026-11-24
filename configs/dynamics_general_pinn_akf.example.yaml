@@ -1,0 +1,38 @@
+# ForceArtGS G9: the four general estimators side by side on ONE shared ModelSpec (same q, Q, enabled terms, parameter
+# vector, priors and held-out episodes). In geometry_coupled mode a single density rho drives BOTH inertia and gravity:
+#   M = rho * I_axis,1 + I_reflected      G(q) = -rho * m1 * g . (a x R(q) r_perp)       (no separate M, mu, gA, gB)
+schema: forceartgs.dynamics_config/v1
+pipeline:
+  force_policy: certified                   # certified | exploratory (exploratory: every DECLARED quantity is an assumption)
+model:
+  terms: {inertia: true, viscous: true, coulomb: true, static: true, gravity: true, bias: false}
+  parameter_source: geometry_coupled        # geometry_coupled | joint_space_only | joint_space_gravity_coupled (diagnostic)
+  gravity: {source: verified_world_gravity, vector_world_mps2: [0.0, 0.0, -9.81], calibration_file: null}
+mass_model:
+  mode: uniform_shell
+  mesh: null                                # validated watertight moving-part mesh at q = 0 (frame W)
+  tentative_proxy: null                     # solid_hull | shell_hull: TENTATIVE_GEOMETRIC_PREVIEW when mesh is null
+  reflected_actuator_inertia: null          # number, or none_passive_mechanism (an ASSUMPTION, recorded as such)
+fitting:
+  methods: [general_integral_ls, general_rollout_fit, general_pinn, general_akf]
+  holdout_mode: independent_episodes
+  pinn:                                     # GeneralPINN: autograd q, qd, qdd; strong + weak + impulse + stick losses
+    hidden: 32
+    layers: 3
+    n_seeds: 3                              # seed ensemble (spread reported as ENSEMBLE, not a confidence interval)
+    steps_data: 3000                        # data warm-up
+    steps_joint: 4000                       # joint phase, physics weight ramped over phys_ramp_fraction
+    lr_net: 3.0e-3
+    lr_theta: 1.0e-2
+    n_colloc: 300
+    force_change_fraction: 0.4              # share of collocation points near force changes (never on ZOH knots)
+    weak_window_obs: 3
+    impulse_max_duration_s: 0.25
+    breakaway_guard_s: 0.2
+  ekf:                                      # GeneralAugmentedEKF: x = [q, v, eta], Joseph update, hybrid stick / slip
+    eta_prior_sd_log: 1.0                   # prior sd of log-parameters around the integral-LS initializer
+    q_process_sd: 1.0e-6
+    accel_noise_floor: 0.02
+    max_step: 2.0e-3
+    reverse_order_check: true               # posterior must not depend on episode order
+

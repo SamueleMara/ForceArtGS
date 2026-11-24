@@ -173,6 +173,13 @@ class ModelSpec:
                                   amplitude=math.hypot(A, B), physical_gravity=True,
                                   gravity_status="DECLARED (operator: dataset z is the true vertical)",
                                   mu_kg_m=v.get("mu"),
+                                  flags=(["GRAVITY_MASS_NOT_COUPLED"] if self.joint_type == "revolute" else []),
+                                  interpretation=("ABLATION ONLY: independent M and mu (no shared mass distribution); "
+                                                  "physical_gravity=True means a declared-vertical gravity law, NOT a "
+                                                  "reconstructed mass / COM; the support centroid is not a verified "
+                                                  "COM" if self.joint_type == "revolute" else
+                                                  "prismatic: G uses the effective mass M (valid only with zero "
+                                                  "reflected mass)"),
                                   coupling=("G_P = -M g.a (single rigid body: effective mass = moving mass)"
                                             if self.joint_type == "prismatic" else
                                             "G_R = mu g . (a x R(q) u), u = hinge -> moving-support centroid"))

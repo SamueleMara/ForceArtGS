@@ -67,6 +67,21 @@ class G9Inputs:
     com_direction: Optional[np.ndarray] = None                 # hinge -> moving-support centroid (perp. to axis)
     com_lever_m: Optional[float] = None
     record_context: Optional[dict] = None                      # canonical record + q for the impulse / coast analysis
+    reference_pose: Optional[dict] = None                      # q_ref of the mass geometry (verified / declared)
+
+
+def code_fingerprint() -> str:
+    """sha256 over the G9 package sources and the shared force-convention / robot-record code: a code change writes
+    a new version instead of silently reusing results produced by older code."""
+    root = Path(__file__).resolve().parent
+    files = sorted(root.rglob("*.py")) + [root.parent / "estimotion_2part" / "joint_discovery" / n
+                                          for n in ("force_convention.py", "robot_record.py")]
+    h = hashlib.sha256()
+    for f in files:
+        if f.is_file():
+            h.update(str(f.relative_to(root.parent)).encode())
+            h.update(f.read_bytes())
+    return h.hexdigest()
 
 
 def _sig(obj) -> str:
@@ -90,13 +105,26 @@ def _mass_model(inp: G9Inputs, cfg, log) -> tuple:
         return None, "NO_MASS_MODEL_GEOMETRY: no validated moving-part surface mesh (mass_model.mesh)"
     if mm["mode"] not in ("uniform_solid", "uniform_shell"):
         return None, f"mass_model.mode {mm['mode']}: not a geometry-integration mode"
+    rp = inp.reference_pose
+    if rp is not None and rp.get("status") in ("PASS", "DECLARED"):
+        q_ref, ref_ev = float(rp["q_ref"]), rp
+    elif inp.synthetic:
+        q_ref, ref_ev = 0.0, dict(status="SYNTHETIC", q_ref=0.0, q_ref_source="synthetic construction at q = 0")
+    elif mm.get("reference_q") is not None:
+        q_ref, ref_ev = float(mm["reference_q"]), dict(status="DECLARED", q_ref=float(mm["reference_q"]),
+                                                       q_ref_source="mass_model.reference_q")
+    else:
+        return None, ("MASS_MODEL_REFERENCE_POSE_UNVERIFIED: the joint coordinate of the mass geometry's pose is "
+                      "not established (declare mass_model.reference_q or supply a verified handoff anchor)"
+                      + (f"; {rp.get('reasons')}" if rp else ""))
     try:
         g = GeometryMassModel.from_validated_mesh(
             inp.mass_mesh, mm["mode"], inp.joint_type, inp.axis, inp.origin, canonical_frame=mm["geometry_frame"],
             source_provenance=inp.mass_mesh_provenance or mm.get("source_provenance") or {},
             reflected_actuator_inertia=mm["reflected_actuator_inertia"],
             is_collision_proxy=bool(mm.get("mesh_is_collision_proxy")),
-            allow_collision_proxy=bool(mm["allow_collision_proxy_as_mass_geometry"]))
+            allow_collision_proxy=bool(mm["allow_collision_proxy_as_mass_geometry"]), q_ref=q_ref,
+            reference_evidence=ref_ev)
         g.reflected()                                   # undeclared reflected inertia blocks the coupling here
         if inp.moving_gaussian_xyz is not None:
             al = alignment_check(inp.mass_mesh, inp.moving_gaussian_xyz)
@@ -193,6 +221,8 @@ def run_g9(inp: G9Inputs, cfg: dict, out_dir, log=print) -> dict:
         struct = structural_checks(inp.train or inp.excitation_only, spec) if (inp.train or inp.excitation_only) \
             else None
     est_dir = out / "estimator_results"
+    others = {}
+    th0, ics = None, None
     if can_fit and spec is not None:
         log(f"G9 fit: {terms.model_id} [{src}] on {len(inp.train)} interaction(s), {label}")
         ls = general_integral_ls(inp.train, spec)
@@ -203,6 +233,21 @@ def run_g9(inp: G9Inputs, cfg: dict, out_dir, log=print) -> dict:
                                   seed=int(cfg["fitting"]["seed"]), robust=cfg["fitting"]["robust_loss"],
                                   max_step=float(cfg["model"]["integrator_max_step_s"]), scale_hint=dict(effort=eff))
         _write(est_dir / "general_rollout_fit.json", dict(**_strip(fit), label=label))
+        methods = cfg["fitting"]["methods"]
+        sQ = [float(i.meta.get("effort_sigma") or 0.0) for i in inp.train]
+        if "general_pinn" in methods:
+            from .estimators.general_pinn import PINNConfig, general_pinn_fit
+            log("G9 GeneralPINN (full-equation residual, autograd)")
+            others["general_pinn"] = general_pinn_fit(inp.train, spec, th0, PINNConfig.from_dict(cfg["fitting"]["pinn"]))
+            _write(est_dir / "general_pinn.json", dict(others["general_pinn"], label=label))
+        if "general_akf" in methods:
+            from .estimators.general_ekf import EKFConfig, general_akf_fit
+            log("G9 GeneralAugmentedEKF (parameters in the augmented state)")
+            others["general_akf"] = general_akf_fit(inp.train, spec, th0, EKFConfig.from_dict(cfg["fitting"]["ekf"]),
+                                                    s_Q=float(np.median(sQ)) if sQ else None)
+            _write(est_dir / "general_akf.json", dict({k: v for k, v in others["general_akf"].items()
+                                                       if k != "timelines"}, label=label))
+            _write(est_dir / "general_akf_timelines.json", others["general_akf"]["timelines"])
         if fit.get("status") in ("ok", "not_converged"):
             th = np.asarray(fit["x"][:len(spec.names)])
             conv = step_convergence(spec, th, inp.train[0])
@@ -249,7 +294,8 @@ def run_g9(inp: G9Inputs, cfg: dict, out_dir, log=print) -> dict:
                 continue
             try:
                 an = _ic(rc["rec"], rc["joint_type"], rc["axis"], rc["origin"], rc["q_src"], rc["q"], rc["q_std"], w,
-                         observability=rc.get("observability"))
+                         observability=rc.get("observability"),
+                         declared_pulse_rows=cfg["identifiability"].get("declared_pulse_rows"))
                 _icplot(an, out / f"impulse_coast_{it.name}.png")
                 an.pop("_plot", None)
                 an["interaction"] = it.name
@@ -260,6 +306,10 @@ def run_g9(inp: G9Inputs, cfg: dict, out_dir, log=print) -> dict:
             schema="forceartgs.g9.impulse_coast/v1", windows=ics,
             note="pulse and coast evaluated separately on native 50 Hz force rows; verdicts "
                  "IMPULSE_INFORMATIVE / IMPULSE_UNRESOLVED / IMPULSE_NOT_INFORMATIVE"))
+    if spec is not None and (fit is not None or others):
+        _write(out / "estimator_results" / "method_comparison.json",
+               method_comparison(spec, fit, others, ident, struct, inp.heldout, label, train=inp.train))
+    gravity_geometry_reports(out, inp, cfg, spec, mm, th0, fit, others, ics, label, log)
     _write(out / "general_identifiability.json", dict(fit_identifiability=ident, structural_from_data=struct,
                                                       step_convergence=conv, label=label) if ident or struct else
            dict(status="NOT_RUN", blocked=blocked))
@@ -370,7 +420,7 @@ def run_g9(inp: G9Inputs, cfg: dict, out_dir, log=print) -> dict:
                "not_a_full_physics_spec": "this file is never passed to the builder's --dynamics"}
     X.write_yaml(out / "dynamics_handoff.yaml", handoff, "G9 dynamics handoff (diagnostic + production fields)")
     # ------------------------------------------------------------------ manifest
-    sig_obj = dict(g9=G9_VERSION, cfg={k: v for k, v in cfg.items() if not k.startswith("_")},
+    sig_obj = dict(g9=G9_VERSION, code=code_fingerprint(), cfg={k: v for k, v in cfg.items() if not k.startswith("_")},
                    inputs=inp.input_hashes, train=[(i.name, _sig([i.t_obs, i.q_obs, i.effort.levels])) for i in inp.train],
                    heldout=[(i.name, _sig([i.t_obs, i.q_obs, i.effort.levels])) for i in inp.heldout])
     st = ("PRODUCTION_PHYSICS_SPEC_READY" if (spec_v1 is not None and production) else
@@ -438,6 +488,156 @@ def _js_kw(inp, exploratory):
     declared = bool(g is not None and not g.verified and str(g.provenance).startswith("DECLARED"))
     return dict(joint_axis=inp.axis, joint_origin=inp.origin, com_direction=inp.com_direction,
                 com_lever_m=inp.com_lever_m, allow_unverified_gravity=bool(exploratory and declared))
+
+
+def method_comparison(spec, rollout, others, ident, struct, heldout, label, train=None) -> dict:
+    """Side-by-side estimators on IDENTICAL inputs / ModelSpec / initializer. No winner by training loss."""
+    from .estimators.general_ekf import _replay
+    from .validation.heldout_prediction import heldout_report
+    rows = {}
+    entries = dict(general_rollout_fit=rollout, **others)
+    unexcited = {p for p, _ in (struct or {}).get("unidentifiable", [])}
+    for m, r in entries.items():
+        if not r or r.get("status") not in ("ok", "not_converged"):
+            rows[m] = dict(status=(r or {}).get("status", "NOT_RUN"))
+            continue
+        th = np.asarray(r["x"][:len(spec.names)], float)
+        par = {}
+        for n in spec.names:
+            e = r["estimates"][n]
+            sd = e.get("std")
+            if m == "general_rollout_fit" and ident:
+                sd = ident["parameters"][n]["std_statistical"]
+            rel = (sd / abs(e["value"])) if (sd is not None and np.isfinite(sd) and e["value"] not in (0,)) else None
+            at_floor = bool(e.get("at_lower_bound") or (n in ("c", "Fc", "dFs", "Fs", "alpha", "M", "mu") and
+                                                        abs(float(e["value"])) < 1e-9))
+            par[n] = dict(value=e["value"], std=None if at_floor else sd, rel_std=None if at_floor else rel,
+                          at_bound=at_floor,
+                          uncertainty_label=("AT_NUMERICAL_FLOOR: exp-parameterised value only approaches 0; the "
+                                             "spread / posterior there is not an uncertainty" if at_floor else
+                                             e.get("uncertainty_label", "STATISTICAL (rollout covariance)")),
+                          interval95=e.get("interval95"),
+                          resolved_by_own_uncertainty=bool(rel is not None and rel <= 0.10 and not at_floor
+                                                           and n not in unexcited),
+                          structural_flag=n in unexcited)
+        rep = r.get("replay") or {}
+        common = _replay(spec, th, train)["per_interaction"] if train else None
+        if train:
+            base = np.mean([x["rmse_over_sigma"] for x in common if "rmse_over_sigma" in x] or [np.nan])
+            for n in spec.names:
+                if not par[n]["at_bound"]:
+                    continue
+                th0_ = th.copy()
+                th0_[spec.names.index(n)] = 0.0                   # truly zero (the physical model allows it)
+                try:
+                    z = _replay(spec, th0_, train)["per_interaction"]
+                    zz = np.mean([x["rmse_over_sigma"] for x in z if "rmse_over_sigma" in x] or [np.nan])
+                    if not np.isfinite(zz):
+                        raise ValueError("the model at exactly zero is not simulable (e.g. zero inertia)")
+                    par[n]["profile_at_zero"] = dict(replay_rmse_over_sigma_at_estimate=float(base),
+                                                     replay_rmse_over_sigma_at_zero=float(zz),
+                                                     consistent_with_zero=bool(abs(zz - base) <= 0.01 * max(base, 1)))
+                except Exception as ex:                       # e.g. M = 0 is not a valid simulation
+                    par[n]["profile_at_zero"] = dict(status="NOT_EVALUABLE", reason=str(ex))
+        rows[m] = dict(status=r.get("status"), parameters=par, physical=r.get("physical"),
+                       open_loop_replay=common,
+                       method_own_replay=rep.get("per_interaction"),
+                       training_residual_rms_sigma=r.get("residual_rms_sigma"),
+                       heldout=heldout_report(spec, th, heldout) if heldout else dict(status="NOT_RUN",
+                                                                                      reason="no held-out episode"),
+                       runtime_s=r.get("runtime_s"), nis=r.get("nis"), order_effect=r.get("order_effect"))
+    return dict(schema="forceartgs.g9.method_comparison/v1", label=label, model=spec.describe(), methods=rows,
+                same_inputs="identical interactions, effort, q, q_std, ModelSpec (terms / gravity / mass model) and "
+                            "integral-LS initializer for every method",
+                open_loop_replay_protocol="every method's frozen theta simulated with the SAME protocol: q0 = first "
+                                          "observation, v0 = line fit of the first 4 observations, native ZOH effort, "
+                                          "max step 1 ms (training episodes; held-out reported separately)",
+                policy="no method is selected by training loss; a parameter is reported resolved by a method only "
+                       "under that method's own uncertainty AND the independent structural / excitation checks")
+
+
+def gravity_geometry_reports(out, inp, cfg, spec, mm, th0, fit, others, ics, label, log=print):
+    """The six gravity-projection / geometry / reference-pose audits (always written; NOT_RUN with a reason)."""
+    from .validation import gravity_geometry_audit as GA
+    names = ("reference_pose_alignment", "mass_com_inertia_audit", "gravity_geometry_audit",
+             "gravity_joint_sensitivity", "method_gravity_parity", "impulse_balance_audit")
+    rep = {n: dict(schema=f"forceartgs.g9.{n}/v1", status="NOT_RUN") for n in names}
+    rep["reference_pose_alignment"] = inp.reference_pose or dict(
+        schema="forceartgs.g9.reference_pose_alignment/v1", status="NOT_RUN",
+        reason="no mass geometry with a pose (no mesh / no tentative proxy)" if inp.mass_mesh is None else
+        "synthetic or declared mesh pose" if inp.synthetic else "no handoff anchor evaluated")
+    thetas = {}
+    if th0 is not None:            # the rollout initializer (LS estimate, or a documented fallback where LS violates
+        thetas["integral_ls_initializer"] = np.asarray(th0, float)   # the physical sign -- see general_integral_ls.json)
+    if fit is not None:
+        thetas["general_rollout_fit"] = np.asarray(fit["x"], float)
+    for k, r in (others or {}).items():
+        if r and r.get("status") in ("ok", "not_converged"):
+            thetas[k] = np.asarray(r["x"], float)
+    tent = bool(inp.mass_mesh_provenance and str(inp.mass_mesh_provenance.get("status", "")).startswith("TENTATIVE"))
+    g = None if inp.gravity is None else np.asarray(inp.gravity.g_world, float)
+    q_all = np.concatenate([it.q_obs for it in inp.train]) if inp.train else None
+    try:
+        if inp.mass_mesh is not None and g is not None and mm is not None:
+            dens = {k: float(spec.values(v[:len(spec.names)])["alpha"]) for k, v in thetas.items()} \
+                if spec is not None and "alpha" in spec.names else None
+            rep["mass_com_inertia_audit"] = GA.mass_com_inertia_audit(
+                inp.mass_mesh, inp.joint_type, inp.axis, inp.origin, g, mm.q_ref, q_obs=q_all, densities=dens,
+                fitted_mode=mm.props.mode, reflected=mm.reflected(), provenance=inp.mass_mesh_provenance,
+                tentative=tent)
+        elif inp.mass_mesh is None:
+            rep["mass_com_inertia_audit"]["reason"] = "no mass geometry (no mesh, no verified tentative proxy)"
+        else:
+            rep["mass_com_inertia_audit"]["reason"] = "mass model rejected or no gravity field"
+        if spec is not None and thetas:
+            th = thetas.get("general_rollout_fit", next(iter(thetas.values())))
+            rep["method_gravity_parity"] = GA.method_gravity_parity(spec, th)
+        if spec is not None and mm is not None and spec.terms.gravity and thetas:
+            rc = inp.record_context or {}
+            rep["gravity_joint_sensitivity"] = GA.gravity_joint_sensitivity(
+                spec, inp.mass_mesh, mm.props.mode, thetas, inp.train, rc.get("rec"),
+                observability=rc.get("observability"), q_ref=mm.q_ref)
+        elif spec is not None and spec.parameter_source == "joint_space_gravity_coupled":
+            rep["gravity_joint_sensitivity"]["reason"] = ("joint_space_gravity_coupled: ablation only "
+                                                          "(GRAVITY_MASS_NOT_COUPLED); no shared mass geometry")
+        if spec is not None and thetas:
+            rc = inp.record_context or {}
+            rep["impulse_balance_audit"] = GA.impulse_balance_audit(ics, spec, thetas, rc.get("rec"), inp.train,
+                                                                    inp.axis, inp.origin)
+    except Exception as e:                                        # an audit failure is reported, never hidden
+        log(f"[g9] gravity / geometry audit error: {type(e).__name__}: {e}")
+        rep["gravity_geometry_audit"]["error"] = f"{type(e).__name__}: {e}"
+    a = np.asarray(inp.axis, float) / np.linalg.norm(inp.axis)
+    gsum = dict(schema="forceartgs.g9.gravity_geometry_audit/v1", label=label,
+                parameter_source=None if spec is None else spec.parameter_source,
+                law="G(q) = dU/dq, U = -m g.c(q); applied generalized gravity effort = -G",
+                gravity=None if inp.gravity is None else dict(
+                    g_B=list(inp.gravity.g_world), frame=inp.gravity.frame, verified=inp.gravity.verified,
+                    provenance=inp.gravity.provenance,
+                    provenance_class="DECLARED_OPERATOR_VERTICAL" if "DECLARED" in str(inp.gravity.provenance) else
+                    "MEASURED" if inp.gravity.verified else "UNVERIFIED"),
+                joint=dict(type=inp.joint_type, axis_B=a.tolist(),
+                           origin_B=None if inp.origin is None else np.asarray(inp.origin, float).tolist(),
+                           tilt_from_vertical_deg=float(np.degrees(np.arccos(min(1.0, abs(a[2]))))),
+                           g_cross_a_norm=None if g is None else float(np.linalg.norm(np.cross(g, a)))),
+                q_ref=None if mm is None else mm.q_ref,
+                mass_mode=None if mm is None else mm.props.mode,
+                reflected_inertia=None if mm is None else mm.reflected_actuator_inertia,
+                force_sign=(inp.record_context or {}).get("rec", {}).get("object_side_multiplier")
+                if inp.record_context else None,
+                flags=(GA.TENTATIVE_FLAGS if tent else []) + (
+                    ["GRAVITY_MASS_NOT_COUPLED"] if spec is not None and spec.parameter_source ==
+                    "joint_space_gravity_coupled" and inp.joint_type == "revolute" else []),
+                parity_status=rep["method_gravity_parity"].get("status"),
+                sub_reports=list(names), source_hashes=inp.input_hashes,
+                initializer_note="'integral_ls_initializer' = theta0_from_ls: the integral-LS estimate where it is "
+                                 "physically consistent, else the documented fallback (e.g. alpha = 1 when LS alpha "
+                                 "<= 0); it is NOT an independent estimate",
+                error=rep["gravity_geometry_audit"].get("error"))
+    rep["gravity_geometry_audit"] = gsum
+    for n in names:
+        _write(out / f"{n}.json", rep[n])
+    return rep
 
 
 def exploratory_pre(fa):

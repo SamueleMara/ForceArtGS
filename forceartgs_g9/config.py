@@ -31,18 +31,24 @@ DEFAULTS = {
     "mass_model": {"mode": "uniform_shell", "mesh": None, "mesh_units": "m", "geometry_frame": "W",
                    "shell_thickness_m": None, "source_provenance": None,
                    "allow_collision_proxy_as_mass_geometry": False, "mesh_is_collision_proxy": False,
-                   "reflected_actuator_inertia": None, "user_link_inertial": None},
+                   "reflected_actuator_inertia": None, "user_link_inertial": None,
+                   # no validated mesh: a TENTATIVE_GEOMETRIC_PREVIEW from the frozen moving Gaussians (hull)
+                   "tentative_proxy": None,
+                   # stored joint coordinate of the mesh pose (required with a user mesh; never assumed 0)
+                   "reference_q": None},
     "fitting": {"methods": ["general_integral_ls", "general_rollout_fit"],
                 "compare_frozen_viscous_baselines": ["IntegralLS", "Backprop", "AKF", "PINN", "MLP"],
                 "use_multiple_interactions": True, "robust_loss": "huber", "seed": 0, "n_starts": 4,
                 "measured_force_uncertainty_required": True, "holdout_mode": "independent_episodes",
-                "auto_lag_fit": False, "model_variants": None, "load_model_comparison": False},
+                "auto_lag_fit": False, "model_variants": None, "load_model_comparison": False,
+                "pinn": None, "ekf": None},
     "contact": {"inherit_upstream_slip_mode": True, "require_contact_provenance": True, "force_on_object_only": True,
                 "use_pure_sensor_torque": False},
     "identifiability": {"propagate_joint_geometry_uncertainty": True, "propagate_calibration_uncertainty": True,
                         "require_excitations": True, "on_unidentifiable_enabled_parameter": "block_identified_export",
                         "force_lag_sweep_s": 0.02, "force_scale_sweep_rel": 0.05, "force_bias_sweep": None,
-                        "contact_point_sweep_m": None, "use_second_window_tare_sweep": True},
+                        "contact_point_sweep_m": None, "use_second_window_tare_sweep": True,
+                        "declared_pulse_rows": None},
     "export": {"write_joint_space_result": True, "reconstruct_link_inertia_when_supported": True,
                "production_requires_heldout_real_prediction": True, "allow_assumption_preview": False,
                "canonical_builder": "parttwin1d", "prefer_imported_single_exporter": True, "write_urdf": True,
@@ -59,6 +65,7 @@ CHOICES = {
     ("model", "parameter_source"): ("geometry_coupled", "joint_space_only", "joint_space_gravity_coupled",
                                     "user_link_inertial"),
     ("mass_model", "mode"): ("uniform_solid", "uniform_shell", "segmented_material", "user_link_inertial"),
+    ("mass_model", "tentative_proxy"): (None, "solid_hull", "shell_hull"),
     ("fitting", "robust_loss"): ("huber", "linear"),
     ("fitting", "holdout_mode"): ("independent_episodes", "none"),
     ("identifiability", "on_unidentifiable_enabled_parameter"): ("block_identified_export",),
@@ -98,6 +105,10 @@ def load_dynamics_config(src=None) -> dict:
     for (a, b), allowed in CHOICES.items():
         if cfg[a][b] not in allowed:
             raise ModelConfigError(f"{a}.{b} = {cfg[a][b]!r} not in {list(allowed)}")
+    known = {"general_integral_ls", "general_rollout_fit", "general_pinn", "general_akf"}
+    bad = sorted(set(cfg["fitting"]["methods"]) - known)
+    if bad:
+        raise ModelConfigError(f"fitting.methods: unknown {bad}; allowed {sorted(known)}")
     if cfg["model"]["automatic_term_selection"]:
         raise ModelConfigError("model.automatic_term_selection: never silently disable requested effects; use "
                                "fitting.model_variants (opt-in, scored on withheld episodes)")

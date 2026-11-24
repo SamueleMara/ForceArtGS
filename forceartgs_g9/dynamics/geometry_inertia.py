@@ -36,7 +36,9 @@ class InertiaReconstructionError(ValueError):
 
 @dataclass
 class GeometryMassModel:
-    """Validated unit-density shape of the canonical moving part (q = 0), tied to the accepted joint."""
+    """Validated unit-density shape of the moving part posed at the reference coordinate ``q_ref`` (the stored joint
+    coordinate of the geometry's pose, verified against the joint authority -- never assumed 0), tied to the
+    accepted joint. ONE density scales inertia (M = rho I_axis,1 + I_refl) and gravity (G = rho G_1)."""
 
     props: UnitDensityProperties
     joint_type: str
@@ -46,11 +48,14 @@ class GeometryMassModel:
     reflected_actuator_inertia: object = None    # float (declared) | PASSIVE | None (undeclared -> block)
     collision_proxy: bool = False
     assumptions: list = field(default_factory=list)
+    q_ref: float = 0.0
+    reference_evidence: dict | None = None
 
     @classmethod
     def from_validated_mesh(cls, mesh: TriMesh, mode: str, joint_type: str, axis, origin, *, canonical_frame="W",
                             source_provenance: dict | None = None, reflected_actuator_inertia=None,
-                            is_collision_proxy=False, allow_collision_proxy=False) -> "GeometryMassModel":
+                            is_collision_proxy=False, allow_collision_proxy=False, q_ref: float = 0.0,
+                            reference_evidence: dict | None = None) -> "GeometryMassModel":
         prov = dict(source_provenance or {})
         if not prov.get("source"):
             raise InertiaReconstructionError("mass-model geometry needs source_provenance.source (where the mesh "
@@ -68,12 +73,15 @@ class GeometryMassModel:
             raise InertiaReconstructionError("revolute mass model needs the hinge origin")
         props = unit_density_properties(mesh, mode, canonical_frame)
         asm = [f"{mode}: uniform material over the validated surface ({DENSITY_UNITS[mode]})",
-               "single rigid moving body; geometry posed at the canonical reference q = 0"]
+               f"single rigid moving body; geometry posed at the reference coordinate q_ref = {float(q_ref):.6g}"]
         if mode == "uniform_shell":
             asm.append("thin shell: thickness << size; the areal density absorbs the (unknown) thickness")
         if is_collision_proxy:
             asm.append("PREVIEW: collision proxy used as mass geometry (opt-in)")
-        m = cls(props, joint_type, a, o, prov, reflected_actuator_inertia, bool(is_collision_proxy), asm)
+        if not math.isfinite(float(q_ref)):
+            raise InertiaReconstructionError("mass-model reference coordinate q_ref must be finite")
+        m = cls(props, joint_type, a, o, prov, reflected_actuator_inertia, bool(is_collision_proxy), asm,
+                float(q_ref), reference_evidence)
         if m.M1 <= 0 or not math.isfinite(m.M1):
             raise InertiaReconstructionError(f"unit-density joint inertia {m.M1} is not positive")
         return m
@@ -85,8 +93,21 @@ class GeometryMassModel:
         return self.props.axis_inertia(self.axis, self.origin) if self.joint_type == "revolute" else self.props.m1
 
     def gravity_unit(self, g_world) -> RigidBodyGravity:
+        """Unit-density gravity G_1 (G = rho G_1): the SAME m_1, c_ref and q_ref as the inertia."""
         return RigidBodyGravity(self.joint_type, tuple(self.axis), tuple(self.origin), tuple(self.props.c1),
-                                self.props.m1, tuple(np.asarray(g_world, float)))
+                                self.props.m1, tuple(np.asarray(g_world, float)), self.q_ref)
+
+    @property
+    def r_perp(self) -> np.ndarray:
+        """Analytic COM displacement perpendicular to the hinge at q_ref, from the integrated geometry COM."""
+        if self.joint_type != "revolute":
+            return np.zeros(3)
+        r = self.props.c1 - self.origin
+        return r - (r @ self.axis) * self.axis
+
+    @property
+    def lever_m(self) -> float:
+        return float(np.linalg.norm(self.r_perp))
 
     def reflected(self) -> float:
         r = self.reflected_actuator_inertia

@@ -1,0 +1,35 @@
+# Physics-constrained input-output identification (forceartgs_g9.system_identification) -- opt-in.
+# Unknown keys are rejected. Old G9 / G10 results are reproducible without this file.
+schema: forceartgs.g9.io_identification/v1
+enabled: false                       # opt in
+joint_source: accepted_authority     # diagnostic_working_authority only with explicit opt-in (conditional results)
+contact_policy: inherit_g9_g10       # no new silent free / noncontact classification
+model_variants: [inertial_viscous, inertial_viscous_coulomb]   # L0 always first; L3 spring only when listed + coverage
+gravitation: inherited_geometry_and_world_gravity
+free_forced_config: configs/g9_real/free_forced.yaml           # SAME classifier options as the G9 free/forced stage
+heldout: last_if_multiple
+fit:
+  method: output_error_and_weak_form
+  initial_velocity: uncertainty_aware_fit   # per-episode (q0, v0) nuisance with the observed-prefix prior
+  input_interpolation: forward_zoh
+  robust_loss: huber
+  huber_delta: 2.0
+  feature_bootstrap_seeds: 8                # moving-block residual bootstrap (sensitivity, not a CI)
+  local_linearization: moving_only
+  compare_methods: [output_error, weak_form, normalized_ekf]   # add normalized_pinn explicitly (slow)
+physx:
+  inherit_g10_worker: true
+  g10_config: configs/g9_real/physx_refinement.yaml
+  use_response_initialization: true
+  response_regularizer_weight: 0.0     # derived from the same q,u; avoid double counting (> 0 is refused)
+  energy_penalty_weight: 0.0           # energy audit only (> 0 is refused)
+  disable_unexpected_link_damping: true
+  disable_unexpected_joint_drive: true
+  require_engine_property_readback: true
+  mass_scale_profile: true
+  reconcile: true                      # replay the conditional candidates in actual PhysX (few rollouts)
+validation:
+  synthetic_ground_truth_required: true
+  real_heldout_required_for_production_export: true
+  forbid_point_export_without_identifiability: true
+  report_absolute_and_normalized_error: true

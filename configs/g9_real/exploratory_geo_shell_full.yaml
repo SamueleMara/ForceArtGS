@@ -1,0 +1,28 @@
+# G9 EXPLORATORY real-data estimation, geometry_coupled with a TENTATIVE shell_hull mass proxy built from the frozen
+# moving-part Gaussians (convex hull of filtered means; never Gaussian covariance / opacity as density). ONE density
+# for inertia and gravity. Gravity DECLARED by the operator (dataset z = true vertical). Passive mechanism: reflected
+# actuator inertia = 0 is an ASSUMPTION. All four estimators on one shared ModelSpec. Never production-exported.
+schema: forceartgs.dynamics_config/v1
+pipeline:
+  force_policy: exploratory
+  allow_diagnostic_kinematics: false
+model:
+  terms: {inertia: true, viscous: true, coulomb: true, static: true, gravity: true, bias: false}
+  parameter_source: geometry_coupled
+  gravity: {source: verified_world_gravity, vector_world_mps2: [0.0, 0.0, -9.81], calibration_file: gravity_base_link_declared.json}
+mass_model:
+  mode: uniform_shell
+  tentative_proxy: shell_hull
+  reflected_actuator_inertia: none_passive_mechanism   # ASSUMPTION (no actuator on the passive object)
+fitting:
+  methods: [general_integral_ls, general_rollout_fit, general_pinn, general_akf]
+  pinn: {n_seeds: 3, steps_data: 3000, steps_joint: 4000}
+  ekf: {reverse_order_check: true}
+  compare_frozen_viscous_baselines: [IntegralLS]
+  n_starts: 4
+identifiability:
+  force_lag_sweep_s: 0.01
+  force_scale_sweep_rel: 0.05                 # UNVALIDATED stress test
+  contact_point_sweep_m: 0.015
+  use_second_window_tare_sweep: true
+  declared_pulse_rows: null                   # e.g. [[229, 232]] (fridge): reported beside threshold detection

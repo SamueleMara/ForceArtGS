@@ -54,7 +54,8 @@ def build_robot_record(scene, force_export_dir, robot_archive, contact_segments=
         if not p.is_file():
             raise FileNotFoundError(str(p))
     ann = json.loads(js_p.read_text())
-    rows = list(csv.DictReader(open(csv_p)))
+    with open(csv_p, newline="") as fh:
+        rows = list(csv.DictReader(fh))
     src = np.array([int(r["source_frame_index"]) for r in rows])
     ts = np.array([float(r["timestamp_s"]) for r in rows])
     Fs = np.array([[float(r[k]) for k in ("Fx_corr_N", "Fy_corr_N", "Fz_corr_N")] for r in rows])

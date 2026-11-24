@@ -1,0 +1,23 @@
+# Ablation: joint_space_gravity_coupled (CONDITIONAL DIAGNOSTIC: COM direction assumed toward the support centroid)
+# with all four estimators on one shared ModelSpec. Compare with exploratory_geo_*_viscous_gravity.yaml.
+schema: forceartgs.dynamics_config/v1
+pipeline:
+  force_policy: exploratory
+  allow_diagnostic_kinematics: false
+model:
+  terms: {inertia: true, viscous: true, coulomb: false, static: false, gravity: true, bias: false}
+  parameter_source: joint_space_gravity_coupled
+  gravity: {source: verified_world_gravity, vector_world_mps2: [0.0, 0.0, -9.81], calibration_file: gravity_base_link_declared.json}
+fitting:
+  methods: [general_integral_ls, general_rollout_fit, general_pinn, general_akf]
+  pinn: {n_seeds: 3, steps_data: 3000, steps_joint: 4000}
+  ekf: {reverse_order_check: true}
+  load_model_comparison: false
+  compare_frozen_viscous_baselines: [IntegralLS]
+  n_starts: 4
+identifiability:
+  force_lag_sweep_s: 0.01
+  force_scale_sweep_rel: 0.05
+  contact_point_sweep_m: 0.015
+  use_second_window_tare_sweep: true
+  declared_pulse_rows: null                   # e.g. [[229, 232]] (fridge): reported beside threshold detection

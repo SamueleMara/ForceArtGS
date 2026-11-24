@@ -118,50 +118,75 @@ class GravityField:
 
 @dataclass(frozen=True)
 class RigidBodyGravity:
-    """Exact rigid-body gravity of one moving body: U(q) = -m g.c(q); G(q) = dU/dq. ``mass`` may be a unit-density
-    mass m_1 (geometry-coupled G_1, scaled by alpha later)."""
+    """Exact rigid-body gravity of one moving body: U(q) = -m g.c(q); G(q) = dU/dq (the generalized LOAD; the applied
+    generalized gravity effort is -G). ``mass`` may be a unit-density mass m_1 (geometry-coupled G_1, scaled by the
+    density later). ``com0`` is the COM at the REFERENCE coordinate ``q_ref`` (the pose of the mass geometry):
+
+        revolute : c(q) = o + R_a(q - q_ref) (c_ref - o)
+                   G(q) = -m g . (a x R_a(q - q_ref) r_perp),  r_perp = (I - a a^T)(c_ref - o)
+        prismatic: c(q) = c_ref + (q - q_ref) a,              G = -m g . a
+    """
 
     joint_type: str
     axis: tuple
     origin: tuple            # a point on the hinge (revolute); unused for prismatic
-    com0: tuple              # COM at the canonical q = 0
+    com0: tuple              # COM at the reference coordinate q_ref
     mass: float
     g_world: tuple
+    q_ref: float = 0.0       # stored joint coordinate of the pose in which com0 was measured
+
+    def _a(self):
+        a = np.asarray(self.axis, float)
+        n = np.linalg.norm(a)
+        if not np.isfinite(n) or n < 1e-12:
+            raise ModelConfigError("gravity: degenerate joint axis")
+        return a / n
+
+    def r_perp(self) -> np.ndarray:
+        """COM displacement perpendicular to the hinge at q_ref (zero vector for prismatic)."""
+        if self.joint_type == "prismatic":
+            return np.zeros(3)
+        a = self._a()
+        r = np.asarray(self.com0, float) - np.asarray(self.origin, float)
+        return r - (r @ a) * a
 
     def com(self, q) -> np.ndarray:
-        a, o, c0 = (np.asarray(x, float) for x in (self.axis, self.origin, self.com0))
+        a, o, c0 = self._a(), np.asarray(self.origin, float), np.asarray(self.com0, float)
         if self.joint_type == "prismatic":
-            return c0 + float(q) * a / np.linalg.norm(a)
-        return o + rotation(a, float(q)) @ (c0 - o)
+            return c0 + (float(q) - self.q_ref) * a
+        return o + rotation(a, float(q) - self.q_ref) @ (c0 - o)
 
     def potential(self, q) -> float:
         return float(-self.mass * np.asarray(self.g_world, float) @ self.com(q))
 
+    def _AB_local(self):
+        """(A0, B0) with G = A0 cos(q - q_ref) + B0 sin(q - q_ref) (revolute)."""
+        g, a = np.asarray(self.g_world, float), self._a()
+        rp = self.r_perp()
+        return float(-self.mass * g @ np.cross(a, rp)), float(self.mass * g @ rp)
+
     def G(self, q):
         """dU/dq, vectorised over q."""
         g = np.asarray(self.g_world, float)
-        a = np.asarray(self.axis, float)
-        a = a / np.linalg.norm(a)
+        a = self._a()
         if self.joint_type == "prismatic":
             v = float(-self.mass * g @ a)
             return np.full(np.shape(q), v) if np.ndim(q) else v
-        o, c0 = np.asarray(self.origin, float), np.asarray(self.com0, float)
-        r = c0 - o
-        r_perp = r - (r @ a) * a
-        A = -self.mass * g @ np.cross(a, r_perp)           # G = A cos q + B sin q (exact, see docstring)
-        B = self.mass * g @ r_perp
-        qq = np.asarray(q, float)
-        out = A * np.cos(qq) + B * np.sin(qq)
+        A0, B0 = self._AB_local()
+        d = np.asarray(q, float) - self.q_ref
+        out = A0 * np.cos(d) + B0 * np.sin(d)
         return out if np.ndim(q) else float(out)
 
     def basis_coefficients(self) -> tuple:
-        """(A, B) with G(q) = A cos q + B sin q (revolute) or (G_P, 0) (prismatic)."""
+        """(A, B) with G(q) = A cos q + B sin q in the STORED coordinate q (q_ref folded in), or (G_P, 0) (prismatic)."""
         if self.joint_type == "prismatic":
             return float(self.G(0.0)), 0.0
-        return float(self.G(0.0)), float(self.G(math.pi / 2))
+        A0, B0 = self._AB_local()
+        c, s = math.cos(self.q_ref), math.sin(self.q_ref)
+        return float(A0 * c - B0 * s), float(A0 * s + B0 * c)
 
     def amplitude_bound(self) -> float:
-        """max_q |G(q)| = m |g_perp| |r_perp| (revolute), |G_P| (prismatic)."""
+        """max_q |G(q)| = m ||g x a|| ||r_perp|| (revolute), |G_P| (prismatic)."""
         A, B = self.basis_coefficients()
         return float(math.hypot(A, B)) if self.joint_type == "revolute" else abs(A)
 

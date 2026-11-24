@@ -142,7 +142,8 @@ def diagnose_general(fit: dict, interactions, spec, *, perturb: dict | None = No
     nphys = len(names)
     Cp = cov[:nphys, :nphys]
     d = np.sqrt(np.clip(np.diag(Cp), 1e-300, None))
-    corr = Cp / np.outer(d, d)
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):   # degenerate (at-bound) directions
+        corr = Cp / np.outer(d, d)
     corr[~np.isfinite(corr)] = np.nan
     struct = structural_checks(interactions, spec)
     sysd = systematic_shifts(fit, interactions, perturb) if perturb else {}

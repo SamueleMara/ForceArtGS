@@ -1,0 +1,22 @@
+# G9 generalized free + forced normalized dynamics (FORCEARTGS_G9_GENERALIZED_FREE_AND_FORCED_DYNAMICS spec).
+# Declared BEFORE the real runs; every value is recorded in <run>/dynamics/g9_free_forced/vNNN/resolved_config.yaml.
+dynamics_config: configs/g9_real/forcetwin_effective.yaml   # the existing exploratory G9 policy (unchanged)
+free_forced:
+  segments:
+    z_sig: 3.0            # running-RMS |Q|/sigma above this = significant effort
+    win_rows: 5           # 0.1 s at 50 Hz
+    v_k: 3.0              # moving = |qdot| > 3 sd(qdot)
+    sep_margin_m: 0.03    # TCP-to-part surface distance above this = geometric release
+    n_part_points: 6000   # surface samples of the tentative hull for the separation test
+    min_q: 5              # q samples needed for a weak-form segment
+    min_run: 10           # inside annotated contact, effort runs shorter than this (rows) are merged (pulses kept)
+    pulse_z: 10.0         # a run with peak |Q|/sigma >= this is a pulse (kept separate)
+    z_J: 5.0              # a merged contact run is FORCED_MEASURED if |J|/sigma_J >= this
+  # EXPLICIT free hypothesis: low measured effort INSIDE an annotated contact is NOT free; this names the
+  # exploratory hypothesis under which such intervals are used (every result capped CONDITIONAL_ON_FREE_HYPOTHESIS)
+  free_hypotheses: [measured_near_zero_effort_in_contact]
+  sigma_floor: {revolute: 1.0e-3, prismatic: 1.0e-3}   # transparent q floor for sigma-normalised metrics [rad | m]
+  replay: {prefix_frac: 0.3, heldout_frac: 0.6}
+  bootstrap: 200
+  negligible_factor: 0.2
+  pinn: {epochs: 2500, epochs_warm: 600, seeds: [0, 1, 2], lbfgs_iters: 300, phase_b_epochs: 1500}

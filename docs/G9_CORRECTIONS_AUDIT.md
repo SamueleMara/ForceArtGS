@@ -122,7 +122,28 @@ The real exploratory reruns created new versions; nothing was overwritten.
 
 ## 5. Ablation (RGB-D / +TCP / +TCP + conditional force)
 
-See §5.1, filled in when the runs finish (`results_20_11_26/frontend_ablation/<scene>/ablation_report.json`).
+The source is `results_20_11_26/frontend_ablation/<scene>/ablation_report.json`. All variants use the same frozen
+temporal blocks for the held-out objective. The certified reference is `rgbd_tcp`.
+
+| scene | variant | joint status | export-ready | failure codes | q range | force / contact rows in fit | axis Δ vs certified |
+|---|---|---|---|---|---|---|---|
+| fridge | rgbd | IDENTIFIED_REVOLUTE | yes | — | 0.325 rad | — | 0.21° |
+| fridge | rgbd_tcp | IDENTIFIED_REVOLUTE | no | UNVERIFIED_PRIOR_SCALE | 0.325 rad | 0 / 4 | (reference) |
+| fridge | rgbd_tcp_force | IDENTIFIED_REVOLUTE | no | EXPLORATORY_FORCE_DIAGNOSTIC, UNVERIFIED_PRIOR_SCALE | 0.325 rad | 0 / 4 | 0.00° |
+| suitcase | rgbd | TYPE_UNOBSERVABLE | no | UNRELIABLE_MOVING_SUPPORT, TYPE_UNOBSERVABLE | 0.172 | — | 0.75° |
+| suitcase | rgbd_tcp | TYPE_UNOBSERVABLE | no | UNRELIABLE_MOVING_SUPPORT, TYPE_UNOBSERVABLE | 0.174 | 0 / 0 | (reference) |
+| suitcase | rgbd_tcp_force | TYPE_UNOBSERVABLE | no | + EXPLORATORY_FORCE_DIAGNOSTIC | 0.174 | 51 / 0 | 0.03° |
+| black box | rgbd | TYPE_UNOBSERVABLE | no | UNRELIABLE_MOVING_SUPPORT, TYPE_UNOBSERVABLE | 0.063 | — | 0.00° |
+| black box | rgbd_tcp | TYPE_UNOBSERVABLE | no | UNRELIABLE_MOVING_SUPPORT, TYPE_UNOBSERVABLE | 0.063 | 0 / 11 | (reference) |
+| black box | rgbd_tcp_force | TYPE_UNOBSERVABLE | no | + EXPLORATORY_FORCE_DIAGNOSTIC | 0.063 | 3 / 11 | 0.00° |
+
+- **Joint decision.** Force did not change the selected hypothesis on either scene, and the exploratory held-out
+  objective did not improve. The certified `rgbd_tcp` authority is kept on both.
+- **Fridge.** Adding the TCP costs export readiness (UNVERIFIED_PRIOR_SCALE: the TCP prior's scale is unverified). It
+  does not change the joint.
+- **Suitcase.** It stays TYPE_UNOBSERVABLE in every variant. The 51 exploratory force rows do not resolve the type.
+- **Black box.** It stays TYPE_UNOBSERVABLE in every variant (q range 0.063). It is declared revolute by the operator
+  (`--declared-joint-type`), never selected from the data.
 
 ## 6. Unresolved
 
@@ -171,3 +192,26 @@ revolute on 2026-11-19.
 
 **Effect on the fridge.** With the declared vertical, the configuration load is physical and has one parameter
 instead of two. The previous effective-load coefficients had CIs crossing 0; μ is now positive at about 2.3σ.
+
+## 8. Gravity projection / mass geometry / reference pose (2026-11-20)
+
+The full description is in `G9_GENERAL_PINN_AKF_IMPLEMENTATION_REPORT.md` §9. The quantitative checks:
+
+| check | fridge (smoke v022; full budget v023–v026) | suitcase (smoke v018; full budget v019–v022) |
+|---|---|---|
+| reference pose | PASS, q_ref = 0 (RGB-D 90 ↔ row 180; axis 0°, hinge 0 m) | PASS, q_ref = 0 |
+| joint tilt from vertical / \|g×a\| | 6.03° / 1.03 m/s² (R) | 88.6° / g·a = 0.24 m/s² (P, working model) |
+| m₁ solid / shell | 0.0609 m³ / 0.941 m² | 0.0142 m³ / 0.347 m² |
+| \|r⊥\| solid / shell | 0.180 / 0.181 m | — (prismatic) |
+| G₁ amplitude vs analytic m₁\|g×a\|ℓ | equal (to 1e-15) | equal |
+| implied mass, full budget (PINN / EKF) | 0.088 / 0.133 kg (solid v023); 0.083 / 0.0046 kg (shell v024); rollout ρ → 0: **not physical** | 8.3 / 7.6 kg: an axial-load fit |
+| gravity amplitude, geometry scenarios | −36 % / +51 % around the accepted value | 0.86–17.5 N (accepted 2.0 N) |
+| vertical-hinge alternative | G ≡ 0. Solid v023: replay 51–80σ vs 109–270σ accepted (fitted ρ). Shell v024: no gain (36 / 57 vs 50 / 63). Upstream residual NOT_RUN; never substituted | n/a |
+| method parity (M, G, dr/dρ) | PASS (≤ 1e-12) | PASS |
+| impulse rows 229–232 | SIGN_OR_TIMING_INCONCLUSIVE: J_Q +6.4e-3 vs Δq̇ −0.234; gauge consistent; ±40 ms lag no flip; tool mass to cancel −24 kg; no sign changed | no declared pulse |
+
+**Status.** Neither scene yields a physical identification:
+- the geometry is TENTATIVE;
+- the calibration is DECLARED;
+- there is no held-out episode;
+- the suitcase joint is not accepted.

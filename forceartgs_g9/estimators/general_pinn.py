@@ -14,8 +14,9 @@ Loss  L = l_data L_data + l_phys L_phys + l_stick L_stick + l_brk L_breakaway + 
   L_breakaway one-sided at the first moving sample after rest: relu(Fs - |Q - G - b|)^2 / s_r^2
   L_impulse   weak form over force pulses: (M [qd(tb) - qd(ta)] + int (c qd + Fc sgn + G + b) - int Q) / s_J
               with int Q EXACT on the native 50 Hz ZOH record
-  L_weak      the same equation integrated over sliding moving windows [a, b] of weak_window_obs samples:
-              (M [qd(b) - qd(a)] + c [q(b) - q(a)] + int (Fc sgn + G + b) - int Q) / (s_r (b - a)); it brings the
+  L_weak      the same equation integrated over every prefix window [segment start, t_i] of each moving segment:
+              (M [qd(b) - qd(a)] + c [q(b) - q(a)] + int (Fc sgn + G + b) - int Q) / s_w, s_w^2 = 2 (M0 s_qd)^2
+              + 2 (c0 s_q)^2 + sigma_Q^2 (b - a) dt_force (the window's own noise); it brings the
               well-measured DISPLACEMENT into the damping term (pointwise strong form alone cannot separate viscous
               from Coulomb friction in near-steady motion with network-derived velocities)
   L_ic        (q_k(t_0) - q_0)^2 / sigma_q^2 (anchors the start)
@@ -50,6 +51,8 @@ class PINNConfig:
     n_colloc: int = 300
     phys_ramp_fraction: float = 0.3            # l_phys ramps 0.05 -> l_phys over the first 30 % of joint steps
     event_exclusion_samples: int = 1           # no strong-form collocation within 1 obs sample of a stop / breakaway
+    impulse_max_duration_s: float = 0.25       # the impulse loss is for SHORT pulses (long pushes: weak prefix form)
+    breakaway_guard_s: float = 0.2             # stick inequality skips rest samples this close before a breakaway
     force_change_fraction: float = 0.4
     resample_every: int = 200
     l_data: float = 1.0
@@ -58,8 +61,9 @@ class PINNConfig:
     l_breakaway: float = 1.0
     l_impulse: float = 1.0
     l_weak: float = 1.0                        # weak (interval-integrated) form on moving windows
-    weak_window_obs: int = 3                   # window length in observation intervals
+    weak_window_obs: int = 3                   # minimum prefix-window length in observation intervals
     l_ic: float = 0.1
+    select_seed_by: str = "replay"             # replay (frozen-theta open-loop, training data) | loss
     phys_scale_rms_floor: float = 0.02         # s_r >= 2 % of the effort RMS (declared numerical floor)
     huber_delta: float = 1.0
 
@@ -147,6 +151,10 @@ class _Episode:
                                         "sigma_qd / sigma_qdd = noise gains of a 7-sample local quadratic")
         self.s_r = max(math.sqrt(sig ** 2 + ((M0 or 0.0) * s_qdd) ** 2 + ((c0 or 0.0) * s_qd) ** 2),
                        cfg.phys_scale_rms_floor * rms, 1e-9)
+        # weak-window noise: endpoint velocity / displacement errors + integrated force noise (declared formula)
+        dtf = float(np.median(np.diff(tf))) if len(tf) > 1 else 0.02
+        self.s_w_parts = (2 * ((M0 or 0.0) * s_qd) ** 2 + 2 * ((c0 or 0.0) * sq) ** 2,
+                          max(sig, cfg.phys_scale_rms_floor * rms) ** 2 * dtf)
         qrange = float(np.ptp(it.q_obs)) or float(np.median(it.q_std)) * 10
         T = self.t1 - self.t0
         self.s_v = max(3 * self.v_eps, 1e-9)
@@ -154,12 +162,15 @@ class _Episode:
         self.q_scale = max(qrange, 5 * float(np.median(it.q_std)))
         # rest runs (>= 3 samples) and breakaway samples, from q only
         self.rest_runs, start = [], None
+        ex = max(int(cfg.event_exclusion_samples), 0)
         for i, m in enumerate(list(~mov) + [False]):
             if m and start is None:
                 start = i
             if not m and start is not None:
-                if i - start >= 3:
-                    self.rest_runs.append((float(it.t_obs[start]), float(it.t_obs[i - 1])))
+                a0 = start + (ex if start > 0 else 0)                 # trim the creep at both rest-run edges
+                z0 = i - 1 - (ex if i < len(mov) else 0)
+                if z0 - a0 >= 2:
+                    self.rest_runs.append((float(it.t_obs[a0]), float(it.t_obs[z0])))
                 start = None
         self.breakaway_t = [float(it.t_obs[i + 1]) for i in range(len(mov) - 1) if (not mov[i]) and mov[i + 1]]
         # force pulses on the native record: contiguous rows |Q| > 3 s_r (description only, not a fitted window)
@@ -172,18 +183,27 @@ class _Episode:
             if not a and st is not None:
                 ta = float(tf[st])
                 tb = float(tf[i]) if i < len(tf) else float(tf[-1] + np.median(np.diff(tf)))
-                if self.t0 < ta and tb < self.t1:
-                    self.pulses.append((ta, tb, zoh_integral(it.effort, ta, tb)))
+                # the moving-equation balance holds only while the part MOVES: clip the pulse to the moving
+                # segment that contains it (while stuck, the static reaction is not Fc sgn(q'))
+                if tb - ta <= cfg.impulse_max_duration_s:
+                    for a, z in segs:
+                        sa, sz = float(it.t_obs[a]), float(it.t_obs[z - 1])
+                        ca, cb = max(ta, sa), min(tb, sz)
+                        if cb - ca >= 2 * float(np.median(np.diff(it.t_obs))):
+                            self.pulses.append((ca, cb, zoh_integral(it.effort, ca, cb)))
                 st = None
-        w = max(int(cfg.weak_window_obs), 1)
+        # weak windows: every PREFIX [segment start, t_i] of each moving segment (the rows of the integral-LS
+        # initializer, here evaluated on the network) -- long windows include the acceleration from rest, which is
+        # what separates viscous from Coulomb friction
         self.weak = []
         for a, z in segs:
-            for i in range(a, z - w):
-                ta, tb = float(it.t_obs[i]), float(it.t_obs[i + w])
+            for i in range(a + max(int(cfg.weak_window_obs), 1), z):
+                ta, tb = float(it.t_obs[a]), float(it.t_obs[i])
                 self.weak.append((ta, tb, zoh_integral(it.effort, ta, tb)))
         self.knots = tf[(tf > self.t0) & (tf < self.t1)]
         self.effort = it.effort
         self.cfg_excl = cfg.event_exclusion_samples
+        self.guard_s = cfg.breakaway_guard_s
 
     def colloc(self, n, frac, rng):
         n_ch = int(frac * n)
@@ -211,10 +231,16 @@ class _Episode:
         rest = np.zeros(len(t), bool)
         for a, b in self.rest_runs:
             rest |= (t >= a) & (t <= b)
-        return torch.as_tensor(t, dtype=DT), torch.as_tensor(mov & ~rest), torch.as_tensor(rest)
+        guard = np.zeros(len(t), bool)
+        for tb_ in self.breakaway_t:
+            guard |= (t >= tb_ - self.guard_s) & (t < tb_)
+        self._last_guard = guard
+        return (torch.as_tensor(t, dtype=DT), torch.as_tensor(mov & ~rest), torch.as_tensor(rest),
+                torch.as_tensor(rest & ~guard))
 
 
-def pinn_losses(dyn: TorchDynamics, eta, ep: _Episode, net, cfg: PINNConfig, tc, mov, rest, w_phys=None) -> dict:
+def pinn_losses(dyn: TorchDynamics, eta, ep: _Episode, net, cfg: PINNConfig, tc, mov, rest, rest_ineq=None,
+                w_phys=None) -> dict:
     v = dyn.values(eta)
     M, c, Fc, Fs, b, G = dyn.terms(v)
     out = {}
@@ -229,8 +255,10 @@ def pinn_losses(dyn: TorchDynamics, eta, ep: _Episode, net, cfg: PINNConfig, tc,
         net_eff = torch.abs(Q[rest] - G(q[rest]) - b)
         thr = Fs if Fs is not None else (Fc if dyn.has["coulomb"] else None)
         st = ((qd[rest] / ep.s_v) ** 2 + (qdd[rest] / ep.s_a) ** 2).mean()
-        if thr is not None:
-            st = st + (torch.relu(net_eff - thr) ** 2).mean() / ep.s_r ** 2
+        ri = rest if rest_ineq is None else rest_ineq
+        if thr is not None and ri.any():
+            ne = torch.abs(Q[ri] - G(q[ri]) - b)
+            st = st + (torch.relu(ne - thr) ** 2).mean() / ep.s_r ** 2
         out["stick"] = st
     else:
         out["stick"] = torch.zeros((), dtype=DT)
@@ -253,7 +281,7 @@ def pinn_losses(dyn: TorchDynamics, eta, ep: _Episode, net, cfg: PINNConfig, tc,
         A = torch.as_tensor([w[0] for w in ep.weak], dtype=DT)
         B = torch.as_tensor([w[1] for w in ep.weak], dtype=DT)
         JQ = torch.as_tensor([w[2] for w in ep.weak], dtype=DT)
-        k = 9
+        k = 33
         s01 = torch.linspace(0, 1, k, dtype=DT)
         tt = (A[:, None] + (B - A)[:, None] * s01[None, :]).reshape(-1)
         qq, qqd, _ = _derivs(net, tt)
@@ -261,7 +289,8 @@ def pinn_losses(dyn: TorchDynamics, eta, ep: _Episode, net, cfg: PINNConfig, tc,
         dt_ = (B - A)[:, None] * s01[None, :]
         integ = torch.trapz(Fc * torch.sign(qqd) + G(qq) + b, dt_, dim=1)
         rw = M * (qqd[:, -1] - qqd[:, 0]) + c * (qq[:, -1] - qq[:, 0]) + integ - JQ
-        out["weak"] = _huber(rw / (ep.s_r * (B - A)), cfg.huber_delta)
+        s_w = torch.sqrt(ep.s_w_parts[0] + ep.s_w_parts[1] * (B - A)) + 1e-12
+        out["weak"] = _huber(rw / s_w, cfg.huber_delta)
     else:
         out["weak"] = torch.zeros((), dtype=DT)
     lp = cfg.l_phys if w_phys is None else w_phys
@@ -338,18 +367,30 @@ def general_pinn_fit(interactions, spec, theta0, cfg: PINNConfig | None = None, 
         hists.append(h)
     T = np.array(thetas)
     mean, std = T.mean(0), T.std(0, ddof=1) if len(T) > 1 else np.full(T.shape[1], np.nan)
-    best = int(np.argmin([h[-1]["total"] for h in hists]))
+    def _rep(th_):
+        v = [x["rmse_over_sigma"] for x in open_loop_replay(spec, th_, interactions)["per_interaction"]
+             if "rmse_over_sigma" in x]
+        return float(np.mean(v)) if v else math.inf
+    seed_replay = [_rep(x) for x in T]
+    seed_loss = [h[-1]["total"] for h in hists]
+    if cfg.select_seed_by not in ("replay", "loss"):
+        raise ValueError(f"select_seed_by {cfg.select_seed_by!r}")
+    best = int(np.argmin(seed_replay if cfg.select_seed_by == "replay" else seed_loss))
     th = T[best]
-    est = {n: dict(value=float(th[j]), ensemble_mean=float(mean[j]), ensemble_std=float(std[j]),
-                   std=float(std[j]), uncertainty_label="ENSEMBLE (seeds; not a calibrated posterior)",
+    est = {n: dict(value=float(th[j]), ensemble_mean=float(mean[j]), ensemble_std=None if np.isnan(std[j]) else float(std[j]),
+                   std=None if np.isnan(std[j]) else float(std[j]), uncertainty_label="ENSEMBLE (seeds; not a calibrated posterior)",
                    at_lower_bound=bool(th[j] < 1e-9))
            for j, n in enumerate(spec.names)}
     return dict(status="ok", method="general_pinn", estimates=est, physical=spec.physical(th), x=th.tolist(),
                 seeds=list(range(cfg.n_seeds)), per_seed_theta=T.tolist(), best_seed=best,
+                seed_selection=dict(by=cfg.select_seed_by, per_seed_replay_rmse_over_sigma=seed_replay,
+                                    per_seed_final_loss=[float(x) for x in seed_loss],
+                                    note="seeds are ranked by frozen-theta open-loop replay on the TRAINING data "
+                                         "(not by neural training loss); no held-out data used"),
                 loss_history=hists, settings=asdict(cfg),
                 scales={e.it.name: dict(s_r=e.s_r, s_r_components=e.s_r_components, s_v=e.s_v, s_a=e.s_a,
                                         pulses=[(a, b, J) for a, b, J in e.pulses],
                                         rest_runs=e.rest_runs, breakaway_t=e.breakaway_t) for e in eps},
                 replay=open_loop_replay(spec, th, interactions), runtime_s=time.time() - t_start,
                 differentiation="torch.autograd (create_graph=True) in physical seconds; no finite differences",
-                note="PINN parameters from the seed with the lowest final total loss; ensemble spread reported")
+                note="PINN parameters from the seed selected by seed_selection.by (default: best frozen-theta open-loop replay on the training data); ensemble spread reported")
