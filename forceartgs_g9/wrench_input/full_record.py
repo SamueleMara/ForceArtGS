@@ -46,7 +46,8 @@ def load_contract(scene_dir, robot_archive, force_export_json=None) -> dict:
     tool_p = meta / "robot_tool.json"
     if not tool_p.is_file():
         raise WrenchContractError(f"known sensor-frame contract missing: {tool_p}")
-    tool = json.loads(tool_p.read_text())
+    from estimotion_2part.joint_discovery.robot_tool import load_robot_tool
+    tool = load_robot_tool(meta.parent)                     # + configs/robot_tool_overrides.json (operator decisions)
     wf = tool.get("wrench_frame") or {}
     if "R_ee_force_sensor" not in wf or wf.get("axes") != "ee":
         raise WrenchContractError(f"{tool_p}: wrench_frame.axes 'ee' + R_ee_force_sensor expected, got {wf}")
@@ -67,7 +68,7 @@ def load_contract(scene_dir, robot_archive, force_export_json=None) -> dict:
                 wrench_units=dict(force="N", moment="N m"), wrench_frame="sensor axes = EE axes",
                 R_ee_force_sensor=R_es.tolist(), known_transform="R_BS(t) = R_base_ee(t) R_ee_force_sensor (E1)",
                 transform_source=f"{tool_p} wrench_frame ({wf.get('alignment_source')}) + archive T_base_ee",
-                robot_tool_json=str(tool_p), robot_tool_sha256=_sha(tool_p),
+                robot_tool_json=str(tool_p), robot_tool_sha256=_sha(tool_p), tool_override=tool.get("tool_override"),
                 recorded_pose_frame=tool.get("recorded_pose_frame"),
                 moment_reference="ee_frame_origin (p_BE = T_base_ee[:3, 3]); wrench recorded in EE axes with the EE "
                                  "pose frame", recorded_torque_origin_note=wf.get("torque_origin"),

@@ -526,7 +526,8 @@ def build_robot_archive(scene, output):
     import polars as pl
     from scipy.spatial.transform import Rotation
     scene = Path(scene)
-    tool = json.loads((scene / "metadata" / "robot_tool.json").read_text())
+    from .robot_tool import load_robot_tool
+    tool = load_robot_tool(scene)                          # metadata/robot_tool.json + configs/robot_tool_overrides.json
     if tool.get("tcp_calibration_valid") is False:
         raise SystemExit(f"{scene.name}: robot_tool.json marks the TCP calibration invalid; refusing to build a TCP archive")
     if tool.get("recorded_pose_frame", "ee") != "ee":
@@ -544,8 +545,10 @@ def build_robot_archive(scene, output):
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     np.savez(output, T_base_ee=T_ee, T_base_tcp=T_ee @ T_ee_tcp, source_row=df["frame_index"].to_numpy(),
-             wrench=wr[:, :6])
-    _log(f"robot archive: {len(st)} rows, tool {tool.get('tool')}, T_ee_tcp z {T_ee_tcp[2, 3]:.4f} m -> {output}")
+             wrench=wr[:, :6], tool_override=np.array(json.dumps(tool.get("tool_override"))))
+    ov = tool.get("tool_override")
+    _log(f"robot archive: {len(st)} rows, tool {tool.get('tool')}, T_ee_tcp z {T_ee_tcp[2, 3]:.4f} m -> {output}" +
+         (f"; OPERATOR OVERRIDE {ov['status']}: {ov['decision']}" if ov else ""))
 
 
 def summarize_runs(runs, ref_axis=None, ref_point=None) -> str:
@@ -1015,9 +1018,10 @@ def main(argv=None):
         if args.tcp_npz is not None:
             from .tcp_contact import load_robot_contact_record
             from .wrench_physics import WrenchConvention
+            from .robot_tool import load_robot_tool
             meta = args.scene / "metadata"
             conv = WrenchConvention.from_scene_metadata(json.loads((meta / "contact_force_convention.json").read_text()),
-                                                        json.loads((meta / "robot_tool.json").read_text()))
+                                                        load_robot_tool(args.scene))
             flags = None
             contact = load_robot_contact_record(args.scene, obs.frame_map, tcp_npz=args.tcp_npz)
             if args.contact_force_threshold_n is not None and contact.wrench_sensor is not None:

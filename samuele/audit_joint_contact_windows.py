@@ -103,7 +103,8 @@ def main(argv=None):
     out.mkdir(parents=True, exist_ok=True)
     conv, parquet, info = locate_inputs(scene)
     ep = read_episode(parquet)
-    tool = json.loads((scene / "metadata" / "robot_tool.json").read_text())
+    from estimotion_2part.joint_discovery.robot_tool import load_robot_tool
+    tool = load_robot_tool(scene)                          # + configs/robot_tool_overrides.json
     if tool.get("tcp_calibration_valid") is False:
         raise SystemExit("TCP calibration marked invalid; refusing")
     t, fi, W, st = ep["timestamp"], ep["frame_index"], ep["wrench"], ep["state"]

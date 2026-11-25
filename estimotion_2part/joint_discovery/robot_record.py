@@ -127,7 +127,8 @@ def build_robot_record(scene, force_export_dir, robot_archive, contact_segments=
                          se_N=se.tolist(), status="INDEPENDENT_WINDOW_CONSISTENT" if ok else "INDEPENDENT_WINDOW_DRIFT")
     cams = json.loads((meta / "cameras.json").read_text())
     frames = {c.get("coordinate_frame") for c in cams["cameras"]}
-    tool = json.loads((meta / "robot_tool.json").read_text()) if (meta / "robot_tool.json").is_file() else {}
+    from .robot_tool import load_robot_tool
+    tool = load_robot_tool(meta.parent, required=False) or {}     # + configs/robot_tool_overrides.json
     reg = json.loads((meta / "robot_base_registration.json").read_text()) if (
         meta / "robot_base_registration.json").is_file() else {}
     gc = ann.get("gravity_compensation") or {}

@@ -36,6 +36,9 @@ from pathlib import Path
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))     # repo root: the shared robot_tool loader
+from estimotion_2part.joint_discovery.robot_tool import load_robot_tool  # noqa: E402
+
 STATE_CODES = {"contact": 1, "absent": 0, "uncertain": -1}
 STATE_NAMES = {v: k for k, v in STATE_CODES.items()}
 G_BASE = np.array([0.0, 0.0, -9.80665])  # base_link z up (robot base convention)
@@ -306,7 +309,7 @@ def export(scene, output, *, baseline_duration_s=DEFAULTS["baseline_duration_s"]
     conversion, parquet, info_path = locate_inputs(scene)
     info = json.loads(Path(info_path).read_text())
     tool_path = scene / "metadata/robot_tool.json"
-    tool = json.loads(tool_path.read_text()) if tool_path.is_file() else None
+    tool = load_robot_tool(scene, required=False)          # + configs/robot_tool_overrides.json (operator decisions)
     R_ee_sensor, wrench_frame = check_conventions(info, tool)
     ep = read_episode(parquet)
     order = np.argsort(ep["frame_index"])
@@ -380,7 +383,7 @@ def export(scene, output, *, baseline_duration_s=DEFAULTS["baseline_duration_s"]
             for e in result["episodes"]],
         thresholds=thresholds, gravity_compensation=gravity_info, manual_corrections=corrections_info,
         tare="baseline mean removed (recorded data appear pre-tared; residual bias re-estimated)",
-        wrench_frame=wrench_frame, counts_native=counts, counts_rgbd=rgbd_counts, rgbd_alignment=rgbd,
+        wrench_frame=wrench_frame, tool_override=(tool or {}).get("tool_override"), counts_native=counts, counts_rgbd=rgbd_counts, rgbd_alignment=rgbd,
         sources=dict(scene=str(scene), parquet=str(parquet), parquet_sha256=sha256_file(parquet),
                      info=str(info_path), robot_tool=str(tool_path) if tool else None,
                      real_conversion_sha256=sha256_file(scene / "metadata/real_conversion.json")),

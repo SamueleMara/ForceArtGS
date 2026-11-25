@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "description": "Operator decisions that REPLACE fields of a scene's metadata/robot_tool.json at read time (the raw scene is never modified). Applied by estimotion_2part/joint_discovery/robot_tool.py:load_robot_tool and recorded in every output that uses it.",
+  "scenes": {
+    "white_drawer_20261021_161154_episode_000000": {
+      "decision": "operator 2026-11-25: run the white drawer with the bare force sensor EE settings",
+      "status": "OPERATOR_NOMINAL_BARE_FORCE_SENSOR",
+      "caveat": "the 2026-11-12 review (different, early force-sensor mounting; old transform unknown) is NOT resolved: TCP offset and sensor axes are the nominal bare-sensor values, not a calibration of this mounting",
+      "set": {
+        "tool": "bare_force_sensor",
+        "T_ee_tcp": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0.03487365], [0, 0, 0, 1]],
+        "wrench_frame": {
+          "axes": "ee",
+          "R_ee_force_sensor": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+          "alignment_source": "operator 2026-11-25: bare force sensor EE settings (nominal; sensor axes = EE axes)",
+          "torque_origin": "recorded_origin_unspecified; not assumed to coincide with TCP",
+          "tcp_torque_transport_applied": false
+        },
+        "tcp_calibration_valid": true,
+        "calibration_status": "OPERATOR_NOMINAL_BARE_FORCE_SENSOR (mounting unverified)"
+      }
+    }
+  }
+}

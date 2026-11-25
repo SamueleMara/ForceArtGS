@@ -67,7 +67,8 @@ class WrenchCalibration:
 
         Declarations become ``DECLARED`` (never ``VERIFIED``)."""
         meta = Path(scene) / "metadata"
-        tool = json.loads((meta / "robot_tool.json").read_text())
+        from .robot_tool import load_robot_tool
+        tool = load_robot_tool(scene)                       # + configs/robot_tool_overrides.json
         conv_p = meta / "contact_force_convention.json"
         conv = json.loads(conv_p.read_text()) if conv_p.is_file() else {}
         wf = tool.get("wrench_frame", {})
