@@ -280,3 +280,84 @@ class IsolatedSapienCpu:
         if isinstance(self._run, _Worker):
             self._run.close()
         self._tmp.cleanup()
+
+
+class IsolatedSapienGpu(IsolatedSapienCpu):
+    """The same isolated one-joint replay on PhysX **GPU** (sapien.physx.PhysxGpuSystem, CUDA), BATCHED: ``batch``
+    rolls out many candidates of one episode in parallel sub-scenes (one GPU call per DE generation / Jacobian /
+    profile slice). Same step law, friction surrogate, passive-term zeroing and per-candidate readback checks as the
+    CPU runner; parity against it is tested. ``__call__`` = a batch of one (slow: the GPU pays per step, not per env).
+    Always runs in the engine interpreter's worker process (CUDA context isolated from the estimator)."""
+
+    def __init__(self, urdf, *, moving_link, joint_name, dt=1 / 1000, gravity=(0., 0., -9.81),
+                 friction_mode="external_effort_surrogate", python=None, readback_rtol=1e-4, device="cuda"):
+        py = python or default_engine_python()
+        if py is None:
+            raise RuntimeError("no SAPIEN interpreter: set PARTTWIN1D_PYTHON")
+        super().__init__(urdf, moving_link=moving_link, joint_name=joint_name, dt=dt, gravity=gravity,
+                         friction_mode=friction_mode, python=py, readback_rtol=readback_rtol)
+        self.device = device
+        self.n_batches = 0
+
+    def _check(self, theta, rb, q):
+        I_engine = readback_axis_inertia(rb, self.axis["axis_link"], self.axis["joint_type"])
+        I_expect = theta.rho_scale * self.axis["axis_inertia"]
+        if abs(I_engine - I_expect) > self.readback_rtol * max(abs(I_expect), 1e-12) + 1e-9:
+            raise RuntimeError(f"engine axis inertia {I_engine:.9g} != scaled URDF {I_expect:.9g}")
+        if abs(float(rb["armature"][0]) - theta.armature) > 1e-6 * max(1.0, theta.armature):
+            raise RuntimeError("armature readback mismatch")
+        lim = np.asarray(rb.get("qlimits") or [[-np.inf, np.inf]], float).reshape(-1, 2)[0]
+        if np.isfinite(lim).all() and (q.min() <= lim[0] + 1e-6 or q.max() >= lim[1] - 1e-6):
+            raise RuntimeError("rollout reached a joint limit (limit impulse in an assumed sliding window)")
+        return I_engine, I_expect
+
+    def batch(self, thetas, ep: Episode) -> list:
+        """Rollouts of every theta on ONE episode; a candidate that fails its checks returns its exception."""
+        thetas = list(thetas)
+        for th in thetas:
+            if th.static_effort > th.dynamic_effort + 1e-12:
+                raise ValueError("SAPIEN surrogate cannot reproduce static breakaway: use native PhysX axis friction")
+            if self.friction_mode == "frictionless_physx" and (th.dynamic_effort or th.viscous):
+                raise ValueError("frictionless_physx cannot identify nonzero friction")
+        forced = ep.mode == "forced"
+        req = dict(kind="batch_gpu", device=self.device, moving_link=self.moving_link, joint_name=self.joint_name,
+                   timestep=self.dt, gravity=self.gravity.tolist(), friction_mode=MODES[self.friction_mode],
+                   candidates=[dict(urdf=str(self._scaled(th.rho_scale)), viscous=float(th.viscous),
+                                    dynamic_effort=float(th.dynamic_effort), armature=float(th.armature),
+                                    effective_inertia=self.effective_inertia(th)) for th in thetas],
+                   q0=float(ep.q0), v0=float(ep.v0), t0=float(ep.t_s[0]), t_query=ep.t_s.tolist(),
+                   effort_t_s=(ep.input_t_s.tolist() if forced else [float(ep.t_s[0])]),
+                   effort_levels=(ep.input_effort.tolist() if forced else [0.0]))
+        out = self._run(req)
+        self.n_batches += 1
+        self.n_rollouts += len(thetas)
+        res = []
+        for i, th in enumerate(thetas):
+            rb = out["readback"][i]
+            q = np.asarray(out["q"][i], float)
+            try:
+                if not np.isfinite(q).all():
+                    raise RuntimeError("non-finite GPU rollout")
+                I_engine, I_expect = self._check(th, rb, q)
+            except RuntimeError as e:
+                res.append(e)
+                continue
+            res.append(SimulationResult(q, np.asarray(out["qdot"][i], float), backend="sapien_physx_gpu",
+                                        engine_version=out.get("sapien_version"),
+                                        runtime_semantics=out["runtime_semantics"],
+                                        diagnostics=dict(axis_inertia_engine=I_engine, axis_inertia_expected=I_expect,
+                                                         external_impulse=out["external_impulse"][i],
+                                                         friction_impulse=out["friction_impulse"][i],
+                                                         v_eps=out["v_eps"][i],
+                                                         engine_defaults_as_loaded=out["engine_defaults_as_loaded"][i],
+                                                         readback=rb, process=self.backend_process,
+                                                         device=out.get("device"), gpu_backend=out.get("backend"),
+                                                         n_contacts=0, contact_note=out.get("contact_note"),
+                                                         sleeping_at_end=None)))
+        return res
+
+    def __call__(self, theta: PhysicalParameters, ep: Episode) -> SimulationResult:
+        r = self.batch([theta], ep)[0]
+        if isinstance(r, Exception):
+            raise r
+        return r

@@ -70,6 +70,8 @@ def _full_inertia(principal, q_wxyz):
 def run_request(r):
     if r.get("kind") == "capabilities":
         return capabilities()
+    if r.get("kind") == "batch_gpu":
+        return run_batch_gpu(r)
     import sapien
     import sapien.physx as px
     dt = float(r["timestep"])
@@ -189,6 +191,157 @@ def run_request(r):
                 moving_link_sleeping_at_end=bool(ml.sleeping) if hasattr(ml, "sleeping") else None,
                 runtime_semantics=("EXPLICIT_FRICTION_SURROGATE_NOT_NATIVE" if mode == "external_effort_surrogate"
                                    else "FRICTIONLESS_NATIVE_PHYSX"))
+
+
+def run_batch_gpu(r):
+    """BATCHED rollout on PhysX GPU (sapien.physx.PhysxGpuSystem): one sub-scene per candidate (its own mass-scaled
+    URDF, viscous / Coulomb surrogate, armature), ONE shared episode (q0, v0, t0, query times, ZOH effort). Same step
+    law as ``run_request`` (read qvel -> explicit surrogate -c v - Td sat(v/v_eps) + recorded effort -> set qf -> step)
+    and the same passive-term zeroing + readback, per candidate. Links carry no collision shapes (checked)."""
+    import sapien
+    import sapien.physx as px
+    import torch
+    dt = float(r["timestep"])
+    mode = r["friction_mode"]
+    if mode not in ("frictionless", "external_effort_surrogate"):
+        raise ValueError(f"friction_mode {mode!r}")
+    cands = r["candidates"]
+    n_c = len(cands)
+    if n_c == 0:
+        raise ValueError("empty batch")
+    c = np.array([float(k.get("viscous", 0.0)) for k in cands])
+    Td = np.array([float(k.get("dynamic_effort", 0.0)) for k in cands])
+    I_eff = np.array([float(k.get("effective_inertia") or 0.0) for k in cands])
+    if mode == "frictionless" and (np.any(c != 0) or np.any(Td != 0)):
+        raise ValueError("frictionless mode with nonzero friction")
+    if np.any((Td > 0) & ~(I_eff > 0)):
+        raise ValueError("Coulomb surrogate needs the effective joint inertia")
+    px.enable_gpu()
+    cfg = px.PhysxSceneConfig()
+    cfg.gravity = np.asarray(r["gravity"], np.float32)
+    px.set_scene_config(cfg)
+    sysg = px.PhysxGpuSystem(device=r.get("device", "cuda"))
+    sysg.set_timestep(dt)
+    scenes, rbs, loaded = [], [], []
+    for i, k in enumerate(cands):
+        sc = sapien.Scene([sysg])
+        sysg.set_scene_offset(sc, [float(i) * 20.0, 0.0, 0.0])
+        ld = sc.create_urdf_loader()
+        ld.fix_root_link = True
+        art = ld.load(k["urdf"])
+        if art is None:
+            raise RuntimeError(f"SAPIEN failed to load {k['urdf']}")
+        joints = [j for j in art.active_joints if j.name == r["joint_name"]]
+        if len(joints) != 1 or len(art.active_joints) != 1:
+            raise ValueError("G10 runner requires exactly one active joint named " + repr(r["joint_name"]))
+        j = joints[0]
+        links = {ln.name: ln for ln in art.links}
+        ml = links[r["moving_link"]]
+        loaded.append(dict(joint_friction=float(j.friction), joint_damping=float(j.damping),
+                           link_linear_damping={n: float(v.linear_damping) for n, v in links.items()},
+                           link_angular_damping={n: float(v.angular_damping) for n, v in links.items()}))
+        j.set_drive_properties(0.0, 0.0)
+        j.set_friction(0.0)
+        j.set_armature(np.array([float(k.get("armature", 0.0))], np.float32))
+        for ln in links.values():
+            ln.set_linear_damping(0.0)
+            ln.set_angular_damping(0.0)
+        p = ml.cmass_local_pose
+        n_shapes = sum(len(ln.collision_shapes) for ln in links.values())
+        rb = dict(joint_friction=float(j.friction), joint_damping=float(j.damping), joint_stiffness=float(j.stiffness),
+                  armature=np.asarray(j.armature, float).tolist(),
+                  link_linear_damping={n: float(v.linear_damping) for n, v in links.items()},
+                  link_angular_damping={n: float(v.angular_damping) for n, v in links.items()},
+                  sleep_threshold=0.0, moving_mass=float(ml.mass),
+                  moving_principal_inertia=np.asarray(ml.inertia, float).tolist(),
+                  moving_cmass_local_p=np.asarray(p.p, float).tolist(),
+                  moving_cmass_local_q_wxyz=np.asarray(p.q, float).tolist(), joint_type=str(j.type),
+                  qlimits=np.asarray(art.qlimit, float).tolist(),
+                  drive_target=np.asarray(j.drive_target, float).tolist(),
+                  drive_velocity_target=np.asarray(j.drive_velocity_target, float).tolist(),
+                  timestep=float(sysg.get_timestep()), gravity=np.asarray(px.get_scene_config().gravity, float).tolist(),
+                  solver_iterations=[int(art.solver_position_iterations), int(art.solver_velocity_iterations)],
+                  n_collision_shapes=int(n_shapes), sleeping="NOT_APPLICABLE_GPU (no sleeping on the GPU pipeline)")
+        Jm = _full_inertia(rb["moving_principal_inertia"], rb["moving_cmass_local_q_wxyz"])
+        rb["moving_inertia_tensor_cmass_link_frame"] = Jm.tolist()
+        rb["moving_inertia_spd"] = bool(np.min(np.linalg.eigvalsh(0.5 * (Jm + Jm.T))) > 0)
+        bad = [kk for kk in ("joint_friction", "joint_damping", "joint_stiffness") if abs(rb[kk]) > 1e-9]
+        bad += [f"{kk}:{n}" for kk in ("link_linear_damping", "link_angular_damping") for n, v in rb[kk].items()
+                if abs(v) > 1e-9]
+        if abs(rb["timestep"] - dt) > 1e-6 * dt:
+            bad.append(f"timestep {rb['timestep']} != {dt}")
+        if np.max(np.abs(np.asarray(rb["gravity"]) - np.asarray(r["gravity"], float))) > 1e-5:
+            bad.append(f"gravity {rb['gravity']} != {r['gravity']}")
+        if not rb["moving_inertia_spd"] or not rb["moving_mass"] > 0:
+            bad.append("moving link mass / inertia not physical")
+        if n_shapes:
+            bad.append(f"{n_shapes} collision shape(s): the isolated joint replay must be contact-free by construction")
+        if bad:
+            raise RuntimeError(f"candidate {i}: passive engine terms / setup not clean after zeroing: {bad}")
+        scenes.append(sc)
+        rbs.append(rb)
+    sysg.gpu_init()
+    dev = torch.device(r.get("device", "cuda"))
+    qpos, qvel, qf = (sysg.cuda_articulation_qpos.torch(), sysg.cuda_articulation_qvel.torch(),
+                      sysg.cuda_articulation_qf.torch())
+    if qpos.shape[0] != n_c:
+        raise RuntimeError(f"GPU articulation count {qpos.shape[0]} != {n_c}")
+    t0 = float(r["t0"])
+    tq = np.asarray(r["t_query"], float)
+    steps = np.rint((tq - t0) / dt).astype(np.int64)
+    if steps[0] < 0 or np.any(np.diff(steps) < 0):
+        raise ValueError("query times must be >= t0 and nondecreasing")
+    tf = np.asarray(r.get("effort_t_s", [t0]), float)
+    lev = np.asarray(r.get("effort_levels", [0.0]), float)
+    if len(tf) != len(lev) or len(tf) == 0 or _zoh_index(tf, t0) < 0:
+        raise ValueError("effort timeline invalid or starts after t0 (no extrapolation)")
+    qpos[:, 0] = float(r["q0"])
+    qvel[:, 0] = float(r["v0"])
+    sysg.gpu_apply_articulation_qpos()
+    sysg.gpu_apply_articulation_qvel()
+    sysg.gpu_update_articulation_kinematics()
+    c_t = torch.tensor(c, dtype=torch.float32, device=dev)
+    Td_t = torch.tensor(Td, dtype=torch.float32, device=dev)
+    veps = torch.tensor(np.where(Td > 0, Td * dt / np.maximum(I_eff, 1e-30), 1.0), dtype=torch.float32, device=dev)
+    fric = mode == "external_effort_surrogate"
+    nq = len(tq)
+    Q, V = np.empty((n_c, nq)), np.empty((n_c, nq))
+    Je, Jf = np.zeros((n_c, nq)), np.zeros((n_c, nq))
+    je = torch.zeros(n_c, dtype=torch.float64, device=dev)
+    jf = torch.zeros(n_c, dtype=torch.float64, device=dev)
+    k = 0
+    for n in range(int(steps[-1]) + 1):
+        need_state = fric or (k < nq and steps[k] == n)
+        if need_state:
+            sysg.gpu_fetch_articulation_qvel()
+        if k < nq and steps[k] == n:
+            sysg.gpu_fetch_articulation_qpos()
+            qp, qv = qpos[:, 0].double().cpu().numpy(), qvel[:, 0].double().cpu().numpy()
+            jeh, jfh = je.cpu().numpy(), jf.cpu().numpy()
+            while k < nq and steps[k] == n:
+                Q[:, k], V[:, k], Je[:, k], Jf[:, k] = qp, qv, jeh, jfh
+                k += 1
+        if n == steps[-1]:
+            break
+        t = t0 + n * dt
+        Qe = float(lev[_zoh_index(tf, t)])
+        if fric:
+            v = qvel[:, 0]
+            Qf = -c_t * v - Td_t * torch.clamp(v / veps, -1.0, 1.0)
+        else:
+            Qf = torch.zeros(n_c, dtype=torch.float32, device=dev)
+        qf[:, 0] = Qe + Qf
+        sysg.gpu_apply_articulation_qf()
+        sysg.step()
+        je += Qe * dt
+        jf += Qf.double() * dt
+    return dict(sapien_version=sapien.__version__, backend="PhysX GPU (sapien.physx.PhysxGpuSystem, CUDA)",
+                device=str(dev), n_candidates=n_c, q=Q.tolist(), qdot=V.tolist(), timestep=dt,
+                n_steps=int(steps[-1]), gravity=list(map(float, cfg.gravity)), friction_mode=mode,
+                v_eps=[float(x) if t_ > 0 else 0.0 for x, t_ in zip(veps.cpu().numpy(), Td)],
+                external_impulse=Je.tolist(), friction_impulse=Jf.tolist(), engine_defaults_as_loaded=loaded,
+                readback=rbs, n_contacts=0, contact_note="no collision shapes on any link (checked per candidate)",
+                runtime_semantics=("EXPLICIT_FRICTION_SURROGATE_NOT_NATIVE" if fric else "FRICTIONLESS_NATIVE_PHYSX"))
 
 
 def serve():

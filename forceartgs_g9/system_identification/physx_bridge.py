@@ -49,15 +49,18 @@ def g10_parameters(M, lam, gam, axis_inertia_unit, armature=0.0):
     return PhysicalParameters(rho, armature, Td, Td, M * (lam or 0.0), inertia_scale_source="IO_RESPONSE_MAPPING")
 
 
-def initialize_physx_refinement(io_result: dict, existing_g10_config: dict, existing_g10_episodes) -> dict:
+def initialize_physx_refinement(io_result: dict, existing_g10_config: dict, existing_g10_episodes,
+                                require_same_windows: bool = True) -> dict:
     """``existing_g10_config``: {fitting: {bounds: ...}, axis_inertia: I_h(rho_s = 1), prior_rho_range?};
-    ``existing_g10_episodes``: the G10 Episodes. The io windows must be the SAME episodes on the same clock."""
+    ``existing_g10_episodes``: the G10 Episodes. The io windows must be the SAME episodes on the same clock, unless
+    ``require_same_windows`` is False (the behavioral full-demo replay: the io windows are segmented sub-windows of the
+    same demonstration and x0 is ONLY a search start, scored like any other candidate)."""
     from .contracts import SCHEMA
     if io_result.get("schema") != SCHEMA:
         raise ValueError(f"io_result schema {io_result.get('schema')!r} != {SCHEMA}")
     io_w = {k: v["t"] for k, v in (io_result.get("episodes") or {}).items()}
     mism = []
-    for e in existing_g10_episodes:
+    for e in (existing_g10_episodes if require_same_windows else []):
         w = io_w.get(e.name)
         if w is None:
             mism.append(f"{e.name}: not in the io identification")

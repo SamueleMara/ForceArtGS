@@ -11,6 +11,12 @@
         --run RUN --scene SCENE [--robot-archive A.npz] [--contact-segments C.yaml] [--discovery-dir D]
         [--pulse-rows A:B] [--declared-joint-type T --declaration-note N]
         (ForceTwin-adaptation: identifiability-first effective I_eff / mu / b; append-only forcetwin_adaptation/vNNN)
+    python -m forceartgs_g9.cli physx-behavioral-wrench --run RUN --scene SCENE [--robot-archive NPZ] [--quick]
+        (G10: full six-axis wrench -> joint effort, contact always on, ONE PhysX rollout from (q_visual(t0), 0);
+         append-only <run>/dynamics/g9/physx_behavioral_wrench/vNNN; behavioral simulator candidate)
+    python -m forceartgs_g9.cli physx-behavioral-replay --run RUN --scene SCENE [--behavioral-config CFG] [--quick]
+        (G10-A: one continuous PhysX replay of the whole demonstration from rest under the recorded effort;
+         append-only <run>/dynamics/g9/physx_behavioral/vNNN; behavioral candidate, never physical identification)
     python -m forceartgs_g9.cli physx-refinement --run RUN --scene SCENE [--quick] [--pulse-rows A:B] ...
         (G10: SAPIEN PhysX CPU diagnostic refinement; append-only <run>/dynamics/g9/physx_refinement/vNNN)
         [--use-io-initialization [IO_RESPONSE]]  (warm start from the input-output identification)
@@ -118,6 +124,37 @@ def main(argv=None) -> int:
     io.add_argument("--engine-python", default=None, help="SAPIEN interpreter for the PhysX reconciliation")
     io.add_argument("--no-physx", action="store_true", help="skip the PhysX reconciliation rollouts")
     io.add_argument("--out-root", default=None)
+    bh = sub.add_parser("physx-behavioral-replay", help="G10-A behavioral full-demo PhysX replay from rest (opt-in) "
+                                                        "-> <run>/dynamics/g9/physx_behavioral/vNNN")
+    bh.add_argument("--run", required=True)
+    bh.add_argument("--scene", required=True)
+    bh.add_argument("--behavioral-config", default="configs/g9_real/physx_behavioral_full_demo.yaml")
+    bh.add_argument("--robot-archive", default=None)
+    bh.add_argument("--contact-segments", default=None)
+    bh.add_argument("--pulse-rows", default=None, help="A:B declared pulse source rows (impulse audit -> diagnostic)")
+    bh.add_argument("--declared-joint-type", default=None, choices=("revolute", "prismatic"))
+    bh.add_argument("--declaration-note", default=None)
+    bh.add_argument("--engine-python", default=None, help="SAPIEN interpreter (default $PARTTWIN1D_PYTHON / parttwin_sim)")
+    bh.add_argument("--io-response", default=None, help="io_response.json for the warm start (default: the latest "
+                                                        "<run>/dynamics/g9/io_identification/vNNN)")
+    bh.add_argument("--quick", action="store_true", help="tiny optimiser budget (smoke test only)")
+    bh.add_argument("--out-root", default=None)
+    bw = sub.add_parser("physx-behavioral-wrench", help="G10 wrench-driven behavioral PhysX calibration (full six-axis "
+                                                        "wrench, contact always on, v0 = 0) -> "
+                                                        "<run>/dynamics/g9/physx_behavioral_wrench/vNNN")
+    bw.add_argument("--run", required=True)
+    bw.add_argument("--scene", required=True)
+    bw.add_argument("--robot-archive", default=None, help="existing robot_archive.npz (default: the canonical record's)")
+    bw.add_argument("--behavioral-config", default="configs/g9_real/physx_behavioral_full_wrench.yaml")
+    bw.add_argument("--contact-segments", default=None, help="EXISTING force-peak + visual contact segments "
+                                                             "(configs/contact_intervals/<scene>.yaml): the interaction")
+    bw.add_argument("--pulse-rows", default=None, help="A:B source rows for the full-vs-force-only comparison")
+    bw.add_argument("--declared-joint-type", default=None, choices=("revolute", "prismatic"))
+    bw.add_argument("--declaration-note", default=None)
+    bw.add_argument("--engine-python", default=None, help="SAPIEN interpreter (default $PARTTWIN1D_PYTHON / parttwin_sim)")
+    bw.add_argument("--io-response", default=None, help="optional io_response.json warm start (default: latest)")
+    bw.add_argument("--quick", action="store_true", help="tiny optimiser budget (smoke test only, not a calibration)")
+    bw.add_argument("--out-root", default=None)
     c = sub.add_parser("compare-dynamics", help="aggregate forcetwin_adaptation comparison tables")
     c.add_argument("--root", required=True, help="directory with *_joint_aware_full runs")
     c.add_argument("--out", required=True)
@@ -129,6 +166,24 @@ def main(argv=None) -> int:
                     contact_segments=a.contact_segments, pulse_rows=pr, out_root=a.out_root,
                     declared_joint_type=a.declared_joint_type, declaration_note=a.declaration_note,
                     python=a.engine_python, no_physx=a.no_physx)
+        print(json.dumps(st, indent=1, default=str))
+        return 0
+    if a.cmd == "physx-behavioral-wrench":
+        from .physx_refinement.behavioral_wrench_real import run as bw_run
+        pr = tuple(int(x) for x in a.pulse_rows.split(":")) if a.pulse_rows else None
+        st = bw_run(a.run, a.scene, behavioral_config=a.behavioral_config, robot_archive=a.robot_archive,
+                    contact_segments=a.contact_segments, pulse_rows=pr, out_root=a.out_root, declared_joint_type=a.declared_joint_type,
+                    declaration_note=a.declaration_note, quick=a.quick, python=a.engine_python,
+                    io_response=a.io_response)
+        print(json.dumps(st, indent=1, default=str))
+        return 0
+    if a.cmd == "physx-behavioral-replay":
+        from .physx_refinement.behavioral_real import run as bh_run
+        pr = tuple(int(x) for x in a.pulse_rows.split(":")) if a.pulse_rows else None
+        st = bh_run(a.run, a.scene, behavioral_config=a.behavioral_config, robot_archive=a.robot_archive,
+                    contact_segments=a.contact_segments, pulse_rows=pr, out_root=a.out_root,
+                    declared_joint_type=a.declared_joint_type, declaration_note=a.declaration_note, quick=a.quick,
+                    python=a.engine_python, io_response=a.io_response)
         print(json.dumps(st, indent=1, default=str))
         return 0
     if a.cmd == "physx-refinement":

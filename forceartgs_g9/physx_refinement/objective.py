@@ -30,6 +30,10 @@ class Episode:
     used_for_training: bool = True
     exploratory_assumptions_accepted: bool = False
     sigma_v0: float | None = None
+    # what 'mode' means for THIS episode (provenance only; legacy default = a classifier-segmented regime window).
+    # The behavioral full-demo adapter sets 'behavioral_full_demo': mode 'forced' then means "the recorded
+    # generalized effort is applied throughout", NOT that contact was proven at every instant.
+    regime_semantics: str = "segmented_regime_window"
 
     def __post_init__(self):
         for k in ("t_s", "q", "sigma_q", "input_t_s", "input_effort"):
@@ -191,6 +195,22 @@ class RefinementLoss:
 
     def __call__(self, theta: PhysicalParameters):
         return self.evaluate(theta)["objective"]
+
+    def objective_many(self, thetas):
+        """Objectives of many candidates (None for a failed rollout). When the rollout can ``prefetch`` (a batched
+        engine, e.g. PhysX GPU), every episode is simulated for all candidates in one batched call first; the loss
+        itself is the SAME ``evaluate`` as for a single candidate."""
+        thetas = list(thetas)
+        if hasattr(self.rollout, "prefetch"):
+            for ep in self.episodes:
+                self.rollout.prefetch(thetas, ep)
+        out = []
+        for th in thetas:
+            try:
+                out.append(self.evaluate(th)["objective"])
+            except (ValueError, FloatingPointError, RuntimeError):
+                out.append(None)
+        return out
 
 
 def effective_joint_inertia(*, joint_type: str, axis, hinge_origin, com,

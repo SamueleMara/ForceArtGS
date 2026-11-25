@@ -1,0 +1,87 @@
+# G10-A behavioral replay, EXPLICIT OPT-IN: the joint authority starts after the recording start (cropped clip);
+# v0 = 0 is accepted only when the first authority samples pass the rest test (H0: v = 0) and the force record covers t0.
+# Unknown keys are rejected; every field is wired (forceartgs_g9/physx_refinement/behavioral_contracts.py).
+schema: forceartgs.g10.behavioral_fit/v1
+enabled: true
+inputs:
+  free_forced_config: configs/g9_real/free_forced.yaml   # same G9 dynamics config + classifier (evidence only)
+initial_state:
+  mode: rest_verified_cropped_start
+  require_complete_demo_start: false
+  initial_q: visual_authority          # q0 = q_authority(t0), never imposed
+  initial_velocity_rad_or_m_per_s: 0.0 # user rest contract: exactly 0
+  optimize_q0: false
+  optimize_v0: false
+  rest_check_window_s: 0.4             # H0: v(t0) = 0 consistency gate (never used as v0)
+  rest_check_min_samples: 4
+  rest_check_k_sigma: 3.0
+  rest_check_input_onset_k_sigma: 3.0   # only samples before the measured input onset are tested
+  rest_check_input_onset_rows: 3
+input:
+  mode: canonical_measured_generalized_effort
+  include_unknown_contact_conditionally: true
+  preserve_original_force_sign: true
+  missing_effort_policy: refuse_full_replay
+  max_row_gap_factor: 1.5
+  uncertainty_sensitivity: true
+  time_offset_rows: [-1, 1]
+  noise_realizations: 2
+  contact_interpretation_hypotheses: true
+  near_zero_k_sigma: 2.0
+model:
+  mass_mode: uniform_solid
+  armature: 0.0
+  friction_mode: external_effort_surrogate
+  physical_bounds_source: existing_g10_and_geometry_prior
+  rho_bounds: [0.1, 10.0]
+  lam_max: 20.0
+  gam_max: 20.0
+  effort_bound_factor: 3.0
+simulation:
+  engine: sapien_cpu_diagnostic
+  timestep: 0.001
+  require_clean_passive_readback: true
+  full_continuous_rollout: true
+  python: null
+loss:
+  primary: robust_position_output_error
+  huber_delta: 2.0
+  numeric_floor_q: 0.0003
+  increment_weight: 0.0
+  event_weight: 0.0
+  optimize_initial_velocity: false
+  optimize_initial_position: false
+  adequacy_sigma: 3.0
+fitting:
+  seed: 0
+  maxiter: 40
+  popsize: 8
+  polish: true
+  tol: 0.001
+  initialize_from_io: true
+  profile_near_optimal_family: true
+  profile_parameters: [rho_scale, viscous, dynamic_effort]
+  local_refine: true                   # bounded robust TRF after DE on the same PhysX residuals
+  local_diff_step: 0.001               # must exceed float32 engine-state resolution (default SciPy step = no-op)
+  local_max_nfev: 200                  # per start, shared by its restarts
+  local_restarts: 3                    # TRF restarts from its end point (trust-region reset)
+  local_starts: 3
+  profile_points: 7
+  profile_inner_max_nfev: 60
+  family_tolerance_sigma: 0.5          # engineering tolerance on rmse/sigma (NOT a confidence interval)
+alternatives:
+  zero_gravity_load: true
+  maxiter: 15
+  popsize: 6
+  local_max_nfev: 100
+policy_probe:
+  enabled: true
+  duration_s: 2.0
+  push_fraction: 0.5
+  amplitude_factor: 1.0
+output:
+  append_only: true
+  write_behavioral_candidate: true
+  allow_preview_without_unique_physical_id: true
+  require_independent_episode_for_validated_transfer: true
+  do_not_modify_certified_g9_handoff: true

@@ -1,0 +1,100 @@
+# G10 wrench-driven behavioral PhysX calibration -- SIMPLIFIED "easy first" model.
+# Full model = inertia + viscous damping + Coulomb friction + gravity. Here gravity and Coulomb friction are OFF:
+# PhysX integrates I q'' = Q_full - c q' (Q_full = full six-axis wrench effort inside the existing contact segments,
+# zero outside) from (q_visual(t0), 0); fitted: rho_scale (axis inertia) and viscous c. Same input, contact window,
+# start state, engine (PhysX GPU) and loss as physx_behavioral_full_wrench.yaml; only physics / fitting differ.
+#   BEH_CONFIG=configs/g9_real/physx_behavioral_inertia_damping.yaml bash pipelines/g9_physx_behavioral_full_wrench_real.sh
+# Strict schema: unknown or banned keys (recalibrate / tare / contact detection / contact point / prefix velocity) are
+# rejected; every key below is wired (forceartgs_g9/physx_refinement/behavioral_contracts.py: load_wrench_config).
+schema: forceartgs.g10.behavioral_wrench/v2
+enabled: true
+experimental_facts:                       # GIVEN by the experiment owner
+  known_sensor_to_global_transform: true  # use the existing archive / robot_tool.json transform, never re-estimate
+  wrench_already_tared_at_start: true     # never an additional tare
+  contact_on_during_interaction: true     # ON inside the EXISTING force-peak + visual segments, OFF (zero effort) outside
+  initial_joint_velocity: 0.0             # exact and fixed, at the interaction start (at rest before contact)
+inputs:
+  dynamics_config: configs/g9_real/forcetwin_effective.yaml   # base G9 config: gravity, mass geometry, authority
+initial_state:
+  q0_source: first_visual_joint_observation
+  require_full_demonstration_start: true
+  optimize_q0: false
+  optimize_v0: false
+  v0_nuisance_bound_sd: 0.0
+input:
+  source: native_full_six_axis_tared_wrench
+  coordinate_transform: existing_known_global_robot_transform
+  projection: full_wrench_joint_screw
+  moment_reference: from_contract         # EE frame origin (robot_tool.json wrench_frame axes = ee)
+  apply_transform_once: true
+  additional_tare: false
+  contact_classifier: disabled            # no NEW classification; the existing segments are only read
+  interaction_segments: existing_force_peak_visual_segments   # --contact-segments configs/contact_intervals/<scene>.yaml
+  interaction_segments_required: true
+  outside_interaction_effort: zero_contact_off
+  include_post_interaction_coast: true    # free motion after release (zero effort) to the end of the visual q
+  use_every_valid_measured_sample: true
+  input_interpolation: forward_zoh
+  missing_input: report_input_coverage_error
+  max_row_gap_factor: 1.5
+  compare_legacy_tcp_force_only: true
+  compare_alternative_moment_origin: true # TCP-origin reading: diagnostic only, never fitted
+  noise_baseline_s: 0.5                   # moment-noise level (MAD) from the first 0.5 s; a noise level, not a tare
+  uncertainty_sensitivity: true
+  time_offset_rows: [-1, 1]
+  noise_realizations: 2
+physics:
+  engine: sapien_gpu_physx                # PhysX GPU, batched sub-scenes (sapien_cpu_diagnostic: parity checks only)
+  device: cuda
+  gravity: zero                           # simplified model: no gravity load (labelled, not measured)
+  coulomb_friction: "off"                 # Coulomb friction Td = 0, not searched
+  friction_mode: external_effort_surrogate # realizes the viscous term -c v (explicit joint effort, not native)
+  timestep_s: 0.001
+  fixed_armature: 0.0
+  static_excess: 0.0
+  zero_and_readback_hidden_passive_terms: true
+  mass_mode: uniform_solid
+  python: null
+loss:
+  objective: full_trajectory_physx_position_output_error
+  huber_delta: 2.0
+  numeric_floor_q: 0.0003
+  fit_initial_velocity: false
+  increment_weight: 0.0
+  adequacy_sigma: 3.0                     # BEHAVIORAL_FIT_OK threshold on rmse / sqrt(sigma_q^2 + sigma_num^2)
+fitting:
+  bounds: existing_g10_geometry_constrained
+  rho_bounds: [0.01, 100.0]               # wide: no gravity / friction to anchor the scale, let the data choose
+  lam_max: 20.0
+  gam_max: 20.0
+  effort_bound_factor: 3.0
+  use_optional_g9_io_warmstart: false    # the io fit includes gravity + Coulomb friction: not this model
+  seed: 0
+  maxiter: 40
+  popsize: 150                            # x2 dims = 300 candidates per GPU batch (GPU cost is per call, not per candidate)
+  tol: 0.001
+  polish: true                            # local refinement after DE (GPU: batched lockstep LM; CPU: robust TRF)
+  local_diff_step: 0.001                  # must exceed the float32 engine-state resolution
+  local_max_nfev: 200
+  local_restarts: 3
+  local_starts: 3
+  collect_near_optimal_candidates: true
+  profile_parameters: [rho_scale, viscous]  # the two free parameters
+  profile_points: 15
+  profile_inner_max_nfev: 60
+  family_tolerance_sigma: 0.5             # engineering tolerance, NOT a confidence interval
+diagnostics:
+  zero_gravity_alternative: false         # gravity is already zero in the main fit
+  alternative_maxiter: 15
+  alternative_popsize: 6
+  alternative_local_max_nfev: 100
+  policy_probe: true
+  probe_duration_s: 2.0
+  probe_push_fraction: 0.5
+  probe_amplitude_factor: 1.0
+output:
+  append_only: true
+  save_best_numeric_candidate_even_if_inadequate: true
+  require_heldout_for_demo_fit: false
+  retain_certified_export_rules: true
+  write_candidate_urdf: true

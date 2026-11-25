@@ -31,6 +31,7 @@ class FitConfiguration:
     tol: float = 1e-3
     max_failed_fraction: float = 0.5
     v0_nuisance_bound_sd: float = 0.0   # > 0: per-training-episode v0 offset in +-k sigma_v0 (needs loss opt-in)
+    vectorized: bool = False            # evaluate each DE generation as ONE batch (rollout with .prefetch, e.g. GPU)
 
     def vector_bounds(self):
         if set(self.bounds)!=set(NAMES):
@@ -91,12 +92,42 @@ def fit_physx(objective: RefinementLoss, config: FitConfiguration, *, logger=Non
         except (ValueError,FloatingPointError,RuntimeError) as e:
             stats["n_failed"]+=1; stats["last_error"]=f"{type(e).__name__}: {e}"
             return PENALTY
+    def f_vec(Z):
+        Z=np.atleast_2d(np.asarray(Z, float))
+        if Z.shape[0]!=nf:
+            Z=Z.T
+        thetas=[]
+        bad=[]
+        for j in range(Z.shape[1]):
+            try:
+                thetas.append(from_vector(full(Z[:, j])))
+            except ValueError:
+                thetas.append(None)
+                bad.append(j)
+        vals=objective.objective_many([t for t in thetas if t is not None])
+        it=iter(vals)
+        out=np.empty(Z.shape[1])
+        for j, t in enumerate(thetas):
+            stats["n_eval"]+=1
+            v=None if t is None else next(it)
+            if v is None:
+                stats["n_failed"]+=1
+                stats["last_error"]="rollout failed in a batched generation"
+                out[j]=PENALTY
+            else:
+                out[j]=v
+        return out
+    if config.vectorized and v0_eps:
+        raise ValueError("vectorized DE does not support the v0 nuisance")
     if free_idx or v0_eps:
         kw={}
+        if config.vectorized:
+            kw.update(vectorized=True, updating="deferred")
         if x0 is not None:
             kw["x0"]=np.r_[[min(max(float(x0[NAMES[i]]),bounds[i][0]),bounds[i][1]) for i in free_idx],
                            np.zeros(len(v0_eps))]
-        result=differential_evolution(f,[bounds[i] for i in free_idx]+v0_bounds,seed=config.seed,
+        result=differential_evolution(f_vec if config.vectorized else f,
+                                      [bounds[i] for i in free_idx]+v0_bounds,seed=config.seed,
                                       maxiter=config.maxiter,popsize=config.popsize,polish=config.polish,
                                       tol=config.tol,workers=1,**kw)
         x=full(result.x)
