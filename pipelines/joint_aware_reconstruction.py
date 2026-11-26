@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -415,6 +416,30 @@ def st_build(r: Run):
     r.set("build", "PASSED", branches=res)
 
 
+def _ckpt_intact(p: Path) -> bool:
+    try:
+        with zipfile.ZipFile(p) as z:
+            return z.testzip() is None
+    except (OSError, zipfile.BadZipFile):
+        return False
+
+
+def ns_train_resume(out: Path, iters) -> tuple[list, int]:
+    """(extra ns-train args, iterations still to run) for an output dir of an interrupted ns-train.
+
+    A training killed mid-way (e.g. by pipelines/suspend_resilient.py after a laptop suspend) resumes from its newest
+    intact checkpoint instead of starting over; the run still ends at step iters-1 exactly like an uninterrupted one.
+    0 iterations left means only the export after training is missing."""
+    d = out / "nerfstudio_models"
+    steps = sorted((int(p.stem.split("-")[1]), p) for p in d.glob("step-*.ckpt")) if d.is_dir() else []
+    for step, ck in reversed(steps):
+        if _ckpt_intact(ck):
+            left = max(0, int(iters) - step - 1)
+            log(f"   resume {out.parent.name[-12:]}/{out.name} from checkpoint step {step} ({left} iterations left)")
+            return ["--load-dir", d, "--load-step", step], left
+    return [], int(iters)
+
+
 def _part_complete(d: Path):
     return (d / "object_3dgs.ply").is_file() and (d / "config.yml").is_file()
 
@@ -431,18 +456,20 @@ def st_parts(r: Run):
             out = b / f"part_{part}"
             if _part_complete(out):
                 continue
-            run_cmd([ns("ns-train"), "splatfacto-depth", "--data", ds, "--output-dir", out, "--experiment-name",
-                     f"part_{part}", "--specialize-output-dir", "True", "--vis", "tensorboard",
-                     "--enable-frame-filtering", "False", "--max-num-iterations", r.iters,
-                     "--pipeline.model.joint-aware-supervision", "True",
-                     "--pipeline.model.fg-mask-lambda", HP["fg_mask_lambda"],
-                     "--pipeline.model.sensor-depth-lambda", HP["depth_lambda_parts"],
-                     "--pipeline.model.camera-optimizer.mode", "off",
-                     "--pipeline.model.quaternion-order", HP["quaternion_order"],
-                     "--pipeline.model.sh-degree", HP["sh_degree"], "--pipeline.datamanager.cache-images", "cpu",
-                     "part-data", "--part_id", part, "--joint-aware", "True", "--orientation-method", "none",
-                     "--center-poses", "False", "--auto-scale-poses", "False", "--scale-factor", "1.0"],
-                    lg, r.env, r.args.dry_run)
+            resume, left = ns_train_resume(out, r.iters) if not r.args.dry_run else ([], r.iters)
+            if left > 0:
+                run_cmd([ns("ns-train"), "splatfacto-depth", "--data", ds, "--output-dir", out, "--experiment-name",
+                         f"part_{part}", "--specialize-output-dir", "True", "--vis", "tensorboard",
+                         "--enable-frame-filtering", "False", "--max-num-iterations", left, *resume,
+                         "--pipeline.model.joint-aware-supervision", "True",
+                         "--pipeline.model.fg-mask-lambda", HP["fg_mask_lambda"],
+                         "--pipeline.model.sensor-depth-lambda", HP["depth_lambda_parts"],
+                         "--pipeline.model.camera-optimizer.mode", "off",
+                         "--pipeline.model.quaternion-order", HP["quaternion_order"],
+                         "--pipeline.model.sh-degree", HP["sh_degree"], "--pipeline.datamanager.cache-images", "cpu",
+                         "part-data", "--part_id", part, "--joint-aware", "True", "--orientation-method", "none",
+                         "--center-poses", "False", "--auto-scale-poses", "False", "--scale-factor", "1.0"],
+                      lg, r.env, r.args.dry_run)
             run_cmd([ns("ns-export"), "gaussian-splat", "--load-config", out / "config.yml", "--output-dir", out,
                      "--world-frame", "True"], lg, r.env, r.args.dry_run)
             run_cmd([ns("ns-export"), "cameras", "--load-config", out / "config.yml", "--output-dir", out,
@@ -491,20 +518,22 @@ def st_blend(r: Run):
         out = b / "twopart_blend"
         lg = b / "logs" / "blend.log"
         if not (out / "object_3dgs.ply").is_file():
-            run_cmd([ns("ns-train"), "twopart-blend", "--data", b / "dataset" / "v000", "--output-dir", out,
-                     "--experiment-name", "twopart_blend", "--specialize-output-dir", "True", "--vis", "tensorboard",
-                     "--enable-frame-filtering", "False", "--max-num-iterations", r.iters,
-                     "--pipeline.model.joint-aware", "True", "--pipeline.model.obj-pose-opt-enabled", "False",
-                     "--pipeline.model.trainable-weights", "True", "--pipeline.model.camera-optimizer.mode", "off",
-                     "--pipeline.model.quaternion-order", HP["quaternion_order"],
-                     "--pipeline.model.enable-gs-refinement", "False",
-                     "--pipeline.model.fg-mask-lambda", HP["fg_mask_lambda"],
-                     "--pipeline.model.sensor-depth-lambda", HP["depth_lambda_blend"],
-                     "--pipeline.model.sh-degree", HP["sh_degree"], "--pipeline.datamanager.cache-images", "cpu",
-                     "twopart-blend-data", "--data", b / "dataset" / "v000", "--part0_dir", b / "part_0",
-                     "--part1_dir", b / "part_1", "--output-dir", out, "--motion_part", "1",
-                     "--orientation-method", "none", "--center-poses", "False", "--auto-scale-poses", "False",
-                     "--scale-factor", "1.0", "--joint-aware", "True"], lg, r.env, r.args.dry_run)
+            resume, left = ns_train_resume(out, r.iters) if not r.args.dry_run else ([], r.iters)
+            if left > 0:
+                run_cmd([ns("ns-train"), "twopart-blend", "--data", b / "dataset" / "v000", "--output-dir", out,
+                         "--experiment-name", "twopart_blend", "--specialize-output-dir", "True", "--vis", "tensorboard",
+                         "--enable-frame-filtering", "False", "--max-num-iterations", left, *resume,
+                         "--pipeline.model.joint-aware", "True", "--pipeline.model.obj-pose-opt-enabled", "False",
+                         "--pipeline.model.trainable-weights", "True", "--pipeline.model.camera-optimizer.mode", "off",
+                         "--pipeline.model.quaternion-order", HP["quaternion_order"],
+                         "--pipeline.model.enable-gs-refinement", "False",
+                         "--pipeline.model.fg-mask-lambda", HP["fg_mask_lambda"],
+                         "--pipeline.model.sensor-depth-lambda", HP["depth_lambda_blend"],
+                         "--pipeline.model.sh-degree", HP["sh_degree"], "--pipeline.datamanager.cache-images", "cpu",
+                         "twopart-blend-data", "--data", b / "dataset" / "v000", "--part0_dir", b / "part_0",
+                         "--part1_dir", b / "part_1", "--output-dir", out, "--motion_part", "1",
+                         "--orientation-method", "none", "--center-poses", "False", "--auto-scale-poses", "False",
+                         "--scale-factor", "1.0", "--joint-aware", "True"], lg, r.env, r.args.dry_run)
             run_cmd([ns("ns-export"), "gaussian-splat", "--load-config", out / "config.yml", "--output-dir", out,
                      "--world-frame", "True"], lg, r.env, r.args.dry_run)
             run_cmd([ns("ns-export"), "cameras", "--load-config", out / "config.yml", "--output-dir", out,
@@ -556,23 +585,25 @@ def st_art(r: Run):
         if not (out / "articulation.json").is_file():
             if not r.args.dry_run and not (b / "twopart_blend" / "JOINT_AWARE_AUTHORITY.json").is_file():
                 raise StageError(f"{kind}: blend stage did not produce the authority adapter")
-            run_cmd([ns("ns-train"), "splatfacto-art", "--data", b / "dataset" / "v000", "--output-dir", out,
-                     "--experiment-name", "splatfacto-art", "--specialize-output-dir", "True", "--vis", "tensorboard",
-                     "--max-num-iterations", r.iters,
-                     "--pipeline.model.optimize-joint-axis", "False", "--pipeline.model.optimize-joint-origin", "False",
-                     "--pipeline.model.optimize-joint-params", "False",
-                     "--pipeline.model.optimize-rotation-offset", "False",
-                     "--pipeline.model.enable-gs-refinement", "True",
-                     "--pipeline.model.hard-part-ids", "True", "--pipeline.model.trainable-weights", "False",
-                     "--pipeline.model.fg-mask-lambda", HP["fg_mask_lambda"],
-                     "--pipeline.model.sensor-depth-lambda", HP["depth_lambda_art"],
-                     "--pipeline.model.camera-optimizer.mode", "off",
-                     "--pipeline.model.quaternion-order", HP["quaternion_order"],
-                     "--pipeline.model.sh-degree", HP["sh_degree"], "--pipeline.datamanager.cache-images", "cpu",
-                     "splatfacto-art-data", "--twopart-blend-dir", b / "twopart_blend", "--motion_part", "1",
-                     "--data-dir", b / "dataset" / "v000", "--output-dir", out, "--joint-aware", "True",
-                     "--orientation-method", "none", "--center-poses", "False", "--auto-scale-poses", "False",
-                     "--scale-factor", "1.0"], lg, r.env, r.args.dry_run)
+            resume, left = ns_train_resume(out, r.iters) if not r.args.dry_run else ([], r.iters)
+            if left > 0:
+                run_cmd([ns("ns-train"), "splatfacto-art", "--data", b / "dataset" / "v000", "--output-dir", out,
+                         "--experiment-name", "splatfacto-art", "--specialize-output-dir", "True", "--vis", "tensorboard",
+                         "--max-num-iterations", left, *resume,
+                         "--pipeline.model.optimize-joint-axis", "False", "--pipeline.model.optimize-joint-origin", "False",
+                         "--pipeline.model.optimize-joint-params", "False",
+                         "--pipeline.model.optimize-rotation-offset", "False",
+                         "--pipeline.model.enable-gs-refinement", "True",
+                         "--pipeline.model.hard-part-ids", "True", "--pipeline.model.trainable-weights", "False",
+                         "--pipeline.model.fg-mask-lambda", HP["fg_mask_lambda"],
+                         "--pipeline.model.sensor-depth-lambda", HP["depth_lambda_art"],
+                         "--pipeline.model.camera-optimizer.mode", "off",
+                         "--pipeline.model.quaternion-order", HP["quaternion_order"],
+                         "--pipeline.model.sh-degree", HP["sh_degree"], "--pipeline.datamanager.cache-images", "cpu",
+                         "splatfacto-art-data", "--twopart-blend-dir", b / "twopart_blend", "--motion_part", "1",
+                         "--data-dir", b / "dataset" / "v000", "--output-dir", out, "--joint-aware", "True",
+                         "--orientation-method", "none", "--center-poses", "False", "--auto-scale-poses", "False",
+                         "--scale-factor", "1.0"], lg, r.env, r.args.dry_run)
             for what in ("gaussian-splat", "cameras", "articulation"):
                 extra = ["--optimized", "True"] if what == "cameras" else []
                 run_cmd([ns("ns-export"), what, "--load-config", out / "config.yml", "--output-dir", out,
