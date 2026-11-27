@@ -189,10 +189,12 @@ RUNS = SSD / "results_19_11_26" / "forceartgs_joint_aware"
 SC = "final_red_fridge_episode_000000"
 SCENE = SSD / "Backup_09_10_26" / "Sapien" / "output" / "real" / SC
 ARCH = SSD / "results_17_11_26" / "overnight_real" / "joint" / SC / "robot_archive.npz"
+# segments of the 19/11 run's window (90:148:2); the repo yaml now holds the 27/11 re-estimate on another window
+SEGS = SSD / "results_27_11_26" / "contact_intervals_before_regen" / f"{SC}.yaml"
 FRIDGE = sorted(RUNS.glob(f"{SC}_multiview_*_joint_aware_full")) if RUNS.is_dir() else []
 
 
-@unittest.skipUnless(FRIDGE and SCENE.is_dir() and ARCH.is_file(), "real fridge data not mounted")
+@unittest.skipUnless(FRIDGE and SCENE.is_dir() and ARCH.is_file() and SEGS.is_file(), "real fridge data not mounted")
 class RealFridgeDiagnostics(unittest.TestCase):
     """Read-only: builds inputs in memory and writes only to a temporary directory."""
 
@@ -207,7 +209,7 @@ class RealFridgeDiagnostics(unittest.TestCase):
         cfg["fitting"]["methods"] = ["general_integral_ls", "general_rollout_fit"]
         cls.cfg = cfg
         cls.inp = build_inputs(FRIDGE[0], SCENE, cfg, robot_archive=ARCH,
-                               contact_segments=root / f"configs/contact_intervals/{SC}.yaml", log=lambda m: None)
+                               contact_segments=SEGS, log=lambda m: None)
 
     def test_D01_provenance_and_reference_pose(self):
         r = self.inp.reference_pose

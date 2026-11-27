@@ -139,7 +139,7 @@ def write_summary(out, rows, ep, ev, analytics, pinn, px, sigma_vT, hist, status
                  f"{_fmt(c0['metrics_on_C1_episode']['rmse_over_sigma'])} | {_fmt(c0['metrics_on_C1_episode']['v_sim_T'])} | "
                  f"{_fmt(c0['M'])} | {_fmt(c0['c'])} |")
     else:
-        L.append(f"| C0 + original G10 | {c0.get('status')}: {c0.get('reason', '')} | - | - | - | - |")
+        L.append(f"| C0 + original G10 | {c0.get('status')}: {c0.get('reason') or c0.get('error', '')} | - | - | - | - |")
     for title, pre in (("C1 + original G10 (matched window)", "B0"), ("C1 + new warm start G10", "B7"),
                        ("C1 + new warm start G10", "B8"), ("C1 + new warm start G10", "B9"),
                        ("C1 + union of new warm starts", "B789"), ("C1 + terminal-loss G10", "B10")):

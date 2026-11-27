@@ -24,6 +24,7 @@ import sys
 import math
 import subprocess
 import tempfile
+from collections import OrderedDict
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -214,23 +215,32 @@ class IsolatedSapienCpu:
                 raise RuntimeError("no SAPIEN in this interpreter: run ForceArtGS in the forceartgs env")
             self._run, self.backend_process = _Worker(py), f"worker:{py}"
         self._tmp = tempfile.TemporaryDirectory(prefix="forceartgs_physx_estimator_")
-        self._urdfs = {}
+        self._urdfs = OrderedDict()                              # rho key -> scaled URDF, least recently used first
+        self._n_urdfs_written = 0                                # file-name counter: a name is never reused
         self.n_rollouts = 0
 
     def effective_inertia(self, theta: PhysicalParameters) -> float:
         """I_h(rho_s, A) = rho_s I_h(1) + A (revolute) / rho_s m_0 + A (prismatic)."""
         return float(theta.rho_scale * self.axis["axis_inertia"] + theta.armature)
 
+    URDF_CACHE = 4096                                            # bounded temp usage during long optimisations
+
     def _scaled(self, rho):
+        """Scaled-inertia URDF for rho, cached. Unique file names (a counter, never the cache size: once the cache
+        was full every new candidate used to overwrite one shared name) and least-recently-used eviction, so a file
+        handed out for the current request is never evicted by a later candidate of the same batch."""
         key = f"{float(rho):.12g}"
-        if key not in self._urdfs:
-            p = Path(self._tmp.name) / f"candidate_{len(self._urdfs):06d}.urdf"
-            scale_urdf_mass_inertia(self.urdf, p, self.moving_link, float(rho))
-            self._urdfs[key] = p
-            if len(self._urdfs) > 4096:                          # bounded temp usage during long optimisations
-                old = next(iter(self._urdfs))
-                Path(self._urdfs.pop(old)).unlink(missing_ok=True)
-        return self._urdfs[key]
+        p = self._urdfs.get(key)
+        if p is not None:
+            self._urdfs.move_to_end(key)
+            return p
+        p = Path(self._tmp.name) / f"candidate_{self._n_urdfs_written:06d}.urdf"
+        self._n_urdfs_written += 1
+        scale_urdf_mass_inertia(self.urdf, p, self.moving_link, float(rho))
+        self._urdfs[key] = p
+        while len(self._urdfs) > self.URDF_CACHE:
+            Path(self._urdfs.popitem(last=False)[1]).unlink(missing_ok=True)
+        return p
 
     def request(self, theta: PhysicalParameters, ep: Episode) -> dict:
         if theta.static_effort > theta.dynamic_effort + 1e-12:
@@ -314,6 +324,9 @@ class IsolatedSapienGpu(IsolatedSapienCpu):
     def batch(self, thetas, ep: Episode) -> list:
         """Rollouts of every theta on ONE episode; a candidate that fails its checks returns its exception."""
         thetas = list(thetas)
+        if len({f"{float(th.rho_scale):.12g}" for th in thetas}) > self.URDF_CACHE:
+            raise ValueError(f"batch of {len(thetas)} candidates needs more scaled URDFs than the cache keeps "
+                             f"({self.URDF_CACHE}): split the batch")
         for th in thetas:
             if th.static_effort > th.dynamic_effort + 1e-12:
                 raise ValueError("SAPIEN surrogate cannot reproduce static breakaway: use native PhysX axis friction")

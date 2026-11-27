@@ -11,8 +11,11 @@ import pytest
 RUNS = Path("/media/samuelemara/Extreme SSD/Samuele/results_19_11_26/forceartgs_joint_aware")
 REAL = Path("/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real")
 DISC = Path("/media/samuelemara/Extreme SSD/Samuele/results_17_11_26/overnight_real/joint")
+# segments of the 19/11 run's window (90:148:2); the repo yaml now holds the 27/11 re-estimate on another window
+SEGS = Path("/media/samuelemara/Extreme SSD/Samuele/results_27_11_26/contact_intervals_before_regen")
 SC = "final_red_fridge_episode_000000"
-pytestmark = pytest.mark.skipif(not (DISC / SC / "robot_archive.npz").is_file(), reason="real records not mounted")
+pytestmark = pytest.mark.skipif(not ((DISC / SC / "robot_archive.npz").is_file() and (SEGS / f"{SC}.yaml").is_file()),
+                                reason="real records not mounted")
 
 
 @pytest.fixture(scope="module")
@@ -33,7 +36,7 @@ def real():
     fr = FR.build(c, scene=SC, joint_type=auth.joint_type, axis=auth.axis_world, origin=auth.origin_world,
                   q_src=np.asarray(auth.source_frame_index)[m], q=np.asarray(auth.q, float)[m], q_sigma=qs)
     cfg = load_wrench_config()
-    segs = BA.load_interaction_segments(Path(__file__).resolve().parents[1] / "configs" / "contact_intervals" / f"{SC}.yaml")
+    segs = BA.load_interaction_segments(SEGS / f"{SC}.yaml")
     return dict(c=c, fr=fr, auth=auth, segs=segs, out=BA.build_wrench_episode(fr, cfg, segs),
                 pulse=BR.pulse_comparison(fr, (229, 232)))
 

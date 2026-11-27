@@ -66,6 +66,26 @@ class CodeError(RuntimeError):
     """A pipeline stage died on a programming error: stop the batch (every scene would hit it)."""
 
 
+def g10_fits(d):
+    """(failed {fit: error}, n fits) of a rest-to-rest result: the G10 PhysX fits catch their exceptions as FIT_FAILED,
+    so a crash there would otherwise pass as COMPARED (coarse fridge 27/11: every fit lost a temp URDF)."""
+    f = None if d is None else Path(d) / "physx_comparison.json"
+    if f is None or not f.is_file():
+        return {}, 0
+    px = json.loads(f.read_text())
+    fits = dict(px.get("fits") or {})
+    if isinstance(px.get("C0"), dict) and px["C0"].get("status") != "SKIPPED":
+        fits["C0"] = px["C0"]
+    return ({k: str(v.get("error") or v.get("reason") or "") for k, v in fits.items()
+             if str(v.get("status", "")).endswith("FAILED")}, len(fits))
+
+
+def code_bugs(failed: dict) -> dict:
+    """Failures that are programming errors (or a vanished engine file), not a property of the data."""
+    pat = re.compile(r"\b(" + "|".join(CODE_ERRORS + ("FileNotFoundError",)) + r")\b")
+    return {k: e for k, e in failed.items() if pat.search(e)}
+
+
 def run_dir(out: Path, sc: str, budget: str):
     c = sorted((out / "forceartgs_joint_aware").glob(f"{sc}_multiview_*_joint_aware_{budget}"))
     return c[0] if c else None
@@ -152,7 +172,12 @@ def scene(out: Path, sc: str, args) -> dict:
     # ---------------------------------------------------------------- 3. rest-to-rest parameter estimation
     r2r_root = out / "rest_to_rest_compare" / sc / "rest_to_rest_compare"
     d, st = latest_status(r2r_root)
-    if st is None or st.get("status") != "COMPARED" or not fresh(d / "STATUS.json", sel, done[-1] if done else None):
+    stale_bug = code_bugs(g10_fits(d)[0])
+    if stale_bug:
+        log(out, f"{sc} [3/4] earlier result has G10 fits that died on a code error: recomputed "
+                 f"({next(iter(stale_bug.values()))[:120]})")
+    if (st is None or st.get("status") != "COMPARED" or stale_bug
+            or not fresh(d / "STATUS.json", sel, done[-1] if done else None)):
         log(out, f"{sc} [3/4] rest-to-rest parameter estimation")
         sh(["bash", "pipelines/g9_rest_to_rest_comparison_real.sh", out / "forceartgs_joint_aware"],
            dict(SCENES=sc, OUT_BASE=str(out / "rest_to_rest_compare"), EXT_ROOT=str(ext), PINN_DEVICE=args.pinn_device,
@@ -162,6 +187,14 @@ def scene(out: Path, sc: str, args) -> dict:
         d, st = latest_status(r2r_root)
     row["r2r"] = str(d) if d else None
     row["r2r_status"] = None if st is None else f"{st.get('status')}: {st.get('reason')}"
+    failed, n_fits = g10_fits(d)
+    row["g10_fits"] = f"{n_fits - len(failed)}/{n_fits} fitted" if n_fits else "-"
+    if failed:
+        log(out, f"{sc} [3/4] G10 fits failed: " + "; ".join(f"{k}: {e[:100]}" for k, e in failed.items()))
+    bug = code_bugs(failed)
+    if bug:
+        k, e = next(iter(bug.items()))
+        raise CodeError(f"{sc}: G10 fit {k}: {e}")
     if st is None or st.get("status") != "COMPARED" or not (st.get("best_row") or {}).get("M"):
         log(out, f"{sc} [3/4] no PhysX-replayed estimate ({row['r2r_status']}): no URDF / USD")
         return row
@@ -186,11 +219,12 @@ def summary(out: Path, rows) -> None:
     L = ["# Real episode_000000: estimated joint dynamics -> URDF / USD", "",
          f"{time.strftime('%F %T')}. M = inertia about the joint axis [kg m^2] (revolute) or moving mass [kg] "
          "(prismatic); c = viscous joint damping. FIT_TO_DEMONSTRATION, not a validated physical twin.", "",
-         "| scene | selection | joint | M | c | best method | PhysX rmse/sigma | asset | URDF |", "|" + "---|" * 9]
+         "| scene | selection | joint | M | c | best method | PhysX rmse/sigma | G10 fits | asset | URDF |",
+         "|" + "---|" * 10]
     for r in rows:
         f = lambda k, fmt="{:.4g}": fmt.format(r[k]) if isinstance(r.get(k), (int, float)) else (r.get(k) or "-")
         L.append(f"| {r['scene']} | {r.get('selection', '-')} | {r.get('joint_type', '-')} | {f('M')} | {f('c')} | "
-                 f"{r.get('method', '-')} | {f('rmse_over_sigma', '{:.3g}')} | "
+                 f"{r.get('method', '-')} | {f('rmse_over_sigma', '{:.3g}')} | {r.get('g10_fits', '-')} | "
                  f"{(r.get('asset_status') or r.get('r2r_status') or r.get('step') or '-')[:90]} | {r.get('urdf') or '-'} |")
     (out / "estimated_assets").mkdir(parents=True, exist_ok=True)
     (out / "estimated_assets" / "SUMMARY.md").write_text("\n".join(L) + "\n")
