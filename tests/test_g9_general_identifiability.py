@@ -11,7 +11,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from forceartgs_g9 import physics_lib  # noqa: E402
 from forceartgs_g9.core import run_g9  # noqa: E402
-from forceartgs_g9.dynamics.general_1dof import GeneralTerms, sim_params, simulate_general  # noqa: E402
+from forceartgs_g9.dynamics.general_1dof import GeneralTerms  # noqa: E402
 from forceartgs_g9.estimators.general_constrained import general_rollout_fit  # noqa: E402
 from forceartgs_g9.estimators.general_integral_ls import general_integral_ls, theta0_from_ls  # noqa: E402
 from forceartgs_g9.estimators.model_spec import G9Interaction, ModelSpec  # noqa: E402
@@ -20,7 +20,6 @@ from forceartgs_g9.testing import synthetic_cfg, synthetic_inputs  # noqa: E402
 from forceartgs_g9.validation.general_identifiability import (diagnose_general,  # noqa: E402
                                                               standard_perturbations, structural_checks)
 from forceartgs_g9.validation.heldout_prediction import heldout_report, leakage, predict_heldout  # noqa: E402
-from forceartgs_g9.validation.model_adequacy import adequacy  # noqa: E402
 
 physics_lib.load()
 
@@ -250,13 +249,10 @@ class GateC(unittest.TestCase):
         self.assertEqual(leakage(it)["status"], "SHARED_TCP_GEOMETRY")
 
     def test_c15_frozen_library_untouched_and_deterministic(self):
-        import subprocess
-        prov = physics_lib.provenance()
-        root = prov["root"]
-        head = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-        dirty = subprocess.run(["git", "-C", root, "status", "--porcelain"], capture_output=True, text=True).stdout
-        self.assertEqual(head, physics_lib.PINNED_COMMIT)
-        self.assertEqual(dirty.strip(), "")
+        prov = physics_lib.provenance()           # installed package: commit + RECORD hashes; checkout: git
+        self.assertEqual(prov["commit"], physics_lib.PINNED_COMMIT)
+        self.assertEqual(prov["dirty_files"], 0)
+        self.assertTrue(prov["pinned"])
         from forceartgs_physics import estimators
         self.assertEqual(tuple(estimators.VALIDATED), ("PINN", "Backprop", "AKF", "MLP"))
         from forceartgs_g9.estimators.frozen_baselines import run_baselines

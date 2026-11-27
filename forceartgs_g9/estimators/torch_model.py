@@ -18,13 +18,41 @@ Parameter coordinates eta (unconstrained): log for the strictly / weakly positiv
 """
 from __future__ import annotations
 
+import functools
 import math
+import os
 
 import numpy as np
 import torch
 
 LOG_PARAMS = ("alpha", "M", "mu", "c", "Fc", "dFs", "Fs")
 DT = torch.float64
+
+
+PINN_DEVICES = ("cpu", "cuda")
+
+
+def torch_device() -> torch.device:
+    """Device of the PINN / torch estimators: ``FORCEARTGS_PINN_DEVICE`` (``--pinn-device`` of the driver and of
+    ``forceartgs_g9.cli rest-to-rest-compare``), default ``cpu``. Measured on the real fridge episode: these small
+    nets (32 x 3, a few hundred points, 7000 sequential steps) are launch-bound on the GPU, 101 s vs 59 s per variant,
+    same estimates. Weight initialisation always draws from a seeded CPU generator, so the initial nets are
+    bit-identical on every device."""
+    want = os.environ.get("FORCEARTGS_PINN_DEVICE", "cpu").strip() or "cpu"
+    if want not in PINN_DEVICES:
+        raise ValueError(f"FORCEARTGS_PINN_DEVICE must be one of {PINN_DEVICES}, got {want!r}")
+    if want == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("FORCEARTGS_PINN_DEVICE=cuda but CUDA is not available")
+    return torch.device(want)
+
+
+def on_torch_device(fn):
+    """Run ``fn`` with every tensor it creates on ``torch_device()``."""
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        with torch_device():
+            return fn(*args, **kwargs)
+    return run
 
 
 def to_eta(name, value):
@@ -117,10 +145,10 @@ class TorchDynamics:
 
 def zoh_torch(effort, t: torch.Tensor) -> torch.Tensor:
     """Q(t) of a forward-ZOH effort at torch times (no gradient w.r.t. t: Q is a measured input)."""
-    tf = np.asarray(effort.t_s, float)
-    lev = np.asarray(effort.levels, float)
-    idx = np.clip(np.searchsorted(tf, t.detach().cpu().numpy(), side="right") - 1, 0, len(lev) - 1)
-    return torch.as_tensor(lev[idx], dtype=DT)
+    tf = torch.as_tensor(np.asarray(effort.t_s, float), dtype=t.dtype, device=t.device)
+    lev = torch.as_tensor(np.asarray(effort.levels, float), dtype=DT, device=t.device)
+    idx = (torch.searchsorted(tf, t.detach().contiguous(), right=True) - 1).clamp(0, len(lev) - 1)
+    return lev[idx]                                                   # on t's device: no host round trip per step
 
 
 def zoh_integral(effort, ta, tb) -> float:

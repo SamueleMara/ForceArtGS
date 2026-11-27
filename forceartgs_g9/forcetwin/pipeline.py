@@ -112,11 +112,9 @@ def _prior_for_sim(inp, mm):
 def run(run_root, scene, *, cfg_path, robot_archive=None, contact_segments=None, discovery_dir=None,
         pulse_rows=None, steps=("audit", "identify", "general"), pinn=False, out_root=None,
         declared_joint_type=None, declaration_note=None, bootstrap=200, log=print) -> dict:
-    from .. import physics_lib
     from ..adapters.forceartgs_g9 import build_inputs
     from ..config import load_dynamics_config
     t0 = time.time()
-    physics_lib.load()
     bad = sorted(set(steps) - set(STEPS))
     if bad:
         raise ValueError(f"unknown steps {bad}")

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import time
 from pathlib import Path
 
@@ -47,7 +46,6 @@ def starts_for(bounds, I_ref, io_init=None) -> dict:
 def run(run_root, scene, *, behavioral_config=None, robot_archive=None, contact_segments=None, pulse_rows=None,
         out_root=None, declared_joint_type=None, declaration_note=None, quick=False, python=None, io_response=None,
         log=print) -> dict:
-    from .. import physics_lib
     from ..adapters.forceartgs_g9 import build_inputs
     from ..config import load_dynamics_config
     from ..forcetwin import record as RC
@@ -61,7 +59,6 @@ def run(run_root, scene, *, behavioral_config=None, robot_archive=None, contact_
     from .robot_replay import detect_backends
     from .sapien_diagnostic import IsolatedSapienCpu, scale_urdf_mass_inertia
     t_start = time.time()
-    physics_lib.load()
     cfg = load_config(behavioral_config, quick=quick)
     if python:
         cfg["simulation"]["python"] = python
@@ -106,7 +103,6 @@ def run(run_root, scene, *, behavioral_config=None, robot_archive=None, contact_
                           "authority -- nothing simulated (nothing fabricated)")
         return finish("DATA_UNAVAILABLE", str(e))
     hashes["record_sha256"] = rec.sha256()
-    jt = rec.joint_type
     fa_status = (inp.force_audit or {}).get("status")
     kin_ev = dict(kinematic_status=inp.kinematic_status, export_ready=bool(inp.kinematics_export_ready),
                   axis_B=np.asarray(rec.axis_B).tolist(), axis_std_rad=inp.axis_std_rad,

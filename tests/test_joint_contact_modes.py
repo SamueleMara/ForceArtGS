@@ -164,6 +164,18 @@ class GateA(unittest.TestCase):
         with self.assertRaises(ContactSegmentError):
             load_contact_segments(wrong, sc["frame_map"], sc["p_tcp"])
 
+    def test_a09b_segments_estimated_on_another_window_are_refused(self):
+        sc = make_tcp_contact("revolute", "stick_hard")
+        f = np.asarray(sc["frame_map"].rgbd_frame_index, int)
+        k = int(f[1] - f[0])
+        same = dict(sc["segments_doc"], window=f"{f[0]}:{f[-1]}:{k}")
+        load_contact_segments(same, sc["frame_map"], sc["p_tcp"])               # estimated on these frames: accepted
+        shifted = dict(sc["segments_doc"], window=f"{f[0] + 1}:{f[-1] + 1}:{k}")
+        with self.assertRaisesRegex(ContactSegmentError, "re-estimate"):
+            load_contact_segments(shifted, sc["frame_map"], sc["p_tcp"])
+        legacy = {key: v for key, v in sc["segments_doc"].items() if key != "window"}
+        load_contact_segments(legacy, sc["frame_map"], sc["p_tcp"])             # no window recorded: exact-frame rule only
+
     def test_a10_hard_stick_is_structural_and_numerically_stable(self):
         sc = make_tcp_contact("revolute", "stick_hard", sigma_tcp=0.001)
         segs, _, _, tr = setup(sc)

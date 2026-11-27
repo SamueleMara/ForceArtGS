@@ -101,6 +101,15 @@ def load_contact_segments(source, frame_map, p_tcp_w=None, cfg=None) -> tuple:
         raise ContactSegmentError("frame_index_type must be source_frame_index (no filename offsets are inferred)")
     sfi = np.asarray(frame_map.source_frame_index, int)
     ts = np.asarray(frame_map.timestamp_s, float)
+    win = data.get("window")
+    if win is not None:                      # segments are estimated per window: never reuse them on another one
+        lo, hi, k = (int(x) for x in str(win).split(":"))
+        grid = set(range(lo, hi + 1, k))
+        model = [int(f) for f in getattr(frame_map, "rgbd_frame_index", [])]
+        if model and not set(model) <= grid:
+            raise ContactSegmentError(f"{origin}: segments were estimated on RGB-D window {win}, but the model frames are "
+                                      f"{model[0]}..{model[-1]} (step {model[1] - model[0] if len(model) > 1 else '-'}); "
+                                      "re-estimate them on this window (samuele/estimate_contact_segments.py)")
     if np.any(np.diff(sfi) <= 0) or np.any(np.diff(ts) <= 0):
         raise ContactSegmentError("frame map is not strictly increasing in source_frame_index / timestamp")
     index = {int(s): i for i, s in enumerate(sfi)}

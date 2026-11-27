@@ -15,7 +15,7 @@ from .. import physics_lib
 
 
 def to_physics_interaction(it, axis, origin, frame="W"):
-    physics_lib.provenance()
+    physics_lib.load()            # on demand: only this opt-in comparison runs ForceArtGS-Physics
     from forceartgs_physics.schemas import ForceRecord, Interaction, JointKinematics, KinematicStatus, Trajectory
     a = np.asarray(axis, float) / np.linalg.norm(axis)
     o = np.zeros(3) if origin is None else np.asarray(origin, float)

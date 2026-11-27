@@ -26,6 +26,7 @@
 """
 import argparse
 import json
+import os
 import sys
 
 
@@ -105,7 +106,7 @@ def main(argv=None) -> int:
     px.add_argument("--pulse-rows", default=None, help="A:B declared pulse source rows (impulse audit -> blocker)")
     px.add_argument("--declared-joint-type", default=None, choices=("revolute", "prismatic"))
     px.add_argument("--declaration-note", default=None)
-    px.add_argument("--engine-python", default=None, help="SAPIEN interpreter (default $PARTTWIN1D_PYTHON / parttwin_sim)")
+    px.add_argument("--engine-python", default=None, help="SAPIEN interpreter (default: this one, the forceartgs env)")
     px.add_argument("--quick", action="store_true", help="tiny optimiser budget (smoke test only)")
     px.add_argument("--out-root", default=None)
     px.add_argument("--use-io-initialization", nargs="?", const="latest", default=None, metavar="IO_RESPONSE",
@@ -134,7 +135,7 @@ def main(argv=None) -> int:
     bh.add_argument("--pulse-rows", default=None, help="A:B declared pulse source rows (impulse audit -> diagnostic)")
     bh.add_argument("--declared-joint-type", default=None, choices=("revolute", "prismatic"))
     bh.add_argument("--declaration-note", default=None)
-    bh.add_argument("--engine-python", default=None, help="SAPIEN interpreter (default $PARTTWIN1D_PYTHON / parttwin_sim)")
+    bh.add_argument("--engine-python", default=None, help="SAPIEN interpreter (default: this one, the forceartgs env)")
     bh.add_argument("--io-response", default=None, help="io_response.json for the warm start (default: the latest "
                                                         "<run>/dynamics/g9/io_identification/vNNN)")
     bh.add_argument("--quick", action="store_true", help="tiny optimiser budget (smoke test only)")
@@ -151,14 +152,41 @@ def main(argv=None) -> int:
     bw.add_argument("--pulse-rows", default=None, help="A:B source rows for the full-vs-force-only comparison")
     bw.add_argument("--declared-joint-type", default=None, choices=("revolute", "prismatic"))
     bw.add_argument("--declaration-note", default=None)
-    bw.add_argument("--engine-python", default=None, help="SAPIEN interpreter (default $PARTTWIN1D_PYTHON / parttwin_sim)")
+    bw.add_argument("--engine-python", default=None, help="SAPIEN interpreter (default: this one, the forceartgs env)")
     bw.add_argument("--io-response", default=None, help="optional io_response.json warm start (default: latest)")
     bw.add_argument("--quick", action="store_true", help="tiny optimiser budget (smoke test only, not a calibration)")
     bw.add_argument("--out-root", default=None)
+    rr = sub.add_parser("rest-to-rest-compare", help="rest-to-rest comparison of G9 analytics / PINN ablations / G10 "
+                        "PhysX on ONE immutable episode (append-only <run>/dynamics/g9/rest_to_rest_compare/vNNN)")
+    rr.add_argument("--run", default=None, help="joint-aware run (required unless --synthetic)")
+    rr.add_argument("--scene", default=None, help="real scene dir (required unless --synthetic)")
+    rr.add_argument("--synthetic", default=None, choices=("prismatic", "revolute"),
+                    help="exact synthetic rest-to-rest benchmark on actual PhysX (truth known); needs --out-root")
+    rr.add_argument("--robot-archive", default=None)
+    rr.add_argument("--config", default="configs/g9_real/rest_to_rest_compare.yaml")
+    rr.add_argument("--contact-segments", default=None, help="existing segments file: used ONLY for the C0 archival "
+                    "(historical masked input) control, never for the rest-to-rest episode")
+    rr.add_argument("--declared-joint-type", default=None, choices=("revolute", "prismatic"))
+    rr.add_argument("--declaration-note", default=None)
+    rr.add_argument("--engine-python", default=None, help="SAPIEN interpreter (default: this one, the forceartgs env)")
+    rr.add_argument("--authority-dir", default=None, help="extended authority (estimotion extend-states) of the SAME "
+                    "accepted joint: q on the whole recording instead of the reconstruction clip")
+    rr.add_argument("--quick", action="store_true", help="tiny budgets (plumbing smoke test only)")
+    rr.add_argument("--pinn-device", choices=("cpu", "cuda"), default=None,
+                    help="device of the PINN ablations (default: $FORCEARTGS_PINN_DEVICE, else cpu)")
+    rr.add_argument("--out-root", default=None)
+    ea = sub.add_parser("estimated-asset", help="URDF / USD / MJCF with the rest-to-rest ESTIMATED inertia + viscous "
+                        "damping (shared PArtTwin1D builder, FIT_TO_DEMONSTRATION) -> <out-root>/vNNN")
+    ea.add_argument("--run", required=True, help="joint-aware run (its parttwin_handoff/ is used)")
+    ea.add_argument("--r2r", required=True, help="rest_to_rest_compare/vNNN directory with STATUS.json best_row")
+    ea.add_argument("--out-root", required=True)
+    ea.add_argument("--parttwin-python", default=None)
     c = sub.add_parser("compare-dynamics", help="aggregate forcetwin_adaptation comparison tables")
     c.add_argument("--root", required=True, help="directory with *_joint_aware_full runs")
     c.add_argument("--out", required=True)
     a = ap.parse_args(argv)
+    if getattr(a, "pinn_device", None):
+        os.environ["FORCEARTGS_PINN_DEVICE"] = a.pinn_device
     if a.cmd == "io-identification":
         from .system_identification.pipeline import run as io_run
         pr = tuple(int(x) for x in a.pulse_rows.split(":")) if a.pulse_rows else None
@@ -166,6 +194,28 @@ def main(argv=None) -> int:
                     contact_segments=a.contact_segments, pulse_rows=pr, out_root=a.out_root,
                     declared_joint_type=a.declared_joint_type, declaration_note=a.declaration_note,
                     python=a.engine_python, no_physx=a.no_physx)
+        print(json.dumps(st, indent=1, default=str))
+        return 0
+    if a.cmd == "rest-to-rest-compare" and a.synthetic:
+        from .physx_refinement.rest_to_rest_comparison import run_synthetic
+        if not a.out_root:
+            ap.error("--synthetic needs --out-root")
+        st = run_synthetic(a.out_root, joint_type=a.synthetic, config=a.config, quick=a.quick, python=a.engine_python)
+        print(json.dumps({k: v for k, v in st.items() if not k.startswith("_")}, indent=1, default=str))
+        return 0
+    if a.cmd == "estimated-asset":
+        from .export.estimated_asset import build as ea_build
+        st = ea_build(a.run, a.r2r, a.out_root, python=a.parttwin_python)
+        print(json.dumps(st, indent=1, default=str))
+        return 0 if st["status"] == "EXPORTED" else 3
+    if a.cmd == "rest-to-rest-compare":
+        from .physx_refinement.rest_to_rest_comparison import run as r2r_run
+        if not (a.run and a.scene):
+            ap.error("rest-to-rest-compare needs --run and --scene (or --synthetic)")
+        st = r2r_run(a.run, a.scene, config=a.config, robot_archive=a.robot_archive,
+                     contact_segments=a.contact_segments, out_root=a.out_root,
+                     declared_joint_type=a.declared_joint_type, declaration_note=a.declaration_note, quick=a.quick,
+                     python=a.engine_python, authority_dir=a.authority_dir)
         print(json.dumps(st, indent=1, default=str))
         return 0
     if a.cmd == "physx-behavioral-wrench":
@@ -230,8 +280,9 @@ def main(argv=None) -> int:
         return 0
     if a.cmd == "synthetic-demo":
         from pathlib import Path
-        from . import physics_lib as pl
-        pl.load(a.physics_library)
+        if a.physics_library:
+            from . import physics_lib as pl
+            pl.load(a.physics_library)
         from .core import run_g9
         from .dynamics.general_1dof import GeneralTerms
         from .export.final_build import final_physics_export
@@ -253,7 +304,6 @@ def main(argv=None) -> int:
                               parity={e: v.get("status") for e, v in (fe.get("numerical_parity") or {}).items()}),
                          indent=1, default=str))
         return 0
-    from . import physics_lib
     if a.cmd == "dynamics":
         from .stage import run_dynamics_stage
         r = run_dynamics_stage(a.run, a.scene, a.dynamics_config, physics_library=a.physics_library,
@@ -267,7 +317,6 @@ def main(argv=None) -> int:
                               status_categories=r["manifest"].get("status_categories"), blocked=r["manifest"]["blocked"],
                               reused=r.get("reused")), indent=1))
         return 0
-    physics_lib.load(a.physics_library)
     from .stage import run_final_physics_export_stage
     r = run_final_physics_export_stage(a.run, g9_dir=a.g9_dir)
     print(json.dumps({k: r.get(k) for k in ("status", "reason", "claim", "readiness")}, indent=1, default=str))

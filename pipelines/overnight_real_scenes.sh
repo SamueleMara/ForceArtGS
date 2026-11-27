@@ -17,7 +17,8 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 ROOT="${1:-/media/samuelemara/Extreme SSD/Samuele/results_$(date +%d_%m_%y)/overnight_real}"  # outputs always on the SSD
 case "$ROOT" in "/media/samuelemara/Extreme SSD/"*) ;; *) echo "refusing: output root must be on the Extreme SSD: $ROOT" >&2; exit 2;; esac
-PY="$HOME/miniconda3/envs/freeartgs/bin/python"
+PY="${FORCEARTGS_PYTHON:-$HOME/miniconda3/envs/forceartgs/bin/python}"
+eval "$("$PY" "$(dirname "${BASH_SOURCE[0]}")/../utils/forceartgs_env.py")"   # clean env: forceartgs + repo only
 CLI=("$PY" -m estimotion_2part.joint_discovery.cli)
 REAL="/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real"
 CFG=configs/joint_discovery.real_tcp2cm.yaml
@@ -34,11 +35,9 @@ TABLE=(
   "white_drawer_20261021_161154_episode_000000|150:330|6|$JR/white_drawer_20261021_161154_episode_000000/observations_stride8|-"
 )
 mkdir -p "$ROOT/joint" "$ROOT/train/.runtime"
-# Seed model weights / compiled extensions from the previous real batch (copy, never overwrite, source untouched).
-SEED="/media/samuelemara/Extreme SSD/Samuele/results_10_11_26/freeart_real/.runtime"
-for d in torch huggingface torch_extensions; do
-  [[ -d "$SEED/$d" && ! -e "$ROOT/train/.runtime/$d" ]] && cp -r "$SEED/$d" "$ROOT/train/.runtime/$d"
-done
+# Model weights from the repo's checkpoints/ (scripts/download_checkpoints.sh); never from an earlier run.
+mkdir -p "$ROOT/train/.runtime/torch/hub/checkpoints"
+cp -n checkpoints/torch/hub/checkpoints/*.pth "$ROOT/train/.runtime/torch/hub/checkpoints/"
 LOG="$ROOT/overnight.log"
 log() { echo "$(date '+%F %T') $*" | tee -a "$LOG"; }
 selected() { [[ -z "${SCENES:-}" || " $SCENES " == *" $1 "* ]]; }

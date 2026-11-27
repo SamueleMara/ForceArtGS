@@ -1,6 +1,6 @@
 """G10 acceptance tests WITH the actual engine (SAPIEN 3 / PhysX CPU, via the worker in the engine interpreter).
 
-Skipped when no SAPIEN interpreter exists (this interpreter or $PARTTWIN1D_PYTHON / parttwin_sim). CPU only.
+Skipped when no SAPIEN interpreter exists (run in the forceartgs env). CPU only.
 Covers the spec's engine list that the diagnostic runner can honour: frictionless inertia under known pulses, input
 sign / time / impulse, vertical hinge (zero gravity torque, nonzero inertia), nonvertical gravity projection against
 the G9 RigidBodyGravity law (q_ref != 0), prismatic gravity, free decay at several normalized ratios, the free-motion

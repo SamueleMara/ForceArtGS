@@ -189,7 +189,7 @@ def propose_finite_motions(obs: TrackObservations, noise, fit_cfg, rng=None, max
     ``no_motion`` rather than forced."""
     rng = np.random.default_rng(fit_cfg.seed) if rng is None else rng
     h = obs.has_3d
-    tr, tm, x = obs.track[h], obs.time[h], obs.x_w[h]
+    tr, tm, x, zh = obs.track[h], obs.time[h], obs.x_w[h], obs.z[h]
     lookup = {}
     for i, (a, b) in enumerate(zip(tr, tm)):
         lookup[(int(a), int(b))] = i
@@ -210,7 +210,7 @@ def propose_finite_motions(obs: TrackObservations, noise, fit_cfg, rng=None, max
             ids = tracks[both]
             P = x[[ia[k] for k in np.flatnonzero(both)]]
             Q = x[[ib[k] for k in np.flatnonzero(both)]]
-            z = np.array([obs.z[h][ia[k]] for k in np.flatnonzero(both)])
+            z = zh[[ia[k] for k in np.flatnonzero(both)]]
             sig = depth_sigma(z, noise) * np.sqrt(2)
             chi2 = np.sum((Q - P) ** 2, 1) / sig ** 2
             moving = chi2 > fit_cfg.moving_chi2_threshold

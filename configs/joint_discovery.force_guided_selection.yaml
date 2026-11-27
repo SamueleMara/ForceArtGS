@@ -1,0 +1,18 @@
+# Force-guided automatic joint selection -- 3D FORCE ONLY (estimotion_2part/joint_discovery/force_guided_selection.py).
+#   python -m estimotion_2part.joint_discovery.cli force-guided-select --scene SCENE --from-run ACCEPTED_DIR \
+#       --robot-archive ARC --config configs/joint_discovery.force_guided_selection.yaml --output APPEND_ONLY_DIR
+# Strict: unknown keys are errors; torque / extra tare / contact inference cannot be switched on.
+force_guided_selection:
+  enabled: true
+  force_input: known_transform_already_tared_3d_force_only   # wrench[:, 0:3] only, converted once
+  use_torque: false
+  continuous_contact: true
+  infer_contact_state: false
+  apply_additional_tare: false
+  eps_v_mps: 0.002          # below this speed the motion DIRECTION is undefined (not 'no contact')
+  eps_f_N: 0.05             # force-direction definedness floor ...
+  eps_f_sigma_k: 3.0        # ... or k x the measured force noise level, whichever is larger
+  direction_separation_k: 2.0   # P/R predicted directions must differ by > k x the force-direction uncertainty
+  bootstrap: 1000
+  null_shifts: 500
+  seed: 0

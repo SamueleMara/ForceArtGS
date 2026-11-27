@@ -9,7 +9,7 @@ physics:
   engine: sapien_cpu_diagnostic
   timestep: 0.001
   friction_mode: external_effort_surrogate   # or frictionless_physx (then every friction bound must be 0)
-  python: null                    # SAPIEN interpreter; null -> this one if it has sapien, else $PARTTWIN1D_PYTHON / parttwin_sim
+  python: null                    # SAPIEN interpreter; null -> this one (the forceartgs env)
 loss:
   huber_delta: 2.0
   numeric_floor_q: 0.0003        # sigma_num: PhysX float32 q accumulation (~3e-4 relative over 3000 steps, measured)

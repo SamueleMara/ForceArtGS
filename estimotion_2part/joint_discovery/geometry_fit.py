@@ -12,15 +12,15 @@ import time
 from dataclasses import dataclass, field
 
 import numpy as np
-from scipy import sparse
-from scipy.optimize import least_squares
 
 from . import assignments as asg
+from . import torch_lsq
 from .candidates import Seed, interpolate_missing
 from .observations import TrackObservations, depth_sigma
-from .rigid_kinematics import (apply_joint, apply_joint_inverse, exp_so3, hinge_gauge, normalize,
+from .torch_lsq import VisionRows
+from .rigid_kinematics import (apply_joint_inverse, hinge_gauge, normalize,
                                tangent_basis)
-from .visual_losses import camera_stacks, project_stacked, whitened_residuals
+from .visual_losses import camera_stacks, whitened_residuals
 
 
 @dataclass
@@ -85,61 +85,11 @@ class Problem:
 
 
 # --------------------------------------------------------------------------- anchors (per-track GN)
-def _joint_rotation(kind, axis, q_obs):
-    if kind in ("static", "prismatic"):
-        return np.broadcast_to(np.eye(3), (len(q_obs), 3, 3))
-    return exp_so3(normalize(axis)[None] * q_obs[:, None])
-
-
 def refine_anchors(kind, axis, origin, q, X0, obs: TrackObservations, K, T_CW, noise, track_mask, iters=6,
                    use_depth=True):
-    """Robust Gauss-Newton (Student-t IRLS) for each track's canonical anchor, joint fixed."""
-    X = np.array(X0, float)
-    sel = track_mask[obs.track] & obs.uv_valid & np.isfinite(X[obs.track]).all(1)
-    idx = np.flatnonzero(sel)
-    if len(idx) == 0:
-        return X
-    tr, t, cam = obs.track[idx], obs.time[idx], obs.cam[idx]
-    RA = _joint_rotation(kind, axis, q[t])
-    Rcw = T_CW[cam, :3, :3]
-    M = Rcw @ RA
-    dz_ok = (obs.depth_valid[idx] & obs.mask_valid[idx] & np.isfinite(obs.z[idx])) if use_depth else np.zeros(len(idx), bool)
-    sz = depth_sigma(np.nan_to_num(obs.z[idx], nan=1.0), noise, obs.depth_edge[idx], obs.depth_cos[idx])
-    dof = noise.student_t_dof
-    N = len(X)
-    for _ in range(iters):
-        xw = (X[tr] if kind == "static" else apply_joint(kind, axis, origin, q[t], X[tr]))
-        uv, z, xc = project_stacked(xw, cam, K, T_CW)
-        zz = np.where(np.abs(z) < 1e-6, 1e-6, z)
-        fx, fy = K[cam, 0, 0], K[cam, 1, 1]
-        D = np.zeros((len(idx), 2, 3))
-        D[:, 0, 0], D[:, 0, 2] = fx / zz, -fx * xc[:, 0] / zz ** 2
-        D[:, 1, 1], D[:, 1, 2] = fy / zz, -fy * xc[:, 1] / zz ** 2
-        su = noise.sigma_px if getattr(obs, "uv_sigma_scale", None) is None else \
-            noise.sigma_px * obs.uv_sigma_scale[idx][:, None, None]
-        Juv = D @ M / su
-        ruv = (uv - obs.uv[idx]) / (su[:, :, 0] if np.ndim(su) else su)
-        wuv = (dof + 1) / (dof + np.sum(ruv ** 2, 1) / 2)
-        H = np.einsum("mki,mkj->mij", Juv, Juv) * wuv[:, None, None]
-        g = np.einsum("mki,mk->mi", Juv, ruv) * wuv[:, None]
-        if dz_ok.any():
-            Jz = M[:, 2, :] / sz[:, None]
-            rz = np.where(dz_ok, (z - np.nan_to_num(obs.z[idx])) / sz, 0.0)
-            wz = np.where(dz_ok, (dof + 1) / (dof + rz ** 2), 0.0)
-            H += np.einsum("mi,mj->mij", Jz, Jz) * wz[:, None, None]
-            g += Jz * (rz * wz)[:, None]
-        Ht = np.zeros((N, 3, 3))
-        gt = np.zeros((N, 3))
-        np.add.at(Ht, tr, H)
-        np.add.at(gt, tr, g)
-        active = np.unique(tr)
-        Ha = Ht[active] + np.eye(3)[None] * (1e-6 + 1e-9 * np.trace(Ht[active], axis1=1, axis2=2))[:, None, None]
-        step = np.linalg.solve(Ha, gt[active][..., None])[..., 0]
-        step = np.clip(step, -0.05, 0.05)
-        X[active] -= step
-        if np.max(np.abs(step)) < 1e-7:
-            break
-    return X
+    """Robust Gauss-Newton (Student-t IRLS) for each track's canonical anchor, joint fixed (GPU: torch_lsq)."""
+    return torch_lsq.refine_anchors(kind, axis, origin, q, X0, obs, K, T_CW, noise, track_mask, iters=iters,
+                                    use_depth=use_depth)
 
 
 def initial_moving_anchors(problem: Problem, kind, axis, origin, q):
@@ -212,97 +162,30 @@ def fit_geometry(kind, axis0, origin0, q0, anchors, fit_tracks, weights, problem
     use_prior = cfg.fit.enable_temporal_prior and T >= 3
     n_prior = T - 2 if use_prior else 0
 
-    def fun(p):
-        a, o, q, X = L.unpack(p)
-        Xi = X[(L.track_col[tr] - L.n_global) // 3]
-        xw = apply_joint(kind, a, o, q[t], Xi)
-        uv, z, _ = project_stacked(xw, cam, problem.K, problem.T_CW)
-        r_uv = ((uv - uv_obs) / noise.sigma_px) * sw[:, None]
-        if uv_scale is not None:
-            r_uv = r_uv / uv_scale[:, None]
-        r_z = (((z - z_obs) / sz) * sw)[dz]
-        parts = [r_uv.ravel(), r_z]
-        if use_prior:
-            v = np.diff(q) / np.diff(ts)
-            acc = np.diff(v) / ((ts[2:] - ts[:-2]) / 2)
-            parts.append(acc / cfg.fit.temporal_sigma_qacc)
-        if extra is not None:
-            parts.append(np.nan_to_num(np.asarray(extra.residuals(kind, a, o, q), float)))
-        return np.concatenate(parts)
-
-    # sparsity pattern
     n_uv, n_z = 2 * len(sel), int(dz.sum())
-    rows, cols = [], []
-    obs_rows_uv = np.arange(n_uv).reshape(-1, 2)
-    obs_rows_z = n_uv + np.arange(n_z)
-    qcol = -np.ones(T, int)
-    qcol[L.free_q] = L.n_joint + np.arange(L.n_q)
-
-    def add(rr, cc):
-        rows.append(np.asarray(rr).ravel())
-        cols.append(np.asarray(cc).ravel())
-
-    tcol = L.track_col[tr]
-    for rr, mask in ((obs_rows_uv[:, 0], None), (obs_rows_uv[:, 1], None), (obs_rows_z, dz)):
-        sub = slice(None) if mask is None else mask
-        r_ = rr
-        for j in range(L.n_joint):
-            add(r_, np.full(len(r_), j))
-        qc = qcol[t[sub]]
-        m = qc >= 0
-        add(r_[m], qc[m])
-        for d in range(3):
-            add(r_, tcol[sub] + d)
-    if use_prior:
-        pr = n_uv + n_z + np.arange(n_prior)
-        for k in range(3):
-            qc = qcol[np.arange(n_prior) + k]
-            m = qc >= 0
-            add(pr[m], qc[m])
     n_extra = 0
     if extra is not None:
-        rt = np.asarray(extra.row_times, int)
-        n_extra = len(rt)
-        er = n_uv + n_z + n_prior + np.arange(n_extra)
-        for j in range(L.n_joint):
-            add(er, np.full(n_extra, j))
-        qc = np.where(rt >= 0, qcol[np.clip(rt, 0, T - 1)], -1)
-        m = qc >= 0
-        add(er[m], qc[m])
-        # finite-difference velocities use neighbouring q values too
-        for sh in (-1, 1):
-            qn = np.where(rt >= 0, qcol[np.clip(rt + sh, 0, T - 1)], -1)
-            m = qn >= 0
-            add(er[m], qn[m])
-        # rows whose value depends on several q (e.g. a variable-projected sticking anchor over a segment)
+        n_extra = len(np.asarray(extra.row_times, int))
         deps = getattr(extra, "row_q_deps", None)
-        if deps is not None:
-            if len(deps) != n_extra:
-                raise ValueError("extra.row_q_deps must list the q dependencies of every extra row")
-            rr, cc = [], []
-            for i, d in enumerate(deps):
-                qc_ = qcol[np.asarray(d, int)]
-                qc_ = qc_[qc_ >= 0]
-                rr.append(np.full(len(qc_), er[i]))
-                cc.append(qc_)
-            if rr:
-                add(np.concatenate(rr), np.concatenate(cc))
+        if deps is not None and len(deps) != n_extra:
+            raise ValueError("extra.row_q_deps must list the q dependencies of every extra row")
     n_rows = n_uv + n_z + n_prior + n_extra
     n_cols = L.n_global + 3 * len(fit_tracks)
-    S = sparse.coo_matrix((np.ones(sum(len(r) for r in rows)), (np.concatenate(rows), np.concatenate(cols))),
-                          shape=(n_rows, n_cols)).tocsr()
-    S.data[:] = 1
-    p0 = L.pack(anchors)
+    Tc = problem.T_CW[cam]
+    rows = VisionRows(kind=kind, axis0=L.axis0, e1=L.e1, e2=L.e2, origin0=L.origin0, q0=L.q0, free_q=L.free_q,
+                      k=(L.track_col[tr] - L.n_global) // 3, t=t, R_cw=Tc[:, :3, :3], t_cw=Tc[:, :3, 3],
+                      Kc=problem.K[cam], uv_obs=uv_obs, z_obs=z_obs, dz=dz, sz=sz, sw=sw, uv_scale=uv_scale,
+                      sigma_px=noise.sigma_px, timestamps=ts,
+                      prior_sigma=cfg.fit.temporal_sigma_qacc if use_prior else None)
     t0 = time.time()
-    res = least_squares(fun, p0, jac_sparsity=S, method="trf", loss=cfg.fit.robust_loss,
-                        f_scale=cfg.fit.robust_f_scale, max_nfev=max_nfev or cfg.fit.least_squares_max_nfev,
-                        x_scale="jac", tr_solver="lsmr", verbose=0)
+    res = torch_lsq.solve(rows, anchors[fit_tracks], cfg.fit.robust_loss, cfg.fit.robust_f_scale,
+                          max_nfev or cfg.fit.least_squares_max_nfev, extra=extra)
     a, o, q, X = L.unpack(res.x)
     if kind == "revolute":
         o = hinge_gauge(a, o, np.nanmedian(X, 0))
     anchors_out = anchors.copy()
     anchors_out[fit_tracks] = X
-    cov = marginal_covariance(res.jac, L)
+    cov = marginal_covariance(res.A, res.B, res.D, L)
     q_unc = np.full(T, np.nan)
     q_unc[problem.ref] = 0.0
     if cov.get("cov") is not None:
@@ -310,29 +193,20 @@ def fit_geometry(kind, axis0, origin0, q0, anchors, fit_tracks, weights, problem
     q = interpolate_missing(q, observed_t | (np.arange(T) == problem.ref), ts)
     info = dict(cost=float(res.cost), nfev=int(res.nfev), status=int(res.status), message=str(res.message),
                 n_residuals=int(n_rows), n_params=int(n_cols), n_fit_tracks=int(len(fit_tracks)), n_extra_rows=int(n_extra),
-                runtime_s=round(time.time() - t0, 3), observed_times=observed_t.tolist())
+                runtime_s=round(time.time() - t0, 3), observed_times=observed_t.tolist(),
+                solver=res.solver, device=res.device)
     info.update({k: v for k, v in cov.items() if k != "cov"})
     return a, o, q, anchors_out, q_unc, observed_t, info
 
 
-def marginal_covariance(J, L: _Layout):
-    """Gauss-Newton covariance of (axis chart, hinge chart, q) after eliminating anchors (Schur)."""
+def marginal_covariance(A, B, D, L: _Layout):
+    """Gauss-Newton covariance of (axis chart, hinge chart, q) after eliminating anchors (Schur); A = Jg'Jg,
+    B = Jg'Jx [g,K,3], D = per-anchor Jx'Jx [K,3,3] of the robust-scaled Jacobian at the solution."""
     try:
-        J = sparse.csr_matrix(J)
         g = L.n_global
-        Jg, Jx = J[:, :g], J[:, g:]
-        A = (Jg.T @ Jg).toarray()
-        B = (Jg.T @ Jx).toarray()
-        D = (Jx.T @ Jx).tocsr()
-        n = Jx.shape[1] // 3
-        Dinv_blocks = np.zeros((n, 3, 3))
-        Dd = D.toarray() if n <= 400 else None
-        for i in range(n):
-            blk = Dd[3 * i:3 * i + 3, 3 * i:3 * i + 3] if Dd is not None else D[3 * i:3 * i + 3, 3 * i:3 * i + 3].toarray()
-            Dinv_blocks[i] = np.linalg.pinv(blk + np.eye(3) * 1e-12)
-        Bb = B.reshape(g, n, 3)
-        BDinv = np.einsum("gni,nij->gnj", Bb, Dinv_blocks).reshape(g, -1)
-        Sm = A - BDinv @ B.T
+        Dinv_blocks = np.linalg.pinv(D + np.eye(3)[None] * 1e-12)
+        BDinv = np.einsum("gni,nij->gnj", B, Dinv_blocks).reshape(g, -1)
+        Sm = A - BDinv @ B.reshape(g, -1).T
         sv = np.linalg.svd(Sm, compute_uv=False)
         cov = np.linalg.pinv(Sm, rcond=1e-12)
         out = dict(cov=cov, schur_singular_values=sv.tolist(),

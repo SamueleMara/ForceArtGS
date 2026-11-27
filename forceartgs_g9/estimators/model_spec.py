@@ -258,3 +258,16 @@ class ModelSpec:
                     mass_model=None if self.mass_model is None else dict(
                         mode=self.mass_model.props.mode, M1=self.mass_model.M1, m1=self.mass_model.props.m1,
                         reflected_actuator_inertia=self.mass_model.reflected_actuator_inertia))
+
+
+INERTIA_VISCOUS_MODEL_ID = "inertia_viscous_minimal"
+
+
+def inertia_viscous_spec(joint_type: str) -> ModelSpec:
+    """Named, opt-in two-parameter ablation  M q'' + c q' = Q  (M effective inertia / mass, c viscous): no gravity, no
+    Coulomb / static friction, no bias, no reflected inertia. The default general model is unchanged; this matches
+    configs/g9_real/physx_behavioral_inertia_damping.yaml (gravity zero, Coulomb off) and is NOT a statement that the
+    real object has no gravity load or friction."""
+    from ..dynamics.general_1dof import GeneralTerms
+    return ModelSpec(GeneralTerms(inertia=True, viscous=True, coulomb=False, static=False, gravity=False, bias=False),
+                     joint_type, "joint_space_only")

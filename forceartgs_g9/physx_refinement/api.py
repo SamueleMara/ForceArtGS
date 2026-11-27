@@ -108,7 +108,7 @@ def run_forceartgs_physx_estimator(interactions, regime_by_name: dict, v0_by_nam
     `regime_by_name`: {name: {mode:free|forced, evidence:{source:..., ...}, train:bool}}
     `v0_by_name`: independently estimated/declared initial velocities (same q convention)
     `calibration_by_name`: {name: {status:VERIFIED|..., exploratory_opt_in:bool}}
-    `python`: SAPIEN interpreter (None: this one if it has sapien, else $PARTTWIN1D_PYTHON / parttwin_sim)
+    `python`: SAPIEN interpreter (None: this one, the forceartgs env)
     `profile`: {n, inner_maxiter, inner_popsize} -- rho_s profile (forced data only)
 
     This module does not derive force from sensor data: the existing canonical

@@ -54,7 +54,6 @@ def model_description(cfg) -> str:
 def run(run_root, scene, *, behavioral_config=None, robot_archive=None, contact_segments=None, pulse_rows=None,
         out_root=None, declared_joint_type=None, declaration_note=None, quick=False, python=None, io_response=None,
         log=print) -> dict:
-    from .. import physics_lib
     from ..adapters.forceartgs_g9 import _q_noise, accepted_kinematics, build_inputs
     from ..config import load_dynamics_config
     from ..forcetwin.pipeline import _clean, _git, _mass_model, _write, next_version
@@ -67,7 +66,6 @@ def run(run_root, scene, *, behavioral_config=None, robot_archive=None, contact_
     from .real_data import reference_urdf
     from .sapien_diagnostic import IsolatedSapienCpu, IsolatedSapienGpu, scale_urdf_mass_inertia
     t_start = time.time()
-    physics_lib.load()
     cfg = load_wrench_config(behavioral_config, quick=quick)
     if python:
         cfg["physics"]["python"] = python

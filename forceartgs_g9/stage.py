@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 
 from . import physics_lib
-from .config import load_dynamics_config, resolve_path
+from .config import load_dynamics_config
 from .core import run_g9
 
 
@@ -44,7 +44,8 @@ def run_dynamics_stage(run_root, scene, dynamics_config, *, physics_library=None
                        force_export=None, allow_diagnostic_kinematics=False, declared_joint_type=None,
                        declaration_note=None, declared_pulse_rows=None, log=print) -> dict:
     from .adapters.forceartgs_g9 import build_inputs
-    prov = physics_lib.load(physics_library)
+    if physics_library:                                  # explicit checkout override for the frozen baselines
+        physics_lib.load(physics_library)
     cfg = load_dynamics_config(dynamics_config)
     if allow_diagnostic_kinematics:
         cfg["pipeline"]["allow_diagnostic_kinematics"] = True
@@ -80,7 +81,8 @@ def run_dynamics_stage(run_root, scene, dynamics_config, *, physics_library=None
                                             source="declared: at rest at the start of the contact segment")
                 it.meta["episode_run_root"] = h["run_root"]
             inp.heldout += its
-    inp.input_hashes["physics_library"] = prov["commit"]
+    inp.input_hashes["physics_library"] = (physics_lib.PINNED_COMMIT if cfg["fitting"]["compare_frozen_viscous_baselines"]
+                                           else "not_used")
     inp.input_hashes["dynamics_config"] = json.dumps({k: v for k, v in cfg.items() if not k.startswith("_")},
                                                      sort_keys=True, default=str)
     root = Path(run_root) / "dynamics" / "g9"

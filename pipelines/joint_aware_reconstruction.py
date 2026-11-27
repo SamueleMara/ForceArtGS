@@ -67,22 +67,35 @@ def log(msg):
 
 # ----------------------------------------------------------------------------- environment
 def stage_env(output_root: Path) -> dict:
-    env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join([str(SUBMODULE), str(REPO), env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
+    from utils.forceartgs_env import clean_env
+    env = clean_env()                                   # forceartgs env + this repo only (no login-shell leakage)
     env["FORCEARTGS_JOINT_AWARE_TRIPWIRE"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    env["CUDA_HOME"] = "/usr/local/cuda-12.8"          # same toolkit as pipelines/train_local_datasets.sh
-    env["PATH"] = f"{env['CUDA_HOME']}/bin:{Path(sys.executable).parent}:{env.get('PATH', '')}"
-    prefix = Path(sys.executable).parents[1]
-    env["LD_LIBRARY_PATH"] = f"{prefix}/lib:{env['CUDA_HOME']}/lib64:{env.get('LD_LIBRARY_PATH', '')}"
     from utils.local_storage import runtime_environment
     rt = runtime_environment(output_root)
     for key, value in rt.items():
         if key not in ("PYTHONDONTWRITEBYTECODE", "MPLBACKEND"):
             Path(value).mkdir(parents=True, exist_ok=True)
     env.update(rt)
+    seed_model_weights(Path(rt["TORCH_HOME"]))
     env["MAX_JOBS"] = env.get("MAX_JOBS", "2")
     return env
+
+
+WEIGHTS = REPO / "checkpoints" / "torch" / "hub" / "checkpoints"     # scripts/download_checkpoints.sh
+
+
+def seed_model_weights(torch_home: Path) -> None:
+    """Every torch-hub weight the pipeline loads comes from the repo's checkpoints/ (no download, no old-run copy)."""
+    need = sorted(WEIGHTS.glob("*.pth")) if WEIGHTS.is_dir() else []
+    if not need:
+        raise StageError(f"model weights missing in {WEIGHTS}: run scripts/download_checkpoints.sh")
+    dst = torch_home / "hub" / "checkpoints"
+    dst.mkdir(parents=True, exist_ok=True)
+    for w in need:
+        t = dst / w.name
+        if not t.is_file() or t.stat().st_size != w.stat().st_size:
+            shutil.copy2(w, t)
 
 
 def run_cmd(cmd, log_path: Path, env, dry=False):
@@ -129,6 +142,10 @@ class Run:
             raise SystemExit(f"{self.root} was run with other iterations/frames/cameras; refusing to resume")
         self.m.update(iterations=self.iters, frames=args.frames, cameras=args.cameras, scene=str(self.scene),
                       job=self.job, branch_dirs={k: str(self.branch(k)) for k in BRANCHES})
+        if getattr(args, "declared_joint_type", None):            # recorded on every (resumed) run
+            prev = self.m.get("declaration") or {}
+            self.m["declaration"] = dict(prev, joint_type=args.declared_joint_type, note=args.declaration_note,
+                                         time=time.strftime("%F %T"))
         self.env = stage_env(Path(args.output_root))
 
     def branch(self, kind):
@@ -141,7 +158,15 @@ class Run:
             atomic_write_json(self.manifest_path, self.m)
 
     def branches(self):
-        return [k for k in BRANCHES if (self.branch(k) / "joint_authority" / "v000" / "authority.json").is_file()]
+        decl = getattr(self.args, "declared_joint_type", None)
+        wk = (self.m.get("selection_v2") or {}).get("working_motion_model")
+        if decl:
+            kinds = (decl,)                                    # operator declaration: only the declared branch
+        elif getattr(self.args, "working_branch_only", False) and wk in BRANCHES:
+            kinds = (wk,)                                      # evidence-based working model only (still not certified)
+        else:
+            kinds = BRANCHES
+        return [k for k in kinds if (self.branch(k) / "joint_authority" / "v000" / "authority.json").is_file()]
 
 
 # ----------------------------------------------------------------------------- stages
@@ -170,6 +195,25 @@ def st_audit(r: Run):
     r.set("audit", "PASSED", **info)
 
 
+def _set_aside(path: Path, why: str) -> Path:
+    """Move an INCOMPLETE stage output (left by a killed / suspended run) aside -- never deleted -- so the stage can
+    be redone. Returns the new location."""
+    dst = path.with_name(f"{path.name}.incomplete_{time.strftime('%Y%m%d_%H%M%S')}")
+    path.rename(dst)
+    log(f"   {why}: moved the incomplete {path.name} aside -> {dst.name}")
+    return dst
+
+
+def _npz_ok(p: Path) -> bool:
+    try:
+        with np.load(p, allow_pickle=False) as z:
+            for k in z.files:
+                z[k]
+        return True
+    except Exception:
+        return False
+
+
 def st_discover(r: Run):
     a = r.args
     d = r.root / "discovery"
@@ -187,14 +231,21 @@ def st_discover(r: Run):
         cli = [sys.executable, "-m", "estimotion_2part.joint_discovery.cli"]
         if not tcp.is_file():
             run_cmd(cli + ["robot-archive", "--scene", r.scene, "--output", tcp], d / "discover.log", r.env, a.dry_run)
+        if tcp.is_file() and not _npz_ok(tcp):
+            _set_aside(tcp, "truncated robot archive")
+            run_cmd(cli + ["robot-archive", "--scene", r.scene, "--output", tcp], d / "discover.log", r.env, a.dry_run)
         for cam in a.cameras:
             f = d / "observations" / f"obs_{cam}.npz"
+            if f.is_file() and not (_npz_ok(f) and f.with_suffix(".json").is_file()):
+                _set_aside(f, "truncated observation table")
             if not f.is_file():
                 run_cmd(cli + ["extract", "--scene", r.scene, "--camera", cam, "--frames", a.frames, "--tcp-npz", tcp,
                                "--output", f], d / "discover.log", r.env, a.dry_run)
             obs.append(f)
         run = d / "fit"
         if not (run / "joint_candidates.json").is_file():
+            if run.exists() and any(run.iterdir()):
+                _set_aside(run, "discovery fit")
             run_cmd(cli + ["fit", "--scene", r.scene, "--config", a.discovery_config, "--cameras", *a.cameras,
                            "--observations", *obs, "--uncertainty", "cluster_robust", "--remote-hinge-policy",
                            "observability", "--experiment-id", "JOINT_AWARE_DISCOVERY", "--output", run],
@@ -227,7 +278,7 @@ def st_multimodal_refine(r: Run):
     acc = out / "accepted" / "joint_selection_v2.json"
     if not acc.is_file():
         if out.exists() and any(out.iterdir()):
-            raise StageError(f"incomplete multimodal frontend directory {out}; inspect and remove it")
+            _set_aside(out, "multimodal frontend")
         run = Path(r.m["discovery"]["run"])
         cmd = [sys.executable, "-m", "estimotion_2part.joint_discovery.cli", "multimodal-refine", "--scene", r.scene,
                "--from-run", run, "--config", r.args.discovery_config, "--output", out]
@@ -270,7 +321,7 @@ def st_select(r: Run):
         shutil.copy2(Path(r.m["multimodal"]["accepted_dir"]) / "joint_selection_v2.json", out / "joint_selection_v2.json")
     if not (out / "joint_selection_v2.json").is_file():
         if out.exists() and any(out.iterdir()):
-            raise StageError(f"incomplete v2 selection directory {out}; inspect and remove it")
+            _set_aside(out, "v2 selection")
         if not (run / "tracks_observations.npz").is_file():
             raise StageError(f"discovery run lacks tracks_observations.npz: {run}")
         cmd = [sys.executable, "-m", "estimotion_2part.joint_discovery.cli", "select-v2", "--scene", r.scene,
@@ -284,12 +335,40 @@ def st_select(r: Run):
     if r.args.dry_run:
         r.set("select", "DRY_RUN")
         return
-    sel = json.loads((out / "joint_selection_v2.json").read_text())
+    sel_path = out / "joint_selection_v2.json"
+    if getattr(r.args, "force_guided_selection", False) and r.m.get("multimodal"):
+        sel_path = force_guided_selection(r)
+    sel = json.loads(sel_path.read_text())
     keep = ("physical_joint_status", "working_motion_model", "working_model_is_approximation",
             "physics_joint_export_ready", "selected_candidate", "failure_codes", "reasons", "counterfactual")
-    r.m["selection_v2"] = dict({k: sel[k] for k in keep}, path=str(out / "joint_selection_v2.json"),
-                               sha256=sha256_file(out / "joint_selection_v2.json"))
+    r.m["selection_v2"] = dict({k: sel[k] for k in keep}, path=str(sel_path), sha256=sha256_file(sel_path))
     r.set("select", sel["physical_joint_status"], **{k: sel[k] for k in keep[:6]})
+
+
+def force_guided_selection(r: Run) -> Path:
+    """Repaired candidate-wise selection + 3D-force direction evidence on the CACHED multimodal evidence (no track
+    recomputation, no torque, no dynamics): append-only <job>/joint_selection_force_guided/vNNN; a version with
+    identical inputs is reused. Returns the selection json to use (force FORCE_UNAVAILABLE without a robot archive)."""
+    from estimotion_2part.joint_discovery.force_guided_selection import _sha, run as fg_run
+    acc = Path(r.m["multimodal"]["accepted_dir"])
+    arc = r.m["discovery"].get("robot_archive") or r.args.robot_archive
+    v2 = acc / "selection"
+    want = dict(tracks_observations=_sha(acc / "tracks_observations.npz"),
+                joint_candidates_v2=_sha(v2 / "joint_candidates_v2.json"), joint_states_v2=_sha(v2 / "joint_states_v2.npz"),
+                joint_selection_v2=_sha(v2 / "joint_selection_v2.json"),
+                block_partition=_sha(v2 / "model_comparison" / "block_partition.json"),
+                robot_archive=_sha(arc) if arc else None)
+    root = r.root / "joint_selection_force_guided"
+    for v in sorted(root.glob("v[0-9][0-9][0-9]"), reverse=True):
+        if (v / "selection_force_guided.json").is_file() and json.loads((v / "source_hashes.json").read_text()) == want:
+            log(f"   force-guided selection: reusing {v.name} (identical inputs)")
+            return v / "selection_force_guided.json"
+    root.mkdir(parents=True, exist_ok=True)
+    out = root / f"v{len(list(root.glob('v[0-9][0-9][0-9]'))):03d}"
+    st = fg_run(r.scene, acc, out, robot_archive=arc, log=log)
+    r.m["force_guided_selection"] = {k: st[k] for k in ("out_dir", "B0", "B1", "B3", "force_evidence_status",
+                                                        "force_changed_decision_beyond_B1")}
+    return out / "selection_force_guided.json"
 
 
 def st_authority(r: Run):
@@ -298,12 +377,25 @@ def st_authority(r: Run):
     v2 = r.m.get("selection_v2") if r.args.selection == "v2" else None
     if r.args.selection == "v2" and v2 is None:
         raise StageError("run the select stage first (joint selection v2)")
-    if v2 is None:
+    decl = getattr(r.args, "declared_joint_type", None)
+    if decl:
+        # OPERATOR DECLARATION (recorded): the declared joint type is reconstructed; the selection's own verdict stays
+        # in joint_selection_v2.json and the manifest -- it is not relabelled
+        plan = {decl: "candidate"}
+        r.m["declaration"] = dict(joint_type=decl, note=r.args.declaration_note,
+                                  selection_status=(v2 or {}).get("physical_joint_status"),
+                                  selection_reasons=(v2 or {}).get("reasons"))
+        log(f"   OPERATOR DECLARATION: {decl} ({r.args.declaration_note}); selection said "
+            f"{(v2 or {}).get('physical_joint_status')}")
+    elif v2 is None:
         plan = {k: ("provisional" if decision == k else "candidate") for k in BRANCHES}
     else:
         st = v2["physical_joint_status"]
         if st == "NO_SIGNIFICANT_MOTION":
             raise StageError("joint selection v2: NO_SIGNIFICANT_MOTION -- nothing articulated to reconstruct")
+        if st == "MODEL_INCONSISTENT" and getattr(r.args, "working_branch_only", False):
+            raise StageError("joint selection v2: MODEL_INCONSISTENT -- no best joint branch exists "
+                             f"({'; '.join(v2['reasons'][:2])}); --working-branch-only trains none")
         if st == "MODEL_INCONSISTENT" and not r.args.allow_inconsistent_diagnostics:
             raise StageError("joint selection v2: MODEL_INCONSISTENT -- no single 1-DoF joint explains the motion "
                              f"({'; '.join(v2['reasons'][:2])}). Diagnostic branches only with "
@@ -311,7 +403,11 @@ def st_authority(r: Run):
         if st.startswith("IDENTIFIED_"):
             plan = {v2["selected_candidate"]: "identified"}          # the accepted candidate alone is authoritative
         elif st == "TYPE_UNOBSERVABLE":
-            plan = {k: "ambiguous" for k in BRANCHES}                 # both kept; working model flagged
+            wk = v2.get("working_motion_model")
+            if getattr(r.args, "working_branch_only", False) and wk in BRANCHES:
+                plan = {wk: "ambiguous"}                              # labelled working branch only (not certified)
+            else:
+                plan = {k: "ambiguous" for k in BRANCHES}             # both kept; working model flagged
         else:
             plan = {k: "candidate" for k in BRANCHES}                 # MODEL_INCONSISTENT diagnostics
     made = {}
@@ -322,7 +418,22 @@ def st_authority(r: Run):
         except AuthorityError as e:
             made[kind] = f"NOT_EVALUATED: {e}"
             continue
-        aid = auth.write(r.branch(kind) / "joint_authority" / "v000")
+        adir = r.branch(kind) / "joint_authority" / "v000"
+        if (adir / "authority.json").is_file():
+            old_a = JointAuthority.load(adir)
+            same = (old_a.joint_type == auth.joint_type and np.array_equal(old_a.axis_world, auth.axis_world) and
+                    np.array_equal(old_a.q, auth.q) and
+                    ((old_a.origin_world is None) == (auth.origin_world is None)) and
+                    (old_a.origin_world is None or np.array_equal(old_a.origin_world, auth.origin_world)))
+            if same and old_a.decision_status != status:
+                # identical geometry / q: keep the authority the reconstruction was built on; only the label moved
+                r.m.setdefault("authority_label_changes", {})[kind] = dict(
+                    written_as=old_a.decision_status, selection_now=status, time=time.strftime("%F %T"))
+                made[kind] = old_a.authority_id()
+                log(f"authority {kind}: kept {made[kind][:12]} (written as {old_a.decision_status}; selection now "
+                    f"{status}, recorded)")
+                continue
+        aid = auth.write(adir)
         made[kind] = aid
         log(f"authority {kind}: {aid[:12]} span {np.ptp(auth.q):.4f} {auth.q_units} status {status}")
     r.m["discovery_decision"] = decision
@@ -918,6 +1029,22 @@ def st_export(r: Run):
         r.set("export", "ABSTAIN", reason=f"selection {sel.get('status')}: no accepted joint-aware asset "
                                           "(--export-diagnostic for candidate diagnostics)")
         return
+    if r.args.handoff_only:
+        res = {}
+        for name, branch in jobs:
+            hdir = r.root / "parttwin_handoff" / name
+            if not (hdir / "articulated_3dgs_handoff.json").is_file():
+                cmd = [sys.executable, "tools/export_parttwin_handoff.py", "--run", r.root, "--output", hdir]
+                if branch:
+                    cmd += ["--diagnostic-branch", branch]
+                elif not ready:
+                    cmd += ["--assumed-physical-joint", r.args.assume_physical_joint]
+                run_cmd(cmd, r.root / "logs" / "export.log", r.env, r.args.dry_run)
+            res[name] = dict(handoff=str(hdir / "articulated_3dgs_handoff.json"),
+                             written=(hdir / "articulated_3dgs_handoff.json").is_file())
+        ok = r.args.dry_run or (res and all(v["written"] for v in res.values()))
+        r.set("export", "PASSED" if ok else "FAILED", handoffs=res, parttwin_build="not run (--handoff-only)")
+        return
     env = dict(r.env)
     env["PYTHONPATH"] = str(PARTTWIN_ROOT / "src")
     env["PARTTWIN_SIM_PYTHON"] = SIM_PY
@@ -1024,8 +1151,20 @@ def main(argv=None):
     ap.add_argument("--allow-non-ssd", action="store_true", help="tests only: allow an output root off the SSD")
     ap.add_argument("--export-parttwin", action="store_true", help="G8: export the accepted asset via PArtTwin1D")
     ap.add_argument("--export-diagnostic", action="store_true", help="G8: also diagnostic assets for ambiguous scenes")
+    ap.add_argument("--handoff-only", action="store_true",
+                    help="G8: write the joint/visual hand-off (in-repo tools/export_parttwin_handoff.py) and STOP: no "
+                         "external PArtTwin1D build (the estimated URDF/USD is written by forceartgs_g9 from the hand-off)")
     ap.add_argument("--dynamics-spec", help="measured physics spec YAML (collision, inertia, joint stops, ...)")
     ap.add_argument("--registration-spec", help="registration YAML (T_world_capture, gravity alignment)")
+    ap.add_argument("--declared-joint-type", choices=["revolute", "prismatic"], default=None,
+                    help="OPERATOR declaration: reconstruct only this joint type (the selection verdict is kept on "
+                         "record, not relabelled); requires --declaration-note")
+    ap.add_argument("--declaration-note", default=None)
+    ap.add_argument("--force-guided-selection", action="store_true",
+                    help="repaired candidate-wise R/P selection + 3D-force direction evidence on the cached multimodal "
+                         "evidence before any 3DGS stage (append-only joint_selection_force_guided/vNNN; no declaration)")
+    ap.add_argument("--working-branch-only", action="store_true",
+                    help="build / train only the evidence-based WORKING branch (TYPE_UNOBSERVABLE stays uncertified)")
     ap.add_argument("--selection", choices=["v2", "legacy"], default="v2",
                     help="v2 (default): observable physical joint selection decides; legacy: discovery decision + "
                          "render comparison (diagnostic, never certifies a physical joint)")
@@ -1052,6 +1191,8 @@ def main(argv=None):
                     help="G9: export_force_contact_annotations.py output for the canonical robot record")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
+    if args.declared_joint_type and not args.declaration_note:
+        ap.error("--declared-joint-type needs --declaration-note (who declared it and why)")
     if not args.allow_non_ssd and not str(Path(args.output_root).resolve()).startswith(SSD):
         ap.error(f"--output-root must be on the Extreme SSD ({SSD})")
     stages = STAGES if args.stage == "all" else tuple(s.strip() for s in args.stage.split(","))

@@ -1,0 +1,94 @@
+# Rest-to-rest comparison of G9 estimators / PINN ablations / G10 PhysX on ONE immutable episode per scene.
+#   python -m forceartgs_g9.cli rest-to-rest-compare --run RUN --scene SCENE --robot-archive ARC \
+#       --config configs/g9_real/rest_to_rest_compare.yaml [--contact-segments SEG (C0 archival only)] [--quick]
+# Strict schema (forceartgs_g9/physx_refinement/rest_to_rest_comparison.py: load_r2r_config): unknown keys are errors;
+# qdot resets, q recentering, hidden tares, contact classification and fitted force scales are banned keys.
+schema: forceartgs.g9_g10.rest_to_rest_compare/v1
+enabled: true
+experimental_facts:                     # GIVEN by the experiment owner (validated to be exactly these)
+  known_global_sensor_transform: true
+  wrench_already_tared: true
+  continuous_contact: true
+  initial_velocity: 0.0
+  final_velocity: 0.0
+episode:
+  selection: full_visual_rest_to_rest   # t0 / T from VISUAL stationary plateaus only (no force / contact / residual)
+  source: existing_joint_authority
+  q0_source: initial_visual_plateau
+  qT_source: final_visual_plateau
+  rest_plateau_confidence_sigma: 3.0    # constant fit |q - mean| <= k sigma AND trend |slope| / se <= k
+  rest_plateau_min_samples: 4
+  rest_plateau_min_duration_s: 0.12
+  rest_plateau_sigma_floor: 0.0003      # sigma = hypot(q_sigma, floor): the same numeric floor as the G10 loss
+  reject_cropped_moving_start: true     # a crop that starts moving -> REST_START_NOT_COVERED (never v0 = 0 on it)
+  no_contact_segmentation: true
+  max_row_gap_factor: 1.5               # native wrench rows: larger gaps -> INPUT_COVERAGE_ERROR (no fill)
+input:
+  source: full_six_axis_tared_wrench
+  coordinate_transform: existing_known_global_transform
+  native_sampling: true
+  zoh: true
+  additional_tare: false
+  contact_mask: none                    # C1: every native row in [t0, T], low values included
+  compare_historical_masked_input: true # C0 archival control (needs --contact-segments)
+  effort_components: full_wrench         # full_wrench | force_only_at_tcp (labelled variant: measured moment dropped)
+model:
+  terms: [inertia, viscous]             # M q'' + c q' = Q (explicit ablation: no gravity, no Coulomb, no bias)
+  gravity: zero
+  coulomb: false
+  bias: false
+  armature: 0.0
+  use_same_urdf_mass_geometry_as_g10: true
+analytical:
+  endpoint_formulas: true               # B1: c_end = J_Q / dq, M_end (Eqs. 2, 5)
+  double_integral_constrained_ls: true  # B2: constrained (whitened) double-integral LS (Eq. 4)
+  convolution_1d: true                  # B3: exact ZOH convolution output error, lambda profile (Eq. 6)
+  svd_scale_columns: true
+  return_signed_unconstrained_estimate: true
+  lambda_max_per_s: 50.0                # profile lambda = c / M in [0, 50] 1/s
+  lambda_grid_points: 61
+  bootstrap_draws: 200                  # parametric bootstrap of the declared q / anchor / wrench / tare noise
+  tare_reference_rows: 25               # tare-reference uncertainty = row sd / sqrt(25) (0.5 s baseline at 50 Hz)
+  family_k_sd: 2.0
+pinn:
+  compare_legacy: true                  # historical GeneralPINN, matched-data adaptation
+  hard_rest_to_rest: true
+  strong_ablation: true                 # B4
+  double_integral_ablation: true        # B5
+  hybrid_ablation: false                # B6 (optional)
+  soft_bc_control: false                # soft-endpoint control (optional)
+  seeds: [0, 1, 2]
+  use_full_input: true
+  initial_velocity_nuisance: false
+  hidden: 32
+  layers: 3
+  steps_data: 3000
+  steps_joint: 4000
+  lr_net: 0.003
+  lr_theta: 0.01
+  n_colloc: 300
+  n_quad: 256
+  l_double_integral: 1.0
+  l_strong: 1.0
+physx:
+  engine: sapien_gpu_physx              # must equal the simplified G10 config (identical physics in every row)
+  timestep_s: 0.001
+  use_existing_simplified_config: configs/g9_real/physx_behavioral_inertia_damping.yaml
+  primary_loss: existing_position_output_error
+  terminal_velocity_loss_weights: [0.0, 0.1, 1.0]   # 0 = V0 (B0); > 0 = V1 (B10), predeclared
+  terminal_velocity_scale_from_rest_plateau: true
+  compare_each_initializer_equal_budget: true       # B7 / B8 / B9 / union at the SAME DE budget as B0
+  export_candidate_preview_only: true
+  profile_baseline_family: true                     # near-optimal family of B0 (candidate_family.json)
+benchmark:
+  include_original_historical_results: true
+  include_matched_input_baseline: true
+  include_input_policy_ablation: true
+  same_data_same_model_same_budget: true
+  include_legacy_g9_matched_adaptations: true
+  write_plots: true
+output:
+  append_only: true
+  preserve_original_results: true
+  preserve_existing_g9_exports: true
+  write_report: true

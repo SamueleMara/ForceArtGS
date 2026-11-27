@@ -1,4 +1,4 @@
-"""Input-output identification WITH the actual engine (SAPIEN 3 / PhysX CPU via the parttwin_sim worker): T8 clean room
+"""Input-output identification WITH the actual engine (SAPIEN 3 / PhysX CPU, forceartgs env): T8 clean room
 (revolute + prismatic, every readback), T9 scale family / armature degeneracy / capability coverage, and the
 analytical-to-PhysX reconciliation end to end. Skipped without a SAPIEN interpreter. CPU only; native axis friction,
 static breakaway and Isaac are NOT covered (not exposed / not installed)."""

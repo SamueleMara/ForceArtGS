@@ -28,7 +28,7 @@ import numpy as np
 
 from .geometry_fit import _select_fit_tracks, fit_geometry
 from .rigid_kinematics import apply_joint_inverse, body_velocity, exp_so3_axis_angle, normalize
-from .tcp_contact import UNAVAILABLE, joint_rate, surface_from_observed_patch, tcp_velocity
+from .tcp_contact import joint_rate, surface_from_observed_patch, tcp_velocity
 from .wrench_physics import fit_shared_mu
 
 ABSTAIN = "ABSTAIN"
@@ -337,7 +337,8 @@ def _axis_angle(a, b):
 
 
 def select_physical_joint(*, motion_evidence, model_fits, common_support, attachment_evidence, predictive_evidence,
-                          render_evidence=None, robot_evidence=None, cfg=None) -> PhysicalDecision:
+                          render_evidence=None, robot_evidence=None, cfg=None,
+                          legacy_r_first=False) -> PhysicalDecision:
     """Evidence hierarchy of spec section 7, in order. Never converts ambiguity into a physical joint.
 
     ``motion_evidence``: dict(rotation=rotation_vs_translation_evidence, shared_axis, hinge, null, support_quality)
@@ -372,6 +373,55 @@ def select_physical_joint(*, motion_evidence, model_fits, common_support, attach
     def decide(status, working, sel, ready=False):
         return PhysicalDecision(status, working, not status.startswith("IDENTIFIED_"), ready, sel, reasons, ev, unc,
                                 codes, cf)
+
+    frp = (robot_evidence or {}).get("force_guided") or {}
+    frp_status = frp.get("status")
+    ev["force_guided"] = frp or dict(status="FORCE_UNAVAILABLE", reason="no 3D-force-guided evidence given")
+
+    def r_failed_assess_p(r_code, r_reason):
+        """Symmetric repair (force-informed selection spec 3.1): a failed REVOLUTE candidate is not 'both models
+        failed'. Evaluate the slide on the SAME evidence: P is a viable working model unless the held-out blocks
+        decisively prefer R with separable predictions, or force-informed evidence prefers R. Never certifies P here
+        (a rotation was measured): TYPE_UNOBSERVABLE / working prismatic, or MODEL_INCONSISTENT when neither fits."""
+        hf = attachment_evidence.get("hinge_fit", {}) or {}
+        half = hf.get("object_half_diag_m")
+        d10 = hf.get("d10_to_interface_m")
+        ratio = (float(d10) / float(half)) if (d10 is not None and half) else None
+        remote = bool(ratio is not None and ratio > 1.0)
+        ev["remote_hinge"] = dict(d10_to_interface_m=d10, object_half_diag_m=half, ratio_to_object=ratio,
+                                  remote=remote, rule="fitted hinge farther from the observed interface than the "
+                                                      "object's own half-diagonal (object-relative, no fixed cutoff)")
+        indist = sep.get("status") == "INDISTINGUISHABLE"
+        ho_pref = ho.get("preference") if ho.get("status") == "OK" else None
+        codes.append(r_code)
+        reasons.append(r_reason)
+        if remote:
+            codes.append("REMOTE_HINGE_DEGENERACY")
+            reasons.append(f"the fitted hinge is {d10:.3g} m from the observed interface = {ratio:.2g} x the object "
+                           "half-diagonal: a remote-hinge limit, i.e. locally a translation")
+        r_wins = (ho_pref == "revolute" and not indist) or frp_status == "FAVOURS_REVOLUTE"
+        if r_wins:
+            why = []
+            if ho_pref == "revolute" and not indist:
+                why.append("held-out blocks decisively prefer the revolute fit and R/P predictions are separable")
+            if frp_status == "FAVOURS_REVOLUTE":
+                why.append("3D-force direction evidence favours the revolute candidate on held-out blocks")
+            reasons.append("the slide does not explain the motion either (" + "; ".join(why) + "): neither 1-DoF "
+                           "candidate is physically and predictively acceptable")
+            codes.append("ROTATION_INCOMPATIBLE_WITH_SLIDE")
+            cf.update(revolute=r_reason, prismatic="rejected: " + "; ".join(why))
+            return decide("MODEL_INCONSISTENT", "none", None)
+        how = (f"R/P predictions are {sep.get('status')} at the measurement noise" if sep.get("status") else
+               "R/P prediction separation not evaluated")
+        reasons.append(f"slide evaluated on the same evidence: {how}; held-out preference "
+                       f"{ho_pref if ho_pref else ho.get('status')}"
+                       + (f"; 3D-force evidence: {frp_status}" if frp_status else ""))
+        reasons.append("working model prismatic is an APPROXIMATION (a rotation was measured, so the slide is not "
+                       "certified); the revolute candidate is rejected as physical geometry, not by simplicity")
+        codes.append("SLIDE_WORKING_APPROXIMATION")
+        codes.append("TYPE_UNOBSERVABLE")
+        cf.update(revolute=r_reason, prismatic="not certified: a rotation was measured; usable as a working model only")
+        return decide("TYPE_UNOBSERVABLE", "prismatic", None)
 
     if ((robot_evidence or {}).get("contact") or {}).get("assumption_failed_segments"):
         codes.append("CONTACT_MODE_CONTRADICTED")
@@ -418,21 +468,30 @@ def select_physical_joint(*, motion_evidence, model_fits, common_support, attach
                       revolute="the hinge line itself is not identified")
             return decide("TYPE_UNOBSERVABLE", "revolute", None)
         if hp_field.get("verdict") == "CONTRADICTED" or hp_fit.get("verdict") == "CONTRADICTED":
-            reasons.append("substantial rotation, but the hinge line is far from the observed static/moving interface "
-                           f"(field d10={hp_field.get('d10_to_interface_m')}, fit d10={hp_fit.get('d10_to_interface_m')})")
-            codes.append("HINGE_ASSEMBLY_CONTRADICTED")
-            cf = dict(revolute="hinge inconsistent with the observed assembly", prismatic="rotation is measured")
-            return decide("MODEL_INCONSISTENT", "none", None)
+            msg = ("substantial rotation, but the hinge line is far from the observed static/moving interface "
+                   f"(field d10={hp_field.get('d10_to_interface_m')}, fit d10={hp_fit.get('d10_to_interface_m')})")
+            if legacy_r_first:
+                reasons.append(msg)
+                codes.append("HINGE_ASSEMBLY_CONTRADICTED")
+                cf = dict(revolute="hinge inconsistent with the observed assembly", prismatic="rotation is measured")
+                return decide("MODEL_INCONSISTENT", "none", None)
+            return r_failed_assess_p("HINGE_ASSEMBLY_CONTRADICTED", msg)
         if d_axis is not None and d_axis > c["max_axis_disagreement_deg"]:
-            reasons.append(f"fitted revolute axis differs by {d_axis:.1f} deg from the hinge-free rotation axis")
-            codes.append("FIT_FIELD_AXIS_DISAGREE")
-            cf = dict(revolute="the reconstruction candidate is not the measured rotation", prismatic="rotation measured")
-            return decide("MODEL_INCONSISTENT", "none", None)
+            msg = f"fitted revolute axis differs by {d_axis:.1f} deg from the hinge-free rotation axis"
+            if legacy_r_first:
+                reasons.append(msg)
+                codes.append("FIT_FIELD_AXIS_DISAGREE")
+                cf = dict(revolute="the reconstruction candidate is not the measured rotation", prismatic="rotation measured")
+                return decide("MODEL_INCONSISTENT", "none", None)
+            return r_failed_assess_p("FIT_FIELD_AXIS_DISAGREE", msg)
         if ho.get("preference") == "prismatic":
-            reasons.append("rotation is measured but the revolute fit predicts held-out blocks worse than the slide")
-            codes.append("PREDICTIVE_CONTRADICTION")
-            cf = dict(revolute="worse held-out prediction", prismatic="cannot explain the measured rotation")
-            return decide("MODEL_INCONSISTENT", "none", None)
+            msg = "rotation is measured but the revolute fit predicts held-out blocks worse than the slide"
+            if legacy_r_first:
+                reasons.append(msg)
+                codes.append("PREDICTIVE_CONTRADICTION")
+                cf = dict(revolute="worse held-out prediction", prismatic="cannot explain the measured rotation")
+                return decide("MODEL_INCONSISTENT", "none", None)
+            return r_failed_assess_p("PREDICTIVE_CONTRADICTION", msg)
         if not cam_axes_ok:
             codes.append("CAMERA_AXIS_DISAGREEMENT")
             reasons.append("per-camera rotation axes disagree with the pooled axis")
@@ -462,6 +521,10 @@ def select_physical_joint(*, motion_evidence, model_fits, common_support, attach
         if fmech.get("status") == "OK" and fmech.get("favours") == "prismatic":
             codes.append("FORCE_DISAGREES")
             reasons.append("verified force under the declared mechanical model favours the slide")
+        if frp_status == "FAVOURS_PRISMATIC":
+            codes.append("FORCE_DISAGREES")
+            reasons.append("3D-force direction evidence (held-out) favours the slide: the revolute verdict stands on "
+                           "geometry, export readiness withheld")
         if (rob.get("contact") or {}).get("unverified_scale"):
             codes.append("UNVERIFIED_PRIOR_SCALE")
         ready = (not [x for x in codes if x in ("CAMERA_AXIS_DISAGREEMENT", "FORCE_DISAGREES", "UNVERIFIED_PRIOR_SCALE",
@@ -492,6 +555,8 @@ def select_physical_joint(*, motion_evidence, model_fits, common_support, attach
                        "(positive support only together with the excluded plausible hinges below)")
     if force_slider:
         reasons.append("verified force under the declared mechanical model favours the slide beyond null controls")
+    if frp_status:
+        reasons.append(f"3D-force evidence: {frp_status} (recorded; it never certifies a joint type)")
     positive_guide = positive_guide or contact_slider or force_slider
     if (rob.get("contact") or {}).get("unverified_scale") and (contact_slider and not force_slider and
                                                                 guide.get("verdict") != "GUIDE_ALIGNED"):

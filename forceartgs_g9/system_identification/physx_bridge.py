@@ -1,4 +1,4 @@
-"""Bridge to the EXISTING G10 PhysX refinement (estimator side, the parttwin_sim worker) -- no estimation in PArtTwin1D.
+"""Bridge to the EXISTING G10 PhysX refinement (estimator side, SAPIEN in the forceartgs env) -- no estimation in PArtTwin1D.
 
 * ``engine_capabilities``: what the installed runtime exposes (SAPIEN 3.0.3: legacy dimensionless joint friction,
   armature, drives -- NO native static / dynamic / viscous axis friction -> friction coverage is the labelled

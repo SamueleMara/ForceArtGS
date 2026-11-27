@@ -56,6 +56,40 @@ limitations are in [`docs/joint_discovery_phase1.md`](docs/joint_discovery_phase
 
 ## Installation
 
+### ForceArtGS: one self-contained conda env
+
+Everything the ForceArtGS pipeline runs (3DGS training, joint discovery, q(t) extension, G9 estimation, SAPIEN/PhysX
+replay, URDF/USD export, tests) runs in ONE conda env, `forceartgs`, with its own CUDA 12.4 toolkit. Vanilla FreeArtGS
+keeps its own `freeartgs` env.
+
+```bash
+bash envs/create_forceartgs_env.sh      # forceartgs env (CUDA in the env, compiled gsplat, SAPIEN, USD, ...)
+bash scripts/download_checkpoints.sh    # model weights -> checkpoints/ (sha256-checked)
+bash scripts/run_tests.sh               # full test suite
+```
+
+Every ForceArtGS entry point starts from `utils/forceartgs_env.py`: the `forceartgs` env plus this repo only. Nothing
+is inherited from the login shell (ROS, other repos on `PYTHONPATH`, a system `CUDA_HOME`). The pinned package list
+is `envs/forceartgs.pip-freeze.txt`. ForceArtGS-Physics (a private hand-off without a redistribution licence) is
+installed into the env at its pinned commit and never committed here.
+
+GPU stages: AllTracker, 3DGS, the joint-discovery geometry fit (`estimotion_2part/joint_discovery/torch_lsq.py`:
+scipy's TRF iteration on torch with exact forward-mode Jacobians and a Schur-reduced Gauss-Newton step, plus the
+per-track anchor refinement), every PINN / torch estimator (`forceartgs_g9/estimators/torch_model.torch_device`) and
+the PhysX replay. The PINNs run on the CPU by default (`--pinn-device cpu|cuda` on the driver and on
+`forceartgs_g9.cli rest-to-rest-compare`, env `FORCEARTGS_PINN_DEVICE`): these small nets are launch-bound on the GPU
+(measured 101 s vs 59 s per variant, same estimates). `FORCEARTGS_DISCOVERY_DEVICE=cpu` forces a CPU reference run of
+the discovery solver.
+
+Real episodes, end to end to URDF + USD with the estimated joint damping and moving inertia:
+
+```bash
+~/miniconda3/envs/forceartgs/bin/python pipelines/suspend_resilient.py -- \
+  ~/miniconda3/envs/forceartgs/bin/python pipelines/real_full_to_estimated_assets.py
+```
+
+### FreeArtGS (upstream)
+
 Please follow [docs/install.md](docs/install.md) to set up the environment and required third-party dependencies.
 
 This fork stores its modified Nerfstudio implementation in the `nerfstudio-local`

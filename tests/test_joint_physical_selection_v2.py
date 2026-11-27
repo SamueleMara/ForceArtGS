@@ -21,8 +21,7 @@ from estimotion_2part.joint_discovery.cli import run_discovery  # noqa: E402
 from estimotion_2part.joint_discovery.config import JointDiscoveryConfig, load_joint_discovery_config  # noqa: E402
 from estimotion_2part.joint_discovery.motion_field import (PointTable, chained_intervals,  # noqa: E402
                                                            estimate_interval_rigid_evidence,
-                                                           estimate_shared_angular_axis, hinge_from_intervals,
-                                                           rotation_vs_translation_evidence)
+                                                           estimate_shared_angular_axis, rotation_vs_translation_evidence)
 from estimotion_2part.joint_discovery.observations import TrackObservations  # noqa: E402
 from estimotion_2part.joint_discovery.physical_selection import (PhysicalDecision, render_veto_allowed,  # noqa: E402
                                                                  select_physical_joint)
@@ -291,13 +290,22 @@ class GateC(unittest.TestCase):
         d = select_physical_joint(**evidence(inconsistent=True, rotation_detected=True, axis_ok=True, net=30))
         self.assertEqual((d.physical_joint_status, d.working_motion_model), ("MODEL_INCONSISTENT", "none"))
 
-    def test_c_rotation_with_contradicted_hinge_is_inconsistent_not_prismatic(self):
-        d = select_physical_joint(**evidence(rotation_detected=True, axis_ok=True, net=15, hinge_verdict="CONTRADICTED"))
-        self.assertEqual(d.physical_joint_status, "MODEL_INCONSISTENT")
+    def test_c_rotation_with_contradicted_hinge_fails_R_then_evaluates_P_never_certifies_it(self):
+        # force-guided selection spec: a contradicted hinge fails THAT revolute geometry; the slide is evaluated on
+        # the same evidence and kept as an uncertified WORKING model (a rotation was measured)
+        ev = evidence(rotation_detected=True, axis_ok=True, net=15, hinge_verdict="CONTRADICTED")
+        d = select_physical_joint(**ev)
+        self.assertEqual((d.physical_joint_status, d.working_motion_model), ("TYPE_UNOBSERVABLE", "prismatic"))
+        self.assertIn("HINGE_ASSEMBLY_CONTRADICTED", d.failure_codes)
+        self.assertFalse(d.physics_joint_export_ready)
+        self.assertEqual(select_physical_joint(**ev, legacy_r_first=True).physical_joint_status, "MODEL_INCONSISTENT")
 
-    def test_c_rotation_but_heldout_prefers_slide_is_inconsistent(self):
-        d = select_physical_joint(**evidence(rotation_detected=True, axis_ok=True, net=15, heldout_pref="prismatic"))
-        self.assertEqual(d.physical_joint_status, "MODEL_INCONSISTENT")
+    def test_c_rotation_but_heldout_prefers_slide_keeps_a_prismatic_working_model(self):
+        ev = evidence(rotation_detected=True, axis_ok=True, net=15, heldout_pref="prismatic")
+        d = select_physical_joint(**ev)
+        self.assertEqual((d.physical_joint_status, d.working_motion_model), ("TYPE_UNOBSERVABLE", "prismatic"))
+        self.assertIn("PREDICTIVE_CONTRADICTION", d.failure_codes)
+        self.assertEqual(select_physical_joint(**ev, legacy_r_first=True).physical_joint_status, "MODEL_INCONSISTENT")
 
     def test_c_unobservable_hinge_is_not_identified(self):
         d = select_physical_joint(**evidence(rotation_detected=True, axis_ok=True, net=2, hinge_ok=False))

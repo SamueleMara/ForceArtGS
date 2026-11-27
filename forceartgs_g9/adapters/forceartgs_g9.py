@@ -50,12 +50,22 @@ def accepted_kinematics(run_root, allow_diagnostic=False, declared_joint_type=No
     from estimotion_2part.joint_discovery.integration_contract import JointAuthority
     run = Path(run_root)
     man = json.loads((run / "run_manifest.json").read_text())
-    if not (run / "selection.json").is_file():
+    sv = man.get("selection_v2") or {}
+    if not (run / "selection.json").is_file() and sv.get("path") and \
+            man.get("stages", {}).get("authority", {}).get("status") == "PASSED":
+        # PRE-RECONSTRUCTION selection: the joint is selected and its authority built, the 3DGS / render comparison
+        # (which writes selection.json) has not run. Never export-ready; the joint geometry is the same authority.
+        sel = dict(schema_version=2, status=sv["physical_joint_status"], selected=sv.get("selected_candidate"),
+                   working_motion_model=sv.get("working_motion_model"), selection_v2=sv["path"],
+                   physics_joint_export_ready=False,
+                   source="PRE_RECONSTRUCTION_SELECTION (joint selection + authority; no 3DGS / selection.json yet)")
+    elif not (run / "selection.json").is_file():
         st = man.get("stages", {}).get("select", {}).get("status") or "NOT_RUN"
         return dict(status=STATUS_MAP.get(st, "UNKNOWN"), selection_status=st, kind=None, selection=None,
                     reason=f"no selection.json (select stage {st}; authority "
                            f"{man.get('stages', {}).get('authority', {}).get('status')}): no accepted joint authority")
-    sel = json.loads((run / "selection.json").read_text())
+    else:
+        sel = json.loads((run / "selection.json").read_text())
     if sel.get("schema_version") != 2:
         raise ValueError("G9 requires selection v2 (physical joint selection); legacy selections are diagnostic only")
     st = sel["status"]
@@ -168,8 +178,7 @@ def force_audit(scene, authority, robot_archive, contact_segments, use_torque=Fa
 def contact_efforts(authority, robot_archive, segments, *, multiplier) -> list:
     """Per contact segment: generalized effort Q(t) at 50 Hz and q(t) at the authority times (DIAGNOSTIC unless
     every force gate passed). Q = a.F (P) or a.((p - o) x F) (R), F = multiplier * R_WS F_sensor on the object."""
-    from forceartgs_physics.forces.projection import generalized_effort
-    from forceartgs_physics.schemas import ForceRecord, JointKinematics, KinematicStatus
+    from ..effort import generalized_effort
     z = np.load(robot_archive, allow_pickle=False)
     rows = np.asarray(z["source_row"], int)
     T_ee, T_tcp, W = (np.asarray(z[k], float) for k in ("T_base_ee", "T_base_tcp", "wrench"))
@@ -177,7 +186,6 @@ def contact_efforts(authority, robot_archive, segments, *, multiplier) -> list:
     P = T_tcp[:, :3, 3]
     a = authority.axis_world
     o = authority.origin_world if authority.origin_world is not None else np.zeros(3)
-    joint = JointKinematics(authority.joint_type, a, o, "base_link", KinematicStatus.IDENTIFIED)
     src = np.asarray(authority.source_frame_index, int)
     out = []
     for s in segments:
@@ -186,13 +194,15 @@ def contact_efforts(authority, robot_archive, segments, *, multiplier) -> list:
         k = (src >= lo) & (src <= hi) & np.asarray(authority.q_valid, bool)
         if m.sum() < 5 or k.sum() < 5:
             continue
-        fr = ForceRecord(t_s=rows[m] / 50.0, force_N=F[m], point_m=P[m], frame="base_link")
-        eff = generalized_effort(joint, fr)
+        t_f = rows[m] / 50.0
+        if np.any(np.diff(t_f) <= 0):
+            raise ValueError("force samples must be strictly increasing in time")
+        Q = generalized_effort(authority.joint_type, a, o, F[m], P[m])
         qs = authority.q_sigma[k] if authority.q_sigma is not None else None
         out.append(G9Interaction(f"{s.get('segment_id', 'contact')}_{lo}-{hi}", authority.joint_type,
                                  np.asarray(authority.timestamp_s)[k], np.asarray(authority.q)[k],
                                  qs if qs is not None and np.all(np.isfinite(qs)) and np.all(qs > 0) else
-                                 _q_noise(authority, k), _ZOH(eff.t_s, eff.levels, eff.model), None,
+                                 _q_noise(authority, k), _ZOH(t_f, Q, "signed vector projection"), None,
                                  dict(source_rows=[lo, hi], slip_mode=s.get("slip_mode"))))
     return out
 
@@ -427,8 +437,6 @@ def _com_dir(auth, centroid):
 
 def build_inputs(run_root, scene, cfg, *, robot_archive=None, contact_segments=None, force_export=None,
                  declared_joint_type=None, declaration_note=None, log=print) -> G9Inputs:
-    from .. import physics_lib
-    physics_lib.provenance()
     kin = accepted_kinematics(run_root, cfg["pipeline"]["allow_diagnostic_kinematics"], declared_joint_type,
                               declaration_note)
     if kin.get("kind") is None:
@@ -441,7 +449,7 @@ def build_inputs(run_root, scene, cfg, *, robot_archive=None, contact_segments=N
                 frontend_contact_used=bool(kin["multimodal"]["contact_evidence_used"]))
     fx = Path(force_export) if force_export else Path(run_root).parent.parent / "contact_annotations" / Path(scene).name
     if robot_archive and Path(robot_archive).is_file() and (fx / "contact_annotations.csv").is_file():
-        from estimotion_2part.joint_discovery.robot_record import build_robot_record, save_robot_record
+        from estimotion_2part.joint_discovery.robot_record import build_robot_record
         rec = build_robot_record(scene, fx, robot_archive, contact_segments)
         fa = record_force_audit(rec, auth, cfg)
         its = record_interactions(rec, auth, cfg, meta)
@@ -504,10 +512,16 @@ def build_inputs(run_root, scene, cfg, *, robot_archive=None, contact_segments=N
         except (ReferencePoseError, KeyError) as e:
             ref_pose = dict(status="FAIL", reasons=[f"{type(e).__name__}: {e}"], q_ref=None)
         if ref_pose["status"] == "PASS":
-            proxy = build_proxy(kin["visual_handoff"], cfg["mass_model"]["tentative_proxy"])
-            proxy["provenance"]["q_ref"] = ref_pose["q_ref"]
-            mesh = proxy["mesh"]
-            cfg["mass_model"]["mode"] = proxy["mode"]               # solid_hull -> uniform_solid, shell -> shell
+            from ..dynamics.geometry_proxy import ProxyGeometryError
+            try:
+                proxy = build_proxy(kin["visual_handoff"], cfg["mass_model"]["tentative_proxy"])
+            except ProxyGeometryError as e:
+                proxy = None
+                log(f"[g9] tentative proxy refused: {e}")
+            if proxy is not None:
+                proxy["provenance"]["q_ref"] = ref_pose["q_ref"]
+                mesh = proxy["mesh"]
+                cfg["mass_model"]["mode"] = proxy["mode"]           # solid_hull -> uniform_solid, shell -> shell
         else:
             log(f"[g9] tentative proxy refused: reference pose not verified ({ref_pose.get('reasons')})")
     mech = None

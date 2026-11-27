@@ -99,10 +99,10 @@ _BACKEND_STATUS: Optional[Dict[str, Any]] = None
 def ensure_gsplat_backend() -> Dict[str, Any]:
     """Make the existing gsplat 0.1.11 CUDA extension importable; never compiles anything.
 
-    gsplat JIT-loads ``gsplat_cuda`` only when ``nvcc`` is on PATH (the repo pipelines export
-    ``CUDA_HOME=/usr/local/cuda-12.8``). When it is not, we load the *already built* extension from the
-    torch extension cache (``~/.cache/torch_extensions/py*_cu*/gsplat_cuda/gsplat_cuda.so``) and bind it
-    to ``gsplat.cuda._backend._C``. Same kernels, no rebuild, no write to the cache.
+    In the forceartgs env gsplat is installed with its compiled module ``gsplat.csrc`` (envs/create_forceartgs_env.sh),
+    so ``gsplat.cuda._backend._C`` is set on import. Fallback for other envs: load an *already built* JIT extension
+    from the torch extension cache (``<TORCH_EXTENSIONS_DIR>/gsplat_cuda/gsplat_cuda.so``) and bind it to
+    ``gsplat.cuda._backend._C``. Same kernels, no rebuild, no write to the cache.
     Returns ``dict(available, source, reason)``."""
     global _BACKEND_STATUS
     if _BACKEND_STATUS is not None and _BACKEND_STATUS["available"]:
@@ -403,7 +403,7 @@ def _local_range(depth: np.ndarray, valid: np.ndarray, r: int = 1) -> np.ndarray
     return np.nan_to_num(rng, nan=0.0)
 
 
-@dataclass
+@dataclass(frozen=True)
 class ProvenanceConfig:
     min_depth_m: float = 0.05
     max_depth_m: float = 10.0
@@ -412,7 +412,10 @@ class ProvenanceConfig:
     depth_edge_m: float = 0.05     # local 3x3 measured depth range above this -> ambiguous (mixed pixels)
 
 
-def pixel_provenance(measured_depth, object_mask, robot_mask=None, cfg: ProvenanceConfig = ProvenanceConfig()):
+DEFAULT_PROVENANCE = ProvenanceConfig()
+
+
+def pixel_provenance(measured_depth, object_mask, robot_mask=None, cfg: ProvenanceConfig = DEFAULT_PROVENANCE):
     """Candidate-independent per-pixel provenance from measured data only (int8 [H,W]).
 
     Priority: robot -> OCCLUDED_BY_ROBOT; robot edge band / object-mask edge band / depth discontinuity
@@ -470,7 +473,7 @@ def depth_loss_weights(prov: np.ndarray, r: RenderOutput, measured_depth, *, par
 
 
 # =========================================================================== losses
-@dataclass
+@dataclass(frozen=True)
 class LossConfig:
     rgb_delta: float = 0.05        # pseudo-Huber scale, intensity units
     depth_delta_m: float = 0.02    # pseudo-Huber scale, metres
@@ -494,8 +497,11 @@ def _masked_mean(x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
     return (x * m).sum() / n.clamp_min(1.0)
 
 
+DEFAULT_LOSS = LossConfig()
+
+
 def render_losses(r: RenderOutput, measured: Mapping[str, Any], sets: Mapping[str, Any],
-                  cfg: LossConfig = LossConfig(), depth_weights: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+                  cfg: LossConfig = DEFAULT_LOSS, depth_weights: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
     """L_RGB, L_depth (metres), L_alpha on fixed pixel sets (bool [H,W] numpy/torch).
 
     L_RGB  = mean pseudo-Huber of per-pixel RGB residual norm on ``sets['rgb']``.
@@ -545,7 +551,7 @@ def _mask_hash(sets: Mapping[str, np.ndarray]) -> str:
 def score_candidates_frozen(canonical_static: Optional[GaussianSet], canonical_moving: GaussianSet,
                             candidates: Sequence[Any], cameras: Mapping[str, Any], frames: Iterable[int],
                             measured: Mapping[str, Mapping[int, Mapping[str, Any]]], *,
-                            loss_cfg: LossConfig = LossConfig(), prov_cfg: ProvenanceConfig = ProvenanceConfig(),
+                            loss_cfg: LossConfig = DEFAULT_LOSS, prov_cfg: ProvenanceConfig = DEFAULT_PROVENANCE,
                             background=(0.0, 0.0, 0.0)) -> Dict[str, Any]:
     """Score static / prismatic / revolute hypotheses with ONE frozen canonical asset on IDENTICAL pixels.
 

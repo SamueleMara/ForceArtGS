@@ -36,7 +36,7 @@ import torch
 
 from ..dynamics.general_1dof import ModelConfigError, simulate_general
 from .general_integral_ls import moving_segments
-from .torch_model import DT, TorchDynamics, zoh_integral, zoh_torch
+from .torch_model import DT, TorchDynamics, on_torch_device, torch_device, zoh_integral, zoh_torch
 
 
 @dataclass
@@ -66,6 +66,24 @@ class PINNConfig:
     select_seed_by: str = "replay"             # replay (frozen-theta open-loop, training data) | loss
     phys_scale_rms_floor: float = 0.02         # s_r >= 2 % of the effort RMS (declared numerical floor)
     huber_delta: float = 1.0
+    # ---- opt-in rest-to-rest ablations (estimators/rest_to_rest_pinn.py); the defaults are the historical behaviour
+    trajectory_boundary_mode: str = "legacy"   # legacy | hard_rest_to_rest | soft_rest_to_rest
+    physics_form: str = "legacy"               # legacy | strong_only | double_integral_rest2rest | hybrid
+    l_double_integral: float = 1.0             # weight of the derivative-free double-integral residual (Eq. 10)
+    l_soft_bc: float = 1.0                     # soft endpoint penalty weight (soft_rest_to_rest control only)
+    n_quad: int = 256                          # fixed uniform quadrature nodes on [t0, T] (+ every visual time)
+    replay_v0: str = "prefix_fit"              # prefix_fit (historical 4-sample v0) | zero (rest-to-rest replay)
+
+    def __post_init__(self):
+        if self.trajectory_boundary_mode not in ("legacy", "hard_rest_to_rest", "soft_rest_to_rest"):
+            raise ModelConfigError(f"trajectory_boundary_mode {self.trajectory_boundary_mode!r}")
+        if self.physics_form not in ("legacy", "strong_only", "double_integral_rest2rest", "hybrid"):
+            raise ModelConfigError(f"physics_form {self.physics_form!r}")
+        if self.replay_v0 not in ("prefix_fit", "zero"):
+            raise ModelConfigError(f"replay_v0 {self.replay_v0!r}")
+        if (self.trajectory_boundary_mode == "legacy") != (self.physics_form == "legacy"):
+            raise ModelConfigError("the legacy net goes with the legacy physics terms; the rest-to-rest net modes go "
+                                   "with strong_only | double_integral_rest2rest | hybrid (rest_to_rest_pinn.py)")
 
     @classmethod
     def from_dict(cls, d):
@@ -85,7 +103,7 @@ class _Net(torch.nn.Module):
         for a, b in zip(dims[:-1], dims[1:]):
             L = torch.nn.Linear(a, b, dtype=DT)
             with torch.no_grad():
-                L.weight.copy_(torch.randn(b, a, generator=g, dtype=DT) * math.sqrt(1.0 / a))
+                L.weight.copy_(torch.randn(b, a, generator=g, dtype=DT, device="cpu") * math.sqrt(1.0 / a))
                 L.bias.zero_()
             self.lin.append(L)
         self.t0, self.T = float(t0), float(max(t1 - t0, 1e-6))
@@ -156,7 +174,6 @@ class _Episode:
         self.s_w_parts = (2 * ((M0 or 0.0) * s_qd) ** 2 + 2 * ((c0 or 0.0) * sq) ** 2,
                           max(sig, cfg.phys_scale_rms_floor * rms) ** 2 * dtf)
         qrange = float(np.ptp(it.q_obs)) or float(np.median(it.q_std)) * 10
-        T = self.t1 - self.t0
         self.s_v = max(3 * self.v_eps, 1e-9)
         self.s_a = max(self.s_v / max(np.median(np.diff(it.t_obs)), 1e-3), 1e-9)
         self.q_scale = max(qrange, 5 * float(np.median(it.q_std)))
@@ -252,7 +269,6 @@ def pinn_losses(dyn: TorchDynamics, eta, ep: _Episode, net, cfg: PINNConfig, tc,
     r = dyn.residual(v, q, qd, qdd, Q)
     out["phys"] = _huber(r[mov] / ep.s_r, cfg.huber_delta) if mov.any() else torch.zeros((), dtype=DT)
     if rest.any():
-        net_eff = torch.abs(Q[rest] - G(q[rest]) - b)
         thr = Fs if Fs is not None else (Fc if dyn.has["coulomb"] else None)
         st = ((qd[rest] / ep.s_v) ** 2 + (qdd[rest] / ep.s_a) ** 2).mean()
         ri = rest if rest_ineq is None else rest_ineq
@@ -300,6 +316,7 @@ def pinn_losses(dyn: TorchDynamics, eta, ep: _Episode, net, cfg: PINNConfig, tc,
     return out
 
 
+@on_torch_device
 def _fit_one(interactions, spec, theta0, cfg: PINNConfig, seed: int, log=None):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
@@ -339,12 +356,15 @@ def _fit_one(interactions, spec, theta0, cfg: PINNConfig, seed: int, log=None):
     return theta, hist, eps, nets
 
 
-def open_loop_replay(spec, theta, interactions, max_step=1e-3) -> dict:
-    """Frozen-theta hybrid-simulator replay from (q0 = first observation, v0 from a local fit) -- the PINN's
-    reported fit quality, independent of its trajectory nets."""
+def open_loop_replay(spec, theta, interactions, max_step=1e-3, v0_mode="prefix_fit") -> dict:
+    """Frozen-theta hybrid-simulator replay from (q0 = first observation, v0) -- the PINN's reported fit quality,
+    independent of its trajectory nets. v0_mode 'prefix_fit' (historical default: v0 from a 4-sample local fit, for
+    cropped historic results) | 'zero' (rest-to-rest full demonstration: v0 = 0 exactly)."""
+    if v0_mode not in ("prefix_fit", "zero"):
+        raise ValueError(f"v0_mode {v0_mode!r}")
     out = []
     for it in interactions:
-        v0 = float(np.polyfit(it.t_obs[:4] - it.t_obs[0], it.q_obs[:4], 1)[0])
+        v0 = (0.0 if v0_mode == "zero" else float(np.polyfit(it.t_obs[:4] - it.t_obs[0], it.q_obs[:4], 1)[0]))
         try:
             r = simulate_general(spec.sim(theta), it.effort, it.t_obs, t0=float(it.t_obs[0]), q0=float(it.q_obs[0]),
                                  v0=v0, max_step=max_step)
@@ -352,12 +372,18 @@ def open_loop_replay(spec, theta, interactions, max_step=1e-3) -> dict:
             out.append(dict(interaction=it.name, rmse_over_sigma=float(np.sqrt(np.mean(e ** 2)))))
         except ModelConfigError as ex:
             out.append(dict(interaction=it.name, error=str(ex)))
-    return dict(per_interaction=out, note="open-loop hybrid-simulator replay with the frozen PINN theta (v0 from a "
-                                          "4-sample local fit); not the trained trajectory nets")
+    return dict(per_interaction=out, v0_mode=v0_mode,
+                note=("open-loop hybrid-simulator replay with the frozen PINN theta (v0 from a 4-sample local fit); not "
+                      "the trained trajectory nets" if v0_mode == "prefix_fit" else
+                      "open-loop hybrid-simulator replay with the frozen PINN theta from (q0, v0 = 0 exactly); not the "
+                      "trained trajectory nets"))
 
 
 def general_pinn_fit(interactions, spec, theta0, cfg: PINNConfig | None = None, log=None) -> dict:
     cfg = cfg or PINNConfig()
+    if cfg.trajectory_boundary_mode != "legacy":
+        raise ModelConfigError("general_pinn_fit is the historical PINN; the rest-to-rest variants live in "
+                               "estimators/rest_to_rest_pinn.py")
     t_start = time.time()
     thetas, hists = [], []
     eps = None
@@ -368,7 +394,8 @@ def general_pinn_fit(interactions, spec, theta0, cfg: PINNConfig | None = None, 
     T = np.array(thetas)
     mean, std = T.mean(0), T.std(0, ddof=1) if len(T) > 1 else np.full(T.shape[1], np.nan)
     def _rep(th_):
-        v = [x["rmse_over_sigma"] for x in open_loop_replay(spec, th_, interactions)["per_interaction"]
+        v = [x["rmse_over_sigma"] for x in open_loop_replay(spec, th_, interactions,
+                                                            v0_mode=cfg.replay_v0)["per_interaction"]
              if "rmse_over_sigma" in x]
         return float(np.mean(v)) if v else math.inf
     seed_replay = [_rep(x) for x in T]
@@ -387,10 +414,11 @@ def general_pinn_fit(interactions, spec, theta0, cfg: PINNConfig | None = None, 
                                     per_seed_final_loss=[float(x) for x in seed_loss],
                                     note="seeds are ranked by frozen-theta open-loop replay on the TRAINING data "
                                          "(not by neural training loss); no held-out data used"),
-                loss_history=hists, settings=asdict(cfg),
+                loss_history=hists, settings=dict(asdict(cfg), device=str(torch_device())),
                 scales={e.it.name: dict(s_r=e.s_r, s_r_components=e.s_r_components, s_v=e.s_v, s_a=e.s_a,
                                         pulses=[(a, b, J) for a, b, J in e.pulses],
                                         rest_runs=e.rest_runs, breakaway_t=e.breakaway_t) for e in eps},
-                replay=open_loop_replay(spec, th, interactions), runtime_s=time.time() - t_start,
+                replay=open_loop_replay(spec, th, interactions, v0_mode=cfg.replay_v0),
+                runtime_s=time.time() - t_start,
                 differentiation="torch.autograd (create_graph=True) in physical seconds; no finite differences",
                 note="PINN parameters from the seed selected by seed_selection.by (default: best frozen-theta open-loop replay on the training data); ensemble spread reported")

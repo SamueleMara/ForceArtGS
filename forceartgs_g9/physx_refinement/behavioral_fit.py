@@ -15,7 +15,6 @@ from __future__ import annotations
 import hashlib
 import math
 from collections import OrderedDict
-from dataclasses import replace
 
 import numpy as np
 
@@ -199,7 +198,16 @@ def _huber_sum(r, delta):
     return float(np.sum(np.where(a <= delta, 0.5 * r * r, delta * (a - 0.5 * delta))))
 
 
-def lm_lockstep(rollout, pe: Episode, bounds, starts, cfg, *, fixed=None, max_nfev=None) -> list:
+def _terminal_resid(res, pe, terminal):
+    """Opt-in V1 residual appended to the position residuals: sqrt(n w) qdot(T) / sigma_vT (equal to n w huber(z)
+    in the quadratic zone; the final selection always uses the exact objective)."""
+    qd = res.qdot
+    if qd is None:
+        raise ValueError("no qdot for the terminal residual")
+    return math.sqrt(len(pe.q) * float(terminal["weight"])) * float(np.asarray(qd, float)[-1]) / float(terminal["sigma"])
+
+
+def lm_lockstep(rollout, pe: Episode, bounds, starts, cfg, *, fixed=None, max_nfev=None, terminal=None) -> list:
     """Batched robust Levenberg-Marquardt run on MANY starts in LOCKSTEP (PhysX GPU): per iteration ONE batch holds
     every active start's forward-difference Jacobian columns, and ONE batch every start's damping ladder of trial
     steps (the best one that lowers that start's cost is accepted). The GPU's cost is per call, not per candidate
@@ -232,10 +240,14 @@ def lm_lockstep(rollout, pe: Episode, bounds, starts, cfg, *, fixed=None, max_nf
         for (k, _), pp in zip(items, ps):
             nf[k] += 1
             try:
-                q = np.asarray(rollout(pp, pe).q, float)
+                res = rollout(pp, pe)
+                q = np.asarray(res.q, float)
                 if q.shape != pe.q.shape or not np.isfinite(q).all():
                     raise ValueError("invalid rollout")
-                out.append((q - pe.q) / sig)
+                r = (q - pe.q) / sig
+                if terminal and float(terminal["weight"]) > 0:
+                    r = np.r_[r, _terminal_resid(res, pe, terminal)]
+                out.append(r)
             except (ValueError, FloatingPointError, RuntimeError):
                 nfail[k] += 1
                 out.append(None)
@@ -312,18 +324,19 @@ def lm_lockstep(rollout, pe: Episode, bounds, starts, cfg, *, fixed=None, max_nf
     return out
 
 
-def _local_refine_batched(rollout, pe, bounds, start, cfg, *, fixed=None, max_nfev=None) -> dict:
-    return lm_lockstep(rollout, pe, bounds, [start], cfg, fixed=fixed, max_nfev=max_nfev)[0]
+def _local_refine_batched(rollout, pe, bounds, start, cfg, *, fixed=None, max_nfev=None, terminal=None) -> dict:
+    return lm_lockstep(rollout, pe, bounds, [start], cfg, fixed=fixed, max_nfev=max_nfev, terminal=terminal)[0]
 
 
-def local_refine(rollout, pe: Episode, bounds, start: PhysicalParameters, cfg, *, fixed=None, max_nfev=None) -> dict:
+def local_refine(rollout, pe: Episode, bounds, start: PhysicalParameters, cfg, *, fixed=None, max_nfev=None,
+                 terminal=None) -> dict:
     """Bounded robust TRF (SciPy least_squares, loss='huber', f_scale = the LossSettings Huber delta) on the SAME
     PhysX residuals (q_PX - q_obs) / sqrt(sigma_q^2 + sigma_num^2): cost = sum huber, i.e. n x the position term of
     RefinementLoss. Only rho_scale / viscous / dynamic_effort move (``fixed``: names held at the start value); armature
     and static_excess stay fixed; q0 / v0 are never touched. Failed rollouts are counted (> 50 % -> no result).
     A batched engine (PhysX GPU) uses the batched Levenberg-Marquardt instead (same loss, one batch per step)."""
     if _batched(rollout):
-        return _local_refine_batched(rollout, pe, bounds, start, cfg, fixed=fixed, max_nfev=max_nfev)
+        return _local_refine_batched(rollout, pe, bounds, start, cfg, fixed=fixed, max_nfev=max_nfev, terminal=terminal)
     from scipy.optimize import least_squares
     f = cfg["fitting"]
     delta = float(cfg["loss"]["huber_delta"])
@@ -344,14 +357,18 @@ def local_refine(rollout, pe: Episode, bounds, start: PhysicalParameters, cfg, *
     def R(x):
         stats["n"] += 1
         try:
-            q = np.asarray(rollout(P(x), pe).q, float)
+            res = rollout(P(x), pe)
+            q = np.asarray(res.q, float)
             if q.shape != pe.q.shape or not np.isfinite(q).all():
                 raise ValueError("invalid rollout")
-            return (q - pe.q) / sig
+            r = (q - pe.q) / sig
+            if terminal and float(terminal["weight"]) > 0:
+                r = np.r_[r, _terminal_resid(res, pe, terminal)]
+            return r
         except (ValueError, FloatingPointError, RuntimeError) as e:
             stats["failed"] += 1
             stats["last"] = f"{type(e).__name__}: {e}"
-            return np.full(len(pe.q), 1e6)
+            return np.full(len(pe.q) + (1 if terminal and float(terminal["weight"]) > 0 else 0), 1e6)
     # start strictly inside the box: TRF's bound scaling (Coleman-Li) freezes a variable that starts ON a bound
     x = np.array([v0[n] for n in free])
     budget = int(max_nfev or f["local_max_nfev"])
@@ -386,12 +403,17 @@ def local_refine(rollout, pe: Episode, bounds, start: PhysicalParameters, cfg, *
 
 
 # ------------------------------------------------------------------------------------------------- fit
-def fit_full_demo(rollout, ep: FullDemoBehavioralEpisode, cfg, bounds, starts: dict, *, log=None) -> dict:
+def fit_full_demo(rollout, ep: FullDemoBehavioralEpisode, cfg, bounds, starts: dict, *, log=None,
+                  objective_factory=None, terminal=None) -> dict:
     """``starts``: {label: PhysicalParameters} deterministic baselines / warm starts (prior reference, io warm start,
-    admissible corners). Each is SCORED (baseline table); the best starts the bounded differential evolution."""
+    admissible corners). Each is SCORED (baseline table); the best starts the bounded differential evolution.
+    Opt-in (rest-to-rest V1): ``objective_factory(rollout, [pe], settings)`` replaces RefinementLoss (it must extend
+    it), ``terminal`` = dict(weight, sigma) adds the matching residual to the local refinement. Defaults: unchanged."""
     f, floor = cfg["fitting"], float(cfg["loss"]["numeric_floor_q"])
     pe = ep.to_physx_episode()
-    obj = RefinementLoss(rollout, [pe], loss_settings(cfg))
+    obj = (objective_factory or RefinementLoss)(rollout, [pe], loss_settings(cfg))
+    if not isinstance(obj, RefinementLoss):
+        raise BehavioralContractError("objective_factory must build a RefinementLoss (the existing position objective)")
     fc = fit_configuration(bounds, f, vectorized=_batched(rollout))
     assert_full_demo_fit(obj, fc)
     if _batched(rollout):
@@ -408,7 +430,7 @@ def fit_full_demo(rollout, ep: FullDemoBehavioralEpisode, cfg, bounds, starts: d
         raise RuntimeError(f"every baseline rollout failed: {base}")
     best_start = min(ok, key=lambda k: ok[k]["objective"])
     if log:
-        log(f"[g10-behavioral] baselines: " + ", ".join(f"{k} L={v['objective']:.4g}" for k, v in ok.items()) +
+        log("[g10-behavioral] baselines: " + ", ".join(f"{k} L={v['objective']:.4g}" for k, v in ok.items()) +
             f"; DE from '{best_start}'")
     rep = fit_physx(obj, fc, x0=vec(PhysicalParameters(**ok[best_start]["params"])))
     p = PhysicalParameters(**rep["params"])
@@ -417,10 +439,10 @@ def fit_full_demo(rollout, ep: FullDemoBehavioralEpisode, cfg, bounds, starts: d
     if f["local_refine"]:
         seeds = [("global_de", p)] + [(k, PhysicalParameters(**ok[k]["params"])) for k in
                                       sorted(ok, key=lambda k: ok[k]["objective"])[:max(int(f["local_starts"]) - 1, 0)]]
-        lrs = (lm_lockstep(rollout, pe, bounds, [s0 for _, s0 in seeds], cfg) if _batched(rollout) else
-               [None] * len(seeds))
+        lrs = (lm_lockstep(rollout, pe, bounds, [s0 for _, s0 in seeds], cfg, terminal=terminal) if _batched(rollout)
+               else [None] * len(seeds))
         for (lab, s0), lr_b in zip(seeds, lrs):
-            lr = lr_b if lr_b is not None else local_refine(rollout, pe, bounds, s0, cfg)
+            lr = lr_b if lr_b is not None else local_refine(rollout, pe, bounds, s0, cfg, terminal=terminal)
             row = dict(start=lab, status=lr["status"], nfev=lr["nfev"], n_failed=lr["n_failed"],
                        message=lr.get("message") or lr.get("reason"))
             if lr["status"] == "OK":

@@ -19,7 +19,8 @@ set -euo pipefail
 SCENE="$1"; FRAMES="$2"; CAMS="$3"
 NAME=$(basename "$SCENE")
 OUT="${4:-outputs/joint_discovery_next/$NAME}"
-PY="${PYTHON:-$HOME/miniconda3/envs/freeartgs/bin/python}"
+PY="${PYTHON:-${FORCEARTGS_PYTHON:-$HOME/miniconda3/envs/forceartgs/bin/python}}"
+eval "$("$PY" "$(dirname "${BASH_SOURCE[0]}")/../utils/forceartgs_env.py")"   # clean env: forceartgs + repo only
 CONFIG="${CONFIG:-configs/joint_discovery.real_tcp2cm.yaml}"
 STAGES="${STAGES:-A0 A1 A3 C2 D1}"
 CLI=("$PY" -m estimotion_2part.joint_discovery.cli)

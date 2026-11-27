@@ -11,7 +11,6 @@ Nothing here modifies a dataset or a legacy output; runs go to a fresh directory
 from __future__ import annotations
 
 import argparse
-import copy
 import csv
 import json
 import time
@@ -28,7 +27,7 @@ from .model_selection import (DECISIONS, bic_report, choose_reference_time, comp
                               score_candidates_on_heldout)
 from .observations import (TrackObservations, concatenate_observations, load_scene_cameras, load_scene_frame_map,
                            parse_frame_range)
-from .rigid_kinematics import apply_joint, decompose_prismatic_velocity, decompose_revolute_velocity
+from .rigid_kinematics import decompose_prismatic_velocity, decompose_revolute_velocity
 from .visual_losses import camera_stacks, render_point_proxy, residual_report, whitened_residuals
 
 REPO = Path(__file__).resolve().parents[2]
@@ -838,6 +837,21 @@ def main(argv=None):
     e.add_argument("--tcp-npz", type=Path, default=None, help="exclude the measured robot tool (TCP->EE shaft)")
     e.add_argument("--tool-radius-m", type=float, default=0.03)
     e.add_argument("--output", required=True, type=Path)
+    fg = sub.add_parser("force-guided-select", help="automatic joint selection with the repaired candidate-wise selector + "
+                        "3D-force direction evidence on CACHED observations (B0-B3; append-only; no torque / dynamics)")
+    fg.add_argument("--scene", required=True, type=Path)
+    fg.add_argument("--from-run", required=True, type=Path, help="multimodal accepted dir (tracks + selection/)")
+    fg.add_argument("--robot-archive", type=Path, default=None)
+    fg.add_argument("--config", type=Path, default=None)
+    fg.add_argument("--output", required=True, type=Path)
+    xs = sub.add_parser("extend-states", help="frozen-joint q(t) on more frames (e.g. the whole recording): the "
+                        "accepted joint is kept exactly, q is measured from tracks; new versioned authority")
+    xs.add_argument("--authority", required=True, type=Path, help="existing joint_authority/vNNN directory (frozen)")
+    xs.add_argument("--observations", nargs="+", required=True, type=Path,
+                    help="extract outputs over a frame range CONTAINING the authority's frames (one per camera)")
+    xs.add_argument("--output", required=True, type=Path, help="NEW directory for the extended authority")
+    xs.add_argument("--tau-m", type=float, default=0.006, help="3D residual scale / moving-track spread [m]")
+    xs.add_argument("--min-points", type=int, default=8)
     d = sub.add_parser("from-dumps", help="adapter for samuele/dump_window_tracks.py archives")
     d.add_argument("--scene", required=True, type=Path)
     d.add_argument("--camera", required=True)
@@ -960,6 +974,28 @@ def main(argv=None):
         run_discovery(sc.obs, sc.calibs, cfg, args.output, scene="synthetic",
                       oracle=dict(axis=sc.gt_axis, origin=sc.gt_origin))
         return 0
+    if args.cmd == "force-guided-select":
+        from .force_guided_selection import run as fg_run
+        st = fg_run(args.scene, args.from_run, args.output, robot_archive=args.robot_archive, config=args.config, log=_log)
+        print(json.dumps(st, indent=1, default=str))
+        return 0
+    if args.cmd == "extend-states":
+        from .frozen_joint_extension import extend_authority, write_extension
+        from .integration_contract import JointAuthority
+        if (args.output / "authority.json").exists():
+            raise SystemExit(f"{args.output} already holds an authority: choose a new directory (append-only)")
+        parent = JointAuthority.load(args.authority)
+        parts = [TrackObservations.load(p) for p in args.observations]
+        obs = parts[0] if len(parts) == 1 else concatenate_observations(parts)
+        import hashlib
+        srcs = [dict(path=str(p), sha256=hashlib.sha256(Path(p).read_bytes()).hexdigest()) for p in args.observations]
+        res = extend_authority(parent, obs, tau_m=args.tau_m, min_points=args.min_points, sources=srcs)
+        rep = write_extension(res, args.output)
+        v = rep.get("validation") or {}
+        _log(f"extend-states: {res['status']} -> {args.output}; overlap rms {v.get('rms_difference')} "
+             f"(tol {v.get('tolerance')}), {(rep.get('result') or {}).get('n_frames')} frames"
+             + (f"; {rep.get('reason')}" if rep.get("reason") else ""))
+        return 0 if res["status"] == "EXTENDED" else 2
     if args.cmd == "extract":
         extract_alltracker(args.scene, args.camera, parse_frame_range(args.frames), args.output,
                            args.query_every, args.grid_stride, downscale=args.downscale, mask_dir=args.mask_dir,

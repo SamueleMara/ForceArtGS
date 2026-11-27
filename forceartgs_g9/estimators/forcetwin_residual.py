@@ -19,6 +19,7 @@ import numpy as np
 import torch
 
 from .forcetwin_linear import direct_rows
+from .torch_model import on_torch_device
 
 DT = torch.float64
 ABLATIONS = ("none", "g", "damping", "both")
@@ -32,7 +33,7 @@ class _MLP(torch.nn.Module):
         self.l2 = torch.nn.Linear(h, 1, dtype=DT)
         for p in self.parameters():
             with torch.no_grad():
-                p.copy_(torch.randn(p.shape, generator=g, dtype=DT) * 0.3)
+                p.copy_(torch.randn(p.shape, generator=g, dtype=DT, device="cpu") * 0.3)
         if not legacy_init:                       # start EXACTLY at the physical baseline (zero output layer)
             with torch.no_grad():
                 self.l2.weight.zero_()
@@ -109,6 +110,7 @@ def _split(win, t, frac=0.75):
     return tr, ~tr
 
 
+@on_torch_device
 def fit_residual(rec, beta, mode, *, grav=None, hidden=8, seed=0, lr=1e-3, wd=1e-3, epochs=1200, patience=120,
                  lam_smooth=1e-3, orthogonalize=True, legacy_init=False, min_improvement=0.05) -> dict:
     """Train one residual head on the frozen baseline. Model selection keeps the NO-RESIDUAL baseline as a candidate
@@ -170,7 +172,7 @@ def fit_residual(rec, beta, mode, *, grav=None, hidden=8, seed=0, lr=1e-3, wd=1e
         net.load_state_dict(best_state)
     with torch.no_grad():
         pred = proj(net(q, v)) if selected == "trained" else torch.zeros_like(r)
-    P = pred.numpy()
+    P = pred.cpu().numpy()
     Zw_, Pw_ = D["Z"] * D["w"][:, None], P * D["w"]
     nz = np.linalg.norm(Zw_, axis=0) * max(float(np.linalg.norm(Pw_)), 1e-300)
     ortho = float(np.max(np.abs(Zw_.T @ Pw_) / np.where(nz > 0, nz, 1.0))) if np.any(P) else 0.0
@@ -181,7 +183,7 @@ def fit_residual(rec, beta, mode, *, grav=None, hidden=8, seed=0, lr=1e-3, wd=1e
     diss = None
     if net.cpos is not None:
         with torch.no_grad():
-            cval = net.c(q, v).numpy()
+            cval = net.c(q, v).cpu().numpy()
         diss = dict(min_c=float(cval.min()), max_c=float(cval.max()),
                     dissipated_power_max=float(np.max(-cval * D["v"] ** 2)), note="-c qdot^2 <= 0 by construction "
                     "(before the orthogonal projection, which removes the part collinear with b qdot)")

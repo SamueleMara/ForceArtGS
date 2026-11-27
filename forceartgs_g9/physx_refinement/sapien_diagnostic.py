@@ -10,8 +10,8 @@ There is no static-friction surrogate: Fs > Td explicitly fails closed.
 Native friction optimization needs a version-compatible Isaac/PhysX adapter.
 
 The simulation itself lives in ``runtime_scripts/sapien_physx_worker.py`` (sapien + numpy only). It runs in this
-interpreter when ``sapien`` is importable, otherwise in a persistent worker process of the engine interpreter
-(``PARTTWIN1D_PYTHON`` or ``~/miniconda3/envs/parttwin_sim/bin/python``; the freeartgs env has no SAPIEN).
+interpreter (the forceartgs env has SAPIEN), or in a persistent worker process of the same interpreter (GPU runner:
+CUDA context isolated from the estimator). Never another repository's env.
 Engine defaults that would silently add dissipation (legacy joint friction 0.05, link linear/angular damping 0.05,
 articulation sleeping, drives) are zeroed and READ BACK every rollout; a nonzero readback fails closed.
 """
@@ -20,8 +20,8 @@ from __future__ import annotations
 import atexit
 import importlib.util
 import json
+import sys
 import math
-import os
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
@@ -36,8 +36,8 @@ MODES = {"frictionless_physx": "frictionless", "external_effort_surrogate": "ext
 
 
 def default_engine_python():
-    p = os.environ.get("PARTTWIN1D_PYTHON", str(Path.home() / "miniconda3/envs/parttwin_sim/bin/python"))
-    return p if Path(p).is_file() else None
+    """This interpreter when it has SAPIEN (the forceartgs env), else None: no fallback to another env."""
+    return sys.executable if importlib.util.find_spec("sapien") is not None else None
 
 
 def scale_urdf_mass_inertia(source, target, moving_link, scale):
@@ -211,7 +211,7 @@ class IsolatedSapienCpu:
         else:
             py = python or default_engine_python()
             if py is None:
-                raise RuntimeError("no SAPIEN interpreter: install sapien here or set PARTTWIN1D_PYTHON")
+                raise RuntimeError("no SAPIEN in this interpreter: run ForceArtGS in the forceartgs env")
             self._run, self.backend_process = _Worker(py), f"worker:{py}"
         self._tmp = tempfile.TemporaryDirectory(prefix="forceartgs_physx_estimator_")
         self._urdfs = {}
@@ -293,7 +293,7 @@ class IsolatedSapienGpu(IsolatedSapienCpu):
                  friction_mode="external_effort_surrogate", python=None, readback_rtol=1e-4, device="cuda"):
         py = python or default_engine_python()
         if py is None:
-            raise RuntimeError("no SAPIEN interpreter: set PARTTWIN1D_PYTHON")
+            raise RuntimeError("no SAPIEN in this interpreter: run ForceArtGS in the forceartgs env")
         super().__init__(urdf, moving_link=moving_link, joint_name=joint_name, dt=dt, gravity=gravity,
                          friction_mode=friction_mode, python=py, readback_rtol=readback_rtol)
         self.device = device

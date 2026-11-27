@@ -1,16 +1,24 @@
 # Contact segments estimated from FORCE PEAKS + VISUAL motion/proximity (operator-validated estimator,
 # samuele/estimate_contact_segments.py). Operator statement 2026-11-19: all real demos are SLIDING contacts
-# with an almost linear TCP path. Window 50:120:2. force: contact_annotations.csv sha256 20dccf081bc41cad;
-# visual: rgbd_rate_timeline.csv sha256 4ed44291b0d87caa; per-frame audit: /media/samuelemara/Extreme SSD/Samuele/results_19_11_26/contact_annotations/final_orange_suitecase_episode_000000/contact_segments_audit.csv
+# with an almost linear TCP path. Window 41:138:2. force: contact_annotations.csv sha256 20dccf081bc41cad;
+# visual: rgbd_rate_timeline.csv sha256 0e18dd51c7d82424; per-frame audit: /media/samuelemara/Extreme SSD/Samuele/results_27_11_26/contact_prep/contact_audit/final_orange_suitecase_episode_000000/contact_segments_audit.csv
 schema: forceartgs.contact_segments/v1
 frame_id: base_link
 frame_index_type: source_frame_index
+window: "41:138:2"   # RGB-D frames a:b:k these segments were estimated on (checked by the loader)
 scene_id: final_orange_suitecase_episode_000000
 source: operator_validated_force_peak_plus_visual_contact_estimate
 segments:
   - segment_id: contact_0
-    start_source_frame: 124
-    end_source_frame: 228
+    start_source_frame: 122
+    end_source_frame: 226
+    contact_state: contact_confirmed
+    slip_mode: sliding
+    provenance: operator_label
+    contact_model: unilateral_point
+  - segment_id: contact_1
+    start_source_frame: 250
+    end_source_frame: 262
     contact_state: contact_confirmed
     slip_mode: sliding
     provenance: operator_label

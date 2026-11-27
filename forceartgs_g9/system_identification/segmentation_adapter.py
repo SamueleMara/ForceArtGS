@@ -91,13 +91,11 @@ def prepare_run(run_root, scene, *, ff_config, cfg_path=None, robot_archive=None
                 declared_joint_type=None, declaration_note=None, allow_diagnostic_kinematics=True, log=print):
     """G9 inputs -> canonical record -> SAME classifier + options as the free/forced stage. Returns a context dict;
     ``status`` is OK, KINEMATICS_NOT_ACCEPTED or DATA_UNAVAILABLE (nothing fabricated)."""
-    from .. import physics_lib
     from ..adapters.forceartgs_g9 import build_inputs
     from ..config import load_dynamics_config
     from ..forcetwin import record as RC
     from ..free_forced import segments as SG
     from ..free_forced.pipeline import _part_points, load_options as ff_options
-    physics_lib.load()
     ffo, cfg_ff = ff_options(ff_config)
     cfg_path = cfg_path or cfg_ff
     cfg = load_dynamics_config(cfg_path)

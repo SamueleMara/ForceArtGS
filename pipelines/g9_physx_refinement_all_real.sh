@@ -7,7 +7,8 @@
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 RUNS="${1:-/media/samuelemara/Extreme SSD/Samuele/results_19_11_26/forceartgs_joint_aware}"
-PY="$HOME/miniconda3/envs/freeartgs/bin/python"
+PY="${FORCEARTGS_PYTHON:-$HOME/miniconda3/envs/forceartgs/bin/python}"
+eval "$("$PY" "$(dirname "${BASH_SOURCE[0]}")/../utils/forceartgs_env.py")"   # clean env: forceartgs + repo only
 REAL="/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real"
 DISC_ROOT="/media/samuelemara/Extreme SSD/Samuele/results_17_11_26/overnight_real/joint"
 SCENES="${SCENES:-final_red_fridge_episode_000000 final_orange_suitecase_episode_000000 final_black_box_episode_000000 final_robot_dog_episode_000000 white_drawer_20261021_161154_episode_000000}"
@@ -15,7 +16,7 @@ LOG="${OUT_BASE:-$RUNS}/g9_physx_refinement_batch.log"
 mkdir -p "$(dirname "$LOG")"
 log() { echo "$(date '+%F %T') $*" | tee -a "$LOG"; }
 log "start scenes=[$SCENES] QUICK=${QUICK:-0} OUT_BASE=${OUT_BASE:-<run>/dynamics/g9/physx_refinement} git=$(git rev-parse --short HEAD) dirty=$(git status --porcelain | wc -l)"
-# Env: QUICK=1 tiny optimiser budget (smoke only); SCENES subset; OUT_BASE redirect; PARTTWIN1D_PYTHON engine env.
+# Env: QUICK=1 tiny optimiser budget (smoke only); SCENES subset; OUT_BASE redirect; SAPIEN engine = this (forceartgs) interpreter.
 for sc in $SCENES; do
   run=$(ls -d "$RUNS/${sc}"_multiview_*_joint_aware_full 2>/dev/null | head -1)
   [[ -z "$run" ]] && { log "$sc: no joint-aware run"; continue; }

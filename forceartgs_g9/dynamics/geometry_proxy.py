@@ -43,12 +43,20 @@ def load_moving_points(handoff_json) -> tuple:
                            "canonical_anchor_original_frame"))
 
 
+class ProxyGeometryError(ValueError):
+    """The moving part has no usable geometry for a tentative proxy (recorded, never a crash)."""
+
+
 def filter_points(X, opacity=None, k=8, factor=3.0):
     from scipy.spatial import cKDTree
     keep = np.ones(len(X), bool)
     if opacity is not None:
         keep &= opacity >= 0.5
     Y = X[keep]
+    if len(Y) < 4:                                      # a hull needs >= 4 points
+        mx = f"{float(np.max(opacity)):.3f}" if opacity is not None and len(opacity) else "n/a"
+        raise ProxyGeometryError(f"{int(keep.sum())} of {len(X)} moving Gaussians pass opacity >= 0.5 (max opacity "
+                                 f"{mx}): no geometry for a tentative proxy (e.g. a very short 3DGS training)")
     d, _ = cKDTree(Y).query(Y, k=min(k + 1, len(Y)))
     dk = d[:, -1]
     ok = dk <= factor * np.median(dk)

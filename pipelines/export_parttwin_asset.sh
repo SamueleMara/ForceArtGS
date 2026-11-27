@@ -20,7 +20,7 @@ PT_PY="${PARTTWIN1D_PYTHON:-$HOME/miniconda3/envs/parttwin_sim/bin/python}"
 export PARTTWIN_SIM_PYTHON="${PARTTWIN_SIM_PYTHON:-$HOME/.venvs/rigeuler-sim-export/bin/python}"
 NAME="${BRANCH:+diagnostic_$BRANCH}"; NAME="${NAME:-accepted}"
 H="$RUN/parttwin_handoff/$NAME"
-"$HOME/miniconda3/envs/freeartgs/bin/python" tools/export_parttwin_handoff.py --run "$RUN" --output "$H" \
+"${FORCEARTGS_PYTHON:-$HOME/miniconda3/envs/forceartgs/bin/python}" tools/export_parttwin_handoff.py --run "$RUN" --output "$H" \
     ${BRANCH:+--diagnostic-branch "$BRANCH"}
 PYTHONPATH="$PT_ROOT/src" "$PT_PY" -m parttwin1d.cli.build_asset --handoff "$H/articulated_3dgs_handoff.json" \
     --output "$RUN/parttwin_assets" ${BRANCH:+--allow-diagnostic} "${DYN[@]}" "${REG[@]}"

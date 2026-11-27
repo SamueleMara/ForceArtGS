@@ -90,7 +90,6 @@ def reference_urdf(inp, rec, mm, path):
 def run(run_root, scene, *, g10_config=None, cfg_path=None, robot_archive=None, contact_segments=None,
         pulse_rows=None, out_root=None, declared_joint_type=None, declaration_note=None, quick=False, python=None,
         io_init=None, log=print) -> dict:
-    from .. import physics_lib
     from ..adapters.forceartgs_g9 import build_inputs
     from ..config import load_dynamics_config
     from ..forcetwin import record as RC
@@ -101,7 +100,6 @@ def run(run_root, scene, *, g10_config=None, cfg_path=None, robot_archive=None, 
     from .api import estimate
     from .sapien_diagnostic import IsolatedSapienCpu
     t0 = time.time()
-    physics_lib.load()
     o = load_options(g10_config, quick=quick)
     if python:
         o["physics"]["python"] = python

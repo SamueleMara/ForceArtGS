@@ -24,6 +24,7 @@ import numpy as np
 import torch
 
 from .general_pinn import DT, _derivs, _Net
+from .torch_model import on_torch_device
 
 
 @dataclass
@@ -76,7 +77,7 @@ class _Seg:
         n = cfg.n_colloc
         cuts = np.linspace(0, n - 1, cfg.n_weak + 1).astype(int)
         self.win = [(int(a), int(b)) for a, b in zip(cuts[:-1], cuts[1:]) if b > a]
-        tcn = self.tc.numpy()
+        tcn = self.tc.cpu().numpy()
         if self.forced:
             from .torch_model import zoh_torch
             eff = seg.effort
@@ -130,6 +131,7 @@ def _losses(S, rates, ag, A):
     return data, strong, weak
 
 
+@on_torch_device
 def _train(segments, nspec, cfg, seed, init, *, epochs, warm, anchor=None):
     from ..free_forced.normalized import a_scale
     torch.manual_seed(seed)
@@ -188,9 +190,9 @@ def _train(segments, nspec, cfg, seed, init, *, epochs, warm, anchor=None):
         loss, L_d, L_s, L_w = objective(1.0)
         hist.append(dict(ep=epochs, stage="lbfgs", loss=float(loss), data=float(L_d), strong=float(L_s),
                          weak=float(L_w), iters=cfg.lbfgs_iters))
-    sp = torch.nn.functional.softplus(eta).detach().numpy()
+    sp = torch.nn.functional.softplus(eta).detach().cpu().numpy()
     est = {n: float(sp[i]) for i, n in enumerate(names)}
-    traj = {S.s.name: dict(t=S.s.t.tolist(), q_hat=S.net(S.t).detach().numpy().tolist()) for S in segs}
+    traj = {S.s.name: dict(t=S.s.t.tolist(), q_hat=S.net(S.t).detach().cpu().numpy().tolist()) for S in segs}
     return dict(seed=seed, estimate=est, final=hist[-1], history=hist, max_abs_eta_grad=grad_seen,
                 trajectories=traj, accel_scale=A)
 

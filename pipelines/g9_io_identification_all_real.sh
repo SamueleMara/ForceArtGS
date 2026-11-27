@@ -5,11 +5,12 @@
 # No calibration, no 3DGS retraining, no joint-authority change, no sign change, no PArtTwin1D change.
 #   bash pipelines/g9_io_identification_all_real.sh [RUN_ROOT]
 #   Env: SCENES subset; OUT_BASE redirect; IO_CONFIG (default the diagnostic real config); NO_PHYSX=1 skip the
-#        PhysX reconciliation; THEN_G10=1 run G10 afterwards (QUICK=1 tiny G10 budget); PARTTWIN1D_PYTHON engine env.
+#        PhysX reconciliation; THEN_G10=1 run G10 afterwards (QUICK=1 tiny G10 budget); SAPIEN engine = this (forceartgs) interpreter.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 RUNS="${1:-/media/samuelemara/Extreme SSD/Samuele/results_19_11_26/forceartgs_joint_aware}"
-PY="$HOME/miniconda3/envs/freeartgs/bin/python"
+PY="${FORCEARTGS_PYTHON:-$HOME/miniconda3/envs/forceartgs/bin/python}"
+eval "$("$PY" "$(dirname "${BASH_SOURCE[0]}")/../utils/forceartgs_env.py")"   # clean env: forceartgs + repo only
 REAL="/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real"
 DISC_ROOT="/media/samuelemara/Extreme SSD/Samuele/results_17_11_26/overnight_real/joint"
 SCENES="${SCENES:-final_red_fridge_episode_000000 final_orange_suitecase_episode_000000 final_black_box_episode_000000 final_robot_dog_episode_000000 white_drawer_20261021_161154_episode_000000}"

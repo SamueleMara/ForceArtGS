@@ -6,7 +6,8 @@
 #                        the hand-picked fridge clip), stride = max(2, ceil(len / 60)) (~30 model times)
 #   3. visual audit      samuele/audit_joint_contact_windows.py        -> <OUT>/contact_audit/<ep>/rgbd_rate_timeline.csv
 #   4. contact segments  samuele/estimate_contact_segments.py (force peaks + visual, sliding) -> configs/contact_intervals/
-#                        (an existing segments file, e.g. the operator-validated ones, is NEVER overwritten)
+#                        (operator-validated estimator; re-run whenever the clip differs from the `window:` recorded in
+#                        the file, so segments always match the model frames; the loader refuses a mismatch)
 #   5. full pipeline     pipelines/joint_aware_reconstruction.py: fresh discovery (robot archive, AllTracker, fit),
 #                        multimodal frontend, selection v2, R/P branches, blend, art (hard part ids), compare, video,
 #                        final, G8 export (+ diagnostic assets); MODEL_INCONSISTENT scenes still train diagnostics.
@@ -15,19 +16,21 @@
 #   bash pipelines/joint_aware_all_real.sh [budget smoke|coarse|full] [OUT]
 # Env: EPISODES=first (default: episode 000000 of every object) | all ;  SCENES="name ..." explicit list (overrides);
 #      PREP_ONLY=1 (steps 1-4 only, no GPU training) ; G9=1 also run G9 exploratory dynamics after each scene.
+#      STAGES=a,b,c (default all; e.g. audit,discover,multimodal_refine,select,authority = joint only, no 3DGS)
+#      EXTRA_ARGS='--force-guided-selection --working-branch-only' (extra joint_aware_reconstruction flags)
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 BUDGET="${1:-full}"
 OUT="${2:-/media/samuelemara/Extreme SSD/Samuele/results_$(date +%d_%m_%y)}"
 case "$OUT" in "/media/samuelemara/Extreme SSD/"*) ;; *) echo "refusing: output must be on the Extreme SSD: $OUT" >&2; exit 2;; esac
-PY="$HOME/miniconda3/envs/freeartgs/bin/python"
+PY="${FORCEARTGS_PYTHON:-$HOME/miniconda3/envs/forceartgs/bin/python}"
+eval "$("$PY" "$(dirname "${BASH_SOURCE[0]}")/../utils/forceartgs_env.py")"   # clean env: forceartgs + repo only
 REAL="/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real"
 RUNS="$OUT/forceartgs_joint_aware"
 mkdir -p "$RUNS/.runtime" "$OUT/contact_annotations" "$OUT/contact_audit" configs/contact_intervals
-SEED="/media/samuelemara/Extreme SSD/Samuele/results_19_11_26/forceartgs_joint_aware/.runtime"
-for d in torch huggingface torch_extensions; do
-  [[ -d "$SEED/$d" && ! -e "$RUNS/.runtime/$d" ]] && cp -r "$SEED/$d" "$RUNS/.runtime/$d"
-done
+export MPLCONFIGDIR="$RUNS/.runtime/matplotlib" MPLBACKEND=Agg      # prep tools: no ~/.cache
+mkdir -p "$MPLCONFIGDIR"
+# model weights: joint_aware_reconstruction.py seeds them from the repo's checkpoints/ (scripts/download_checkpoints.sh)
 LOG="$OUT/joint_aware_all_real.log"
 log() { echo "$(date '+%F %T') $*" | tee -a "$LOG"; }
 
@@ -71,13 +74,13 @@ for ep in "${LIST[@]}"; do
   fi
   CLIP=$(clip_of "$FX" "$S") || { log "$ep SKIP: no sustained force contact (DATA_UNAVAILABLE)"; continue; }
   AU="$OUT/contact_audit/$ep"
-  if [[ ! -f "$AU/rgbd_rate_timeline.csv" ]]; then
+  if [[ ! -f "$AU/rgbd_rate_timeline.csv" || "$(cat "$AU/clip.txt" 2>/dev/null)" != "$CLIP" ]]; then
     rm -rf "$AU"
     "$PY" samuele/audit_joint_contact_windows.py --scene "$S" --clip-frames "$CLIP" --cameras cam_001 cam_002 \
-        --output "$AU" > "$AU.log" 2>&1 || log "$ep WARN: visual audit failed (force-only segments)"
+        --output "$AU" > "$AU.log" 2>&1 && echo "$CLIP" > "$AU/clip.txt" || log "$ep WARN: visual audit failed (force-only segments)"
   fi
   SEG="configs/contact_intervals/$ep.yaml"
-  if [[ ! -f "$SEG" && -f "$AU/rgbd_rate_timeline.csv" ]]; then
+  if [[ -f "$AU/rgbd_rate_timeline.csv" ]] && ! grep -q "^window: \"$CLIP\"" "$SEG" 2>/dev/null; then
     "$PY" samuele/estimate_contact_segments.py --scene "$ep" --frames "$CLIP" --force-csv "$FX/contact_annotations.csv" \
         --visual-csv "$AU/rgbd_rate_timeline.csv" --output "$SEG" --audit-csv "$AU/contact_segments_audit.csv" \
         >> "$AU.log" 2>&1 || log "$ep WARN: contact segment estimation failed"
@@ -87,8 +90,8 @@ for ep in "${LIST[@]}"; do
   MM=(--multimodal-frontend --mm-max-iterations 3)
   [[ -f "$SEG" ]] && MM+=(--contact-segments "$SEG")
   "$PY" pipelines/joint_aware_reconstruction.py --scene "$S" --frames "$CLIP" --cameras cam_001 cam_002 \
-      --output-root "$RUNS" --stage all --budget "$BUDGET" "${MM[@]}" \
-      --export-parttwin --export-diagnostic --allow-inconsistent-diagnostics >> "$RUNS/$ep.$BUDGET.log" 2>&1
+      --output-root "$RUNS" --stage "${STAGES:-all}" --budget "$BUDGET" "${MM[@]}" ${EXTRA_ARGS:-} \
+      --export-parttwin --export-diagnostic --handoff-only --allow-inconsistent-diagnostics >> "$RUNS/$ep.$BUDGET.log" 2>&1
   rc=$?
   IFS=: read -r fa fb fk <<< "$CLIP"
   sel="$(ls -d "$RUNS/${ep}_multiview_cams001-002_i${fa}-${fb}_fall_s${fk}_joint_aware_${BUDGET}" 2>/dev/null)/selection.json"

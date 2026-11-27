@@ -94,11 +94,12 @@ def main(argv=None):
         w = csv.DictWriter(fh, list(rows[0]))
         w.writeheader()
         w.writerows(rows)
-    lines = [f"# Contact segments estimated from FORCE PEAKS + VISUAL motion/proximity (operator-validated estimator,",
-             f"# samuele/estimate_contact_segments.py). Operator statement 2026-11-19: all real demos are SLIDING contacts",
+    lines = ["# Contact segments estimated from FORCE PEAKS + VISUAL motion/proximity (operator-validated estimator,",
+             "# samuele/estimate_contact_segments.py). Operator statement 2026-11-19: all real demos are SLIDING contacts",
              f"# with an almost linear TCP path. Window {a.frames}. force: {a.force_csv.name} sha256 {sha(a.force_csv)[:16]};",
              f"# visual: {a.visual_csv.name} sha256 {sha(a.visual_csv)[:16]}; per-frame audit: {a.audit_csv}",
              "schema: forceartgs.contact_segments/v1", "frame_id: base_link", "frame_index_type: source_frame_index",
+             f'window: "{a.frames}"   # RGB-D frames a:b:k these segments were estimated on (checked by the loader)',
              f"scene_id: {a.scene}", "source: operator_validated_force_peak_plus_visual_contact_estimate", "segments:"]
     for n, (s, e) in enumerate(segs):
         lines += [f"  - segment_id: contact_{n}", f"    start_source_frame: {rows[s]['source_frame_index']}",

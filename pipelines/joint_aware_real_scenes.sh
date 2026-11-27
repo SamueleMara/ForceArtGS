@@ -10,7 +10,8 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 BUDGET="${1:-coarse}"
 OUT="${2:-/media/samuelemara/Extreme SSD/Samuele/results_$(date +%d_%m_%y)/forceartgs_joint_aware}"
-PY="$HOME/miniconda3/envs/freeartgs/bin/python"
+PY="${FORCEARTGS_PYTHON:-$HOME/miniconda3/envs/forceartgs/bin/python}"
+eval "$("$PY" "$(dirname "${BASH_SOURCE[0]}")/../utils/forceartgs_env.py")"   # clean env: forceartgs + repo only
 REAL="/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real"
 DISC_ROOT="${DISC_ROOT:-/media/samuelemara/Extreme SSD/Samuele/results_17_11_26/overnight_real/joint}"
 JR=outputs/joint_discovery_runs
@@ -23,10 +24,7 @@ TABLE=(
   "final_orange_suitecase_episode_000000|50:120:2|$JR/final_orange_suitecase_episode_000000/observations_50-120-2"
 )
 mkdir -p "$OUT/.runtime"
-SEED="/media/samuelemara/Extreme SSD/Samuele/results_17_11_26/overnight_real/train/.runtime"
-for d in torch huggingface torch_extensions; do
-  [[ -d "$SEED/$d" && ! -e "$OUT/.runtime/$d" ]] && cp -r "$SEED/$d" "$OUT/.runtime/$d"
-done
+# model weights: joint_aware_reconstruction.py seeds them from the repo's checkpoints/ (scripts/download_checkpoints.sh)
 LOG="$OUT/joint_aware_batch.log"
 log() { echo "$(date '+%F %T') $*" | tee -a "$LOG"; }
 log "start budget=$BUDGET stages=$STAGES git=$(git rev-parse --short HEAD) dirty=$(git status --porcelain | wc -l) submodule_dirty=$(git -C reconstruction/nerfstudio status --porcelain | wc -l)"

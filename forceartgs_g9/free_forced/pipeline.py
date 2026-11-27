@@ -14,7 +14,6 @@ from __future__ import annotations
 import copy
 import csv
 import hashlib
-import json
 import math
 import time
 from pathlib import Path
@@ -156,11 +155,9 @@ def _passivity_failure(raw, kept, aud):
 def run(run_root, scene, *, cfg_path, ff_config=None, robot_archive=None, contact_segments=None, discovery_dir=None,
         pulse_rows=None, pinn=False, out_root=None, declared_joint_type=None, declaration_note=None,
         log=print) -> dict:
-    from .. import physics_lib
     from ..adapters.forceartgs_g9 import build_inputs
     from ..config import load_dynamics_config
     t0 = time.time()
-    physics_lib.load()
     opts, cfg_from_opts = load_options(ff_config)
     cfg_path = cfg_path or cfg_from_opts
     out = next_version(Path(out_root) if out_root else Path(run_root) / "dynamics" / "g9_free_forced")
@@ -441,7 +438,6 @@ def run(run_root, scene, *, cfg_path, ff_config=None, robot_archive=None, contac
                      "an axis estimate")
     _write(out / "geometry_gravity_hypotheses.json", gh)
     free_raw = H["raw"]
-    ns_primary = ns
     ns = ns_a
     # ------------------------------------------------------------------ forced scale (+ declared pulse audit)
     imp_dec, imp_aud = None, None

@@ -46,7 +46,7 @@ class FitConfig:
     max_tracks_per_camera: int = 1500
     min_track_observations: int = 3
     em_iterations: int = 4
-    least_squares_max_nfev: int = 60
+    least_squares_max_nfev: int = 200    # per EM round; GPU solver: every round converges (fridge: <= 133 used, 500 identical)
     robust_loss: str = "soft_l1"
     robust_f_scale: float = 3.0           # in whitened units
     temporal_sigma_qacc: float = 50.0     # rad/s^2 or m/s^2 scale for the weak acceleration prior

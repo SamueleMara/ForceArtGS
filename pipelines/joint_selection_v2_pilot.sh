@@ -4,7 +4,8 @@
 #   bash pipelines/joint_selection_v2_pilot.sh [out_root]
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-PY="$HOME/miniconda3/envs/freeartgs/bin/python"
+PY="${FORCEARTGS_PYTHON:-$HOME/miniconda3/envs/forceartgs/bin/python}"
+eval "$("$PY" "$(dirname "${BASH_SOURCE[0]}")/../utils/forceartgs_env.py")"   # clean env: forceartgs + repo only
 OUT="${1:-/media/samuelemara/Extreme SSD/Samuele/results_$(date +%d_%m_%y)/joint_selection_v2/pilot}"
 REAL="/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real"
 DISC="${DISC_ROOT:-/media/samuelemara/Extreme SSD/Samuele/results_17_11_26/overnight_real/joint}"
