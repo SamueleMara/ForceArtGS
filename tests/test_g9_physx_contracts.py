@@ -79,3 +79,17 @@ def test_scaled_urdf_cache_never_hands_out_a_deleted_or_overwritten_file(tmp_pat
         assert p.is_file() and _mass(p) == pytest.approx(rho)
     assert len(e._urdfs) == 4 and len(list(Path(e._tmp.name).iterdir())) == 4
     assert len({str(p) for p in e._urdfs.values()}) == 4
+
+
+
+def test_de_warm_start_exactly_on_a_bound_is_accepted():
+    # regression (smoke 28/11, B7_G10_SVD_START FIT_FAILED): a warm start clipped onto rho's lower bound made scipy's
+    # [0, 1] rescaling round below 0 -> "Some entries in x0 lay outside the specified bounds"
+    from scipy.optimize import differential_evolution
+    from forceartgs_g9.physx_refinement.optimizer import warm_start_inside
+    b = [(0.01, 100.0), (0.0, 12649.1)]
+    with pytest.raises(ValueError, match="outside"):
+        differential_evolution(lambda x: float(x.sum()), b, x0=[0.01, 0.46], maxiter=1, seed=0)
+    x0 = [warm_start_inside(0.01, *b[0]), warm_start_inside(0.46, *b[1])]
+    assert x0[1] == 0.46 and 0.01 < x0[0] < 0.01 + 1e-6                               # interior starts untouched
+    differential_evolution(lambda x: float(x.sum()), b, x0=x0, maxiter=1, seed=0)

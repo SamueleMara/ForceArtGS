@@ -839,10 +839,12 @@ def _deep_update(d, u):
 
 def run_synthetic(out_root, *, joint_type="prismatic", rho_true=1.5, c_true=None, config=None, quick=False,
                   engine=None, python=None, wrench_overrides=None, r2r_overrides=None, noise=2e-4, seed=0,
-                  log=print) -> dict:
+                  log=print, pushes=None, q0=None, bias=0.0) -> dict:
     """The SAME comparison on an exact synthetic rest-to-rest demonstration (truth known), with ACTUAL PhysX on a
     single-joint reference URDF (gravity zero). Truth trajectory: the exact two-term solution with M = rho_true x the
-    URDF axis inertia (PhysX itself integrates semi-implicit Euler at dt: its O(dt) offset is part of the result)."""
+    URDF axis inertia (PhysX itself integrates semi-implicit Euler at dt: its O(dt) offset is part of the result).
+    Optional (cross-demo synthetic benchmark; defaults = the single historical push): ``pushes`` [(duration_s,
+    level / M)] (levels in units of M), ``q0``, ``bias`` (constant unmodelled effort in the RECORD, units of M)."""
     import yaml
     from ..estimators.rest_to_rest_synthetic import episode as syn_episode
     from ..estimators.rest_to_rest_synthetic import exact_rest_to_rest
@@ -875,8 +877,9 @@ def run_synthetic(out_root, *, joint_type="prismatic", rho_true=1.5, c_true=None
                                        com_ref=[0.4, 0.0, 0.0], inertia_com_ref=np.diag([0.02, 0.03, 0.04]))
     M = rho_true * info["axis_inertia"]
     c = c_true if c_true is not None else 1.8 * M
-    sy = exact_rest_to_rest(M, c, q0=0.12 if joint_type == "prismatic" else -0.3, pushes=((0.3, 3.0 * M),),
-                            noise=noise, q_sigma=max(noise, 1e-9), seed=seed, jitter=0.0)
+    sy = exact_rest_to_rest(M, c, q0=(0.12 if joint_type == "prismatic" else -0.3) if q0 is None else q0,
+                            pushes=((0.3, 3.0 * M),) if pushes is None else tuple((d, k * M) for d, k in pushes),
+                            noise=noise, q_sigma=max(noise, 1e-9), seed=seed, jitter=0.0, bias=bias * M)
     b = syn_episode(sy, joint_type=joint_type)
     _write(out / "rest_endpoint_evidence.json", b["evidence"].to_dict())
     if b["status"] != "OK":
@@ -914,4 +917,5 @@ def run_synthetic(out_root, *, joint_type="prismatic", rho_true=1.5, c_true=None
                                                                          "physx_rmse_over_sigma", "v_sim_T")}
                                                     for r in rows])
     _write(out / "STATUS.json", st)
-    return dict(st, _rows=rows, _px=px, _analytics=analytics, _pinn=pinn, _ep=ep, _info=info)
+    return dict(st, _rows=rows, _px=px, _analytics=analytics, _pinn=pinn, _ep=ep, _info=info, _sy=sy,
+                _evidence=b["evidence"].to_dict(), _urdf=str(urdf))

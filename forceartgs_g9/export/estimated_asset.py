@@ -5,15 +5,23 @@ Estimated (best PhysX-replayed row of `rest_to_rest_compare/vNNN`, model M q'' +
   moving-part inertia  M   along the joint: revolute = inertia about the joint axis (kg m^2), prismatic = mass (kg)
 Kinematics (joint type, axis, axis point) are the run's own 3DGS hand-off (the same accepted / working joint).
 
+Visuals = the run's own 3DGS parts (hand-off static_canonical.ply / moving_canonical.ply), copied BYTE-IDENTICAL into
+<vNNN>/gaussians/ so the folder is self-contained. The Gaussians stay in the run's canonical frame P (moving part at
+q = 0); each link's <visual><origin> is T_link_P (static_link = Wc: T_Wc_P; moving_link = joint frame at q = 0, axes
+parallel to Wc at the joint origin o: Trans(-o) T_Wc_P), so the joint articulates the moving Gaussians exactly as in
+the run: x_Wc(q) = T_Wc_moving(q) T_moving_P x_P. The USD carries the same placement (a `gaussians_3dgs` Xform per link
+with the PLY as an asset path). A 3DGS PLY is not a triangle mesh: a viewer without a Gaussian renderer draws nothing.
 Nothing else is written: no collision, no joint stops (revolute -> URDF `continuous`, prismatic -> infinite limit),
-no static-link inertial, no Coulomb friction, no visual mesh. URDF / USD cannot store "axis inertia only", so the
+no static-link inertial, no Coulomb friction. URDF / USD cannot store "axis inertia only", so the
 moving inertial is put where nothing else can enter the 1-DoF dynamics:
   revolute   COM ON the joint axis, tensor M/2 (I + a a^T): exactly M about the axis; the off-axis moments M/2 are the
              smallest valid (triangle-inequality) completion and, with a fixed base and the COM on the axis, change
              neither the joint dynamics nor any gravity torque. Mass NOT identified: a negligible placeholder.
   prismatic  mass M at the joint origin; rotational inertia NOT identified (cannot rotate): negligible placeholder.
 Every placeholder is listed in estimated_physics.json. Verification: the URDF is loaded in SAPIEN (PhysX) and a
-constant effort is replayed against the closed-form response of M q'' + c q' = Q; the USD is read back with pxr.
+constant effort is replayed against the closed-form response of M q'' + c q' = Q, and the engine pose of every 3DGS
+visual (link pose x visual pose, at q = 0 and at a moved q) is checked against the articulation above; the USD is
+read back with pxr (inertia, damping, Gaussian placement and PLY paths).
 FIT_TO_DEMONSTRATION, not a validated physical twin. Append-only <out_root>/vNNN/.
 """
 from __future__ import annotations
@@ -21,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import shutil
 import sys
 import subprocess
 import time
@@ -28,7 +37,8 @@ from pathlib import Path
 
 import numpy as np
 
-SCHEMA = "forceartgs.g9.estimated_joint_dynamics_asset/v1"
+SCHEMA = "forceartgs.g9.estimated_joint_dynamics_asset/v2"    # v2: + the 3DGS parts
+GAUSSIAN_DIR = "gaussians"
 SIM_PY = sys.executable  # the forceartgs env (pxr + sapien); never another env
 PLACEHOLDER = 1e-6        # not identified, dynamically inert (see module docstring)
 
@@ -87,17 +97,74 @@ def joint_dynamics_model(joint: dict, M: float, c: float) -> dict:
                 axis_inertia=float(a @ I @ a) if joint["type"] == "revolute" else None)
 
 
-def write_urdf(path: Path, name: str, m: dict) -> None:
+def rpy_from_matrix(R) -> np.ndarray:
+    """URDF rpy (fixed axes, R = Rz(yaw) Ry(pitch) Rx(roll))."""
+    R = np.asarray(R, float)
+    cp = math.hypot(R[0, 0], R[1, 0])
+    pitch = math.atan2(-R[2, 0], cp)
+    if cp < 1e-9:                                                # gimbal lock: yaw folded into roll
+        return np.array([math.atan2(-R[1, 2], R[1, 1]), pitch, 0.0])
+    return np.array([math.atan2(R[2, 1], R[2, 2]), pitch, math.atan2(R[1, 0], R[0, 0])])
+
+
+def matrix_from_rpy(rpy) -> np.ndarray:
+    r, p, y = (float(v) for v in rpy)
+    Rx = np.array([[1, 0, 0], [0, math.cos(r), -math.sin(r)], [0, math.sin(r), math.cos(r)]])
+    Ry = np.array([[math.cos(p), 0, math.sin(p)], [0, 1, 0], [-math.sin(p), 0, math.cos(p)]])
+    Rz = np.array([[math.cos(y), -math.sin(y), 0], [math.sin(y), math.cos(y), 0], [0, 0, 1]])
+    return Rz @ Ry @ Rx
+
+
+def gaussian_parts(handoff, hj: dict, m: dict) -> list:
+    """The hand-off's 3DGS parts as link visuals (see module docstring). Fails closed on a missing PLY, a sha256
+    different from the hand-off's, or a non-rigid T_Wc_P."""
+    out = []
+    for part, link in (("static", "static_link"), ("moving", "moving_link")):
+        p = (hj.get("parts") or {}).get(part) or {}
+        if not p.get("ply"):
+            raise ValueError(f"hand-off has no {part} PLY")
+        src = Path(handoff).parent / p["ply"]
+        if not src.is_file():
+            raise ValueError(f"{src}: missing")
+        sha = _sha(src)
+        if p.get("ply_sha256") and sha != p["ply_sha256"]:
+            raise ValueError(f"{src}: sha256 {sha[:12]} differs from the hand-off's {p['ply_sha256'][:12]}")
+        T_Wc_P = np.asarray(p["T_Wc_P"], float)
+        R = T_Wc_P[:3, :3] if T_Wc_P.shape == (4, 4) else None
+        if (R is None or np.abs(R.T @ R - np.eye(3)).max() > 1e-6 or np.linalg.det(R) < 0.999999
+                or not np.allclose(T_Wc_P[3], [0, 0, 0, 1])):
+            raise ValueError(f"{part}: T_Wc_P is not a rigid transform")
+        T = T_Wc_P.copy()
+        if link == "moving_link":
+            T[:3, 3] -= m["origin"]                              # moving link frame: Wc axes at the joint origin
+        rpy = rpy_from_matrix(T[:3, :3])
+        if np.abs(matrix_from_rpy(rpy) - T[:3, :3]).max() > 1e-9:
+            raise ValueError(f"{part}: rpy round trip failed")
+        out.append(dict(part=part, link=link, src=str(src), file=f"{GAUSSIAN_DIR}/{src.name}", sha256=sha,
+                        n_gaussians=p.get("n_gaussians"), fields=p.get("immutable_gaussian_fields"),
+                        T_Wc_P=T_Wc_P.tolist(), T_link_P=T.tolist(), xyz=T[:3, 3].tolist(), rpy=rpy.tolist()))
+    return out
+
+
+def write_urdf(path: Path, name: str, m: dict, gaussians=()) -> None:
     I = m["inertia"]
     f = lambda v: " ".join(repr(float(x)) for x in v)
     jt = "continuous" if m["type"] == "revolute" else "prismatic"
     lim = "" if jt == "continuous" else '\n    <limit lower="-inf" upper="inf" effort="inf" velocity="inf"/>'
+    vis = {g["link"]: f"""
+    <visual name="{g['part']}_3dgs">
+      <origin xyz="{f(g['xyz'])}" rpy="{f(g['rpy'])}"/>
+      <geometry><mesh filename="{g['file']}"/></geometry>
+    </visual>""" for g in gaussians}
+    static = f'<link name="static_link">{vis["static_link"]}\n  </link>' if "static_link" in vis else '<link name="static_link"/>'
     path.write_text(f"""<?xml version="1.0"?>
 <!-- ESTIMATED joint dynamics only (forceartgs_g9.export.estimated_asset): damping c and the moving-part inertia M
-     along the joint; frame = capture world Wc (metres). No collision, stops, static inertial or friction. -->
+     along the joint; frame = capture world Wc (metres). No collision, stops, static inertial or friction.
+     Visuals = the run's 3DGS parts (Gaussian PLYs in {GAUSSIAN_DIR}/, not triangle meshes), placed so the joint
+     articulates the moving Gaussians as in the run. -->
 <robot name="{name}">
-  <link name="static_link"/>
-  <link name="moving_link">
+  {static}
+  <link name="moving_link">{vis.get("moving_link", "")}
     <inertial>
       <origin xyz="{f(m['com'])}" rpy="0 0 0"/>
       <mass value="{m['mass']!r}"/>
@@ -165,6 +232,17 @@ for pr in (st.GetPrim(), mv.GetPrim()):
     pr.CreateAttribute("physxRigidBody:angularDamping", Sdf.ValueTypeNames.Float).Set(0.0)
 J.GetPrim().AddAppliedSchema("PhysxJointAPI")
 J.GetPrim().CreateAttribute("physxJoint:jointFriction", Sdf.ValueTypeNames.Float).Set(0.0)
+T_mv = np.eye(4); T_mv[:3, :3] = R; T_mv[:3, 3] = o                # USD moving_link frame in Wc
+for g in req["gaussians"]:
+    parent = st if g["link"] == "static_link" else mv
+    T = np.asarray(g["T_Wc_P"], float) if g["link"] == "static_link" else np.linalg.inv(T_mv) @ np.asarray(g["T_Wc_P"], float)
+    gx = UsdGeom.Xform.Define(stage, parent.GetPath().AppendChild("gaussians_3dgs"))
+    gx.AddTransformOp().Set(Gf.Matrix4d(*T.T.flatten().tolist()))       # Gf row-vector convention
+    gp = gx.GetPrim()
+    gp.CreateAttribute("forceartgs:gaussians_ply", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath("./" + g["file"]))
+    gp.CreateAttribute("forceartgs:ply_sha256", Sdf.ValueTypeNames.String).Set(g["sha256"])
+    gp.SetCustomDataByKey("forceartgs:frame", "3DGS PLY in the run's canonical frame P (moving part at q = 0); "
+                                              "this Xform = T_link_P; not a triangle mesh")
 root.GetPrim().SetCustomDataByKey("forceartgs:estimated", json.dumps(req["provenance"]))
 stage.GetRootLayer().Save()
 s2 = Usd.Stage.Open(req["usd"])
@@ -178,6 +256,14 @@ out["usd"] = dict(path=req["usd"], mass=UsdPhysics.MassAPI(mp).GetMassAttr().Get
                   damping_usd=UsdPhysics.DriveAPI(jp, kind).GetDampingAttr().Get(),
                   damping_usd_units="N m s/deg" if kind == "angular" else "N s/m",
                   stiffness=UsdPhysics.DriveAPI(jp, kind).GetStiffnessAttr().Get())
+gu = []
+for g in req["gaussians"]:
+    gp = s2.GetPrimAtPath(f"/{req['name']}/{g['link']}/gaussians_3dgs")
+    W = np.array(UsdGeom.Xformable(gp).ComputeLocalToWorldTransform(Usd.TimeCode.Default()), float).T
+    ap = gp.GetAttribute("forceartgs:gaussians_ply").Get()
+    gu.append(dict(link=g["link"], ply=ap.path, resolved=bool(ap.resolvedPath),
+                   max_err_T_Wc_P=float(np.abs(W - np.asarray(g["T_Wc_P"], float)).max())))
+out["usd"]["gaussians"] = gu
 # ---------------------------------------------------------------- SAPIEN (PhysX) constant-effort replay of the URDF
 import sapien
 scene = sapien.Scene(); dt = 1e-3; scene.set_timestep(dt)
@@ -186,6 +272,32 @@ art = ld.load(req["urdf"])
 for l in art.get_links():                                  # engine defaults the identification zeroed (G10):
     l.disable_gravity = True; l.linear_damping = 0.0; l.angular_damping = 0.0   # gravity off, no link damping
 j0 = art.get_active_joints()[0]; j0.set_friction(0.0)
+# 3DGS visuals: engine pose (link pose x visual pose) vs the run's articulation, at q = 0 and at a moved q
+def _rot(u, th):
+    u = np.asarray(u, float) / np.linalg.norm(u); K = np.array([[0, -u[2], u[1]], [u[2], 0, -u[0]], [-u[1], u[0], 0]])
+    return np.eye(3) + math.sin(th) * K + (1 - math.cos(th)) * K @ K
+shapes = {}
+for l in art.get_links():
+    for comp in l.entity.components:
+        if isinstance(comp, sapien.render.RenderBodyComponent):
+            for sh in comp.render_shapes:
+                shapes[sh.name] = (l, sh)
+gs = []
+for qt in (0.0, 0.5 if m["type"] == "revolute" else 0.1):
+    art.set_qpos(np.array([qt], np.float32))
+    J_ = np.eye(4)
+    if m["type"] == "revolute":
+        J_[:3, :3] = _rot(a, qt); J_[:3, 3] = o - J_[:3, :3] @ o
+    else:
+        J_[:3, 3] = qt * a / np.linalg.norm(a)
+    for g in req["gaussians"]:
+        if g["part"] + "_3dgs" not in shapes:
+            gs.append(dict(part=g["part"], q=qt, error="visual not loaded")); continue
+        l, sh = shapes[g["part"] + "_3dgs"]
+        W = l.entity_pose.to_transformation_matrix() @ sh.local_pose.to_transformation_matrix()
+        E = (J_ if g["link"] == "moving_link" else np.eye(4)) @ np.asarray(g["T_Wc_P"], float)
+        gs.append(dict(part=g["part"], q=qt, link=l.name, max_err=float(np.abs(W - E).max())))
+art.set_qpos(np.zeros(1, np.float32)); art.set_qvel(np.zeros(1, np.float32))
 links_rb = [dict(name=l.name, linear_damping=l.linear_damping, angular_damping=l.angular_damping) for l in art.get_links()]
 j = [jj for jj in art.get_active_joints()][0]
 Q = req["Q"]; Mm = m["M"]; c = m["damping"]; T = req["T"]
@@ -198,7 +310,7 @@ v_ref = Q / c * (1 - np.exp(-c * tt / Mm)) if c > 0 else Q * tt / Mm
 out["sapien"] = dict(sapien_version=sapien.__version__, joint_type=j.type, joint_damping=float(j.damping), joint_friction=float(j.friction),
                      engine_overrides="link linear/angular damping 0 and joint friction 0 (SAPIEN defaults 0.05), "
                                       "gravity off -- as in the G10 identification", links=links_rb,
-                     Q=Q, T=T, dt=dt, v_end_sim=vs[-1], v_end_closed_form=float(v_ref[-1]),
+                     gaussians=gs, Q=Q, T=T, dt=dt, v_end_sim=vs[-1], v_end_closed_form=float(v_ref[-1]),
                      max_rel_err_v=float(np.max(np.abs(np.asarray(vs) - v_ref)) / max(abs(float(v_ref[-1])), 1e-12)))
 print("RESULT " + json.dumps(out))
 '''
@@ -230,9 +342,18 @@ def build(run, r2r_dir, out_root, *, python=None, log=print) -> dict:
                                             "(pipeline flags --export-parttwin --export-diagnostic)")
     hj = json.loads(h.read_text())
     m = joint_dynamics_model(hj["joint"], fit["M"], fit["c"])
+    try:
+        gauss = gaussian_parts(h, hj, m)
+    except (ValueError, KeyError) as ex:
+        return finish("BLOCKED_GAUSSIANS", f"3DGS parts of {h}: {ex}", handoff=str(h))
+    (out / GAUSSIAN_DIR).mkdir()
+    for g in gauss:                                              # byte copy: the folder exports on its own
+        shutil.copyfile(g["src"], out / g["file"])
+        if _sha(out / g["file"]) != g["sha256"]:
+            return finish("BLOCKED_GAUSSIANS", f"copy of {g['src']} differs from the source", handoff=str(h))
     name = hj["object_id"]
     urdf, usd = out / "model.urdf", out / "model.usda"
-    write_urdf(urdf, name, m)
+    write_urdf(urdf, name, m, gauss)
     jm = {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in m.items()}
     prov = dict(r2r_dir=str(r2r_dir), method=fit["row"].get("method"), M=fit["M"], c=fit["c"], handoff=str(h),
                 note="estimated joint damping + moving inertia along the joint only; see estimated_physics.json")
@@ -243,11 +364,20 @@ def build(run, r2r_dir, out_root, *, python=None, log=print) -> dict:
                      moving_mass=m["mass"] if m["type"] == "prismatic" else None),
         placeholders=m["placeholders"],
         not_written=["collision", "joint stops / velocity / effort limits", "static-link inertial",
-                     "Coulomb / static friction", "armature", "visual meshes (3DGS PLYs stay in the run)"],
+                     "Coulomb / static friction", "armature", "triangle visual meshes (the visuals are the 3DGS PLYs)"],
+        gaussians=dict(
+            format="3DGS PLY, byte-identical to the run's hand-off (fields as listed; colour = SH degree 0)",
+            frame="Gaussians in the run's canonical frame P; the moving part at joint value q = 0",
+            placement="URDF <visual><origin> = T_link_P (xyz + rpy, R = Rz Ry Rx); x_Wc(q) = T_Wc_link(q) T_link_P x_P "
+                      "(static_link = Wc; moving_link = joint frame at q = 0, axes parallel to Wc at the joint origin); "
+                      "USD: Xform <link>/gaussians_3dgs = T_link_P in its own link frame, PLY in forceartgs:gaussians_ply",
+            caveat="not a triangle mesh: URDF/USD viewers without a 3DGS renderer draw nothing for it",
+            parts=[{k: v for k, v in g.items() if k != "src"} | dict(source=g["src"]) for g in gauss]),
         model=jm), indent=1, default=str))
     Q = float(m["damping"] * 0.1 if m["damping"] > 0 else m["M"])        # probe effort (only scales the response)
     T = float(min(2.0, max(0.2, 3 * m["M"] / m["damping"]))) if m["damping"] > 0 else 0.5
-    req = dict(model=jm, name=name, urdf=str(urdf), usd=str(usd), provenance=prov, Q=Q, T=T)
+    req = dict(model=jm, name=name, urdf=str(urdf), usd=str(usd), provenance=prov, Q=Q, T=T,
+               gaussians=[{k: g[k] for k in ("part", "link", "file", "sha256", "T_Wc_P")} for g in gauss])
     p = subprocess.run([python or SIM_PY, "-c", _SIM_SCRIPT, json.dumps(req)], capture_output=True, text=True)
     (out / "verify.log").write_text(f"--- stdout\n{p.stdout}\n--- stderr\n{p.stderr}")
     lines = [l for l in p.stdout.splitlines() if l.startswith("RESULT ")]
@@ -259,8 +389,13 @@ def build(run, r2r_dir, out_root, *, python=None, log=print) -> dict:
     usd_ok = (math.isclose(ver["usd"]["axis_inertia"], m["M"], rel_tol=1e-4) if m["type"] == "revolute" else
               math.isclose(ver["usd"]["mass"], m["M"], rel_tol=1e-6))
     sim_ok = ver["sapien"]["max_rel_err_v"] < 0.02
-    status = "EXPORTED" if usd_ok and sim_ok else "EXPORTED_CHECK_FAILED"
+    g_err = [e.get("max_err", math.inf) for e in ver["sapien"]["gaussians"]] + \
+            [e["max_err_T_Wc_P"] if e["resolved"] else math.inf for e in ver["usd"]["gaussians"]]
+    g_ok = len(g_err) == 3 * len(gauss) and max(g_err) < 1e-5               # float32 engine poses
+    status = "EXPORTED" if usd_ok and sim_ok and g_ok else "EXPORTED_CHECK_FAILED"
     return finish(status, f"{m['type']} M={m['M']:.4g} c={m['damping']:.4g}; SAPIEN replay max rel err "
-                          f"{ver['sapien']['max_rel_err_v']:.2%}; USD read-back {'OK' if usd_ok else 'MISMATCH'}",
+                          f"{ver['sapien']['max_rel_err_v']:.2%}; USD read-back {'OK' if usd_ok else 'MISMATCH'}; "
+                          f"3DGS static+moving placed {'OK' if g_ok else 'MISMATCH'} (max err {max(g_err):.1e})",
+                  gaussians=[out / g["file"] for g in gauss],
                   handoff=str(h), urdf=str(urdf), urdf_sha256=_sha(urdf), usd=str(usd), usd_sha256=_sha(usd),
                   verification=ver)

@@ -17,6 +17,12 @@ a MODEL_INCONSISTENT scene has no best branch and is not trained).
     --budget smoke (300 it/stage, QUICK rest-to-rest): end-to-end plumbing check of the identical chain.
 A reconstruction stage that dies on a Python programming error (NameError, ImportError, ...) stops the WHOLE batch:
 every other scene would die the same way.
+
+Parallel (SLURM array, slurm/): every job runs ONE scene with the same --out; each scene writes
+estimated_assets/<scene>/row.json and SUMMARY.md is rebuilt from all of them (atomic), or at the end by
+--summarize-only. --episodes all = every *_episode_XXXXXX, not only 000000; --list-scenes prints them.
+Paths: FORCEARTGS_REAL_ROOT (dataset), FORCEARTGS_OUTPUT_ROOT (allowed output prefix), FORCEARTGS_CONTACT_DIR
+(contact segments; default the repo's configs/contact_intervals), FORCEARTGS_PYTHON (the forceartgs interpreter).
 """
 import argparse
 import json
@@ -28,7 +34,9 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-REAL = Path("/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real")
+REAL = Path(os.environ.get("FORCEARTGS_REAL_ROOT",                 # server: export the dataset root
+                           "/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real"))
+OUTPUT_ROOT = os.environ.get("FORCEARTGS_OUTPUT_ROOT", "/media/samuelemara/Extreme SSD/")   # allowed output prefix
 PY = sys.executable                                               # the forceartgs env (run the driver with it)
 FIRST = ["final_red_fridge_episode_000000", "final_orange_suitecase_episode_000000", "final_black_box_episode_000000",
          "final_robot_dog_episode_000000", "white_drawer_20261021_161154_episode_000000"]
@@ -60,6 +68,9 @@ def npz_ok(p: Path) -> bool:
 
 CODE_ERRORS = ("NameError", "ImportError", "ModuleNotFoundError", "SyntaxError", "AttributeError", "TypeError",
                "UnboundLocalError", "IndentationError")
+
+
+ASSET_SCHEMA = "forceartgs.g9.estimated_joint_dynamics_asset/v2"   # + the 3DGS parts next to the URDF
 
 
 class CodeError(RuntimeError):
@@ -120,18 +131,74 @@ def latest_status(root: Path):
 
 
 def fresh(result: Path, *inputs) -> bool:
-    """A resumed step's result is reused only if it is newer than every input it was made from (make rule): a result
-    from an earlier pass with different upstream data is never reused."""
+    """mtime make rule: only right after the step that produced `result` (see run_inputs for why not on resume)."""
     if result is None or not Path(result).exists():
         return False
     t = Path(result).stat().st_mtime
     return all(t >= Path(i).stat().st_mtime for i in inputs if i is not None and Path(i).exists())
 
 
+DECISION_KEYS = ("status", "selected", "working_motion_model", "physics_joint_export_ready", "failure_codes")
+JOINT_FILES = tuple(f"{d}/{f}" for d in ("discovery/fit", "multimodal_refine/accepted")
+                    for f in ("joint_candidates.json", "joint_states.npz", "model_selection.json",
+                              "part_support/track_support.npz"))
+
+
+def run_inputs(run: Path) -> dict:
+    """What steps 2-3 consume from the reconstruction, by CONTENT: the selection decision and the joint files. Not the
+    mtime of selection.json: every resumed step-1 pass recomputes the compare stage and rewrites it with the same
+    decision, which made every finished step 2-3 look stale (coarse fridge resume 27/11)."""
+    import hashlib
+    f = Path(run) / "selection.json"
+    sel = json.loads(f.read_text()) if f.is_file() else {}
+    return dict(decision={k: sel.get(k) for k in DECISION_KEYS},
+                joint_files={j: hashlib.sha256((Path(run) / j).read_bytes()).hexdigest()
+                             for j in JOINT_FILES if (Path(run) / j).is_file()})
+
+
+def _inputs_path(out: Path, sc: str) -> Path:
+    return out / "logs" / f"{sc}.inputs.json"
+
+
+def recorded(out: Path, sc: str) -> dict:
+    f = _inputs_path(out, sc)
+    return json.loads(f.read_text()) if f.is_file() else {}
+
+
+def record(out: Path, sc: str, step: str, **kw) -> None:
+    d = recorded(out, sc)
+    d[step] = kw
+    f = _inputs_path(out, sc)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, indent=1))
+    tmp.replace(f)
+
+
+def authorities(out: Path, sc: str) -> list:
+    return sorted((out / "joint_states_extended" / sc).glob("authority_v[0-9][0-9][0-9]/authority.json"))
+
+
+def adopt(out: Path, sc: str, run) -> None:
+    """Results made before inputs were recorded (by an older driver): BEFORE step 1 may rewrite selection.json, the
+    mtime rule is still valid for them -- record their inputs now so the content rule can take over."""
+    if run is None or not (Path(run) / "selection.json").is_file():
+        return
+    rec, sel = recorded(out, sc), Path(run) / "selection.json"
+    done = [a for a in authorities(out, sc) if fresh(a, sel)]
+    if done and "step2" not in rec:
+        record(out, sc, "step2", inputs=run_inputs(run), result=str(done[-1]), adopted=True)
+    d, st = latest_status(out / "rest_to_rest_compare" / sc / "rest_to_rest_compare")
+    if d is not None and "step3" not in rec and fresh(d / "STATUS.json", sel, done[-1] if done else None):
+        record(out, sc, "step3", inputs=run_inputs(run), authority=str(done[-1]) if done else None, result=str(d),
+               adopted=True)
+
+
 def scene(out: Path, sc: str, args) -> dict:
     row = dict(scene=sc)
     # ---------------------------------------------------------------- 1. prep + full reconstruction (resumable)
     extra = "--force-guided-selection --working-branch-only"          # the automatic decision's branch only
+    adopt(out, sc, run_dir(out, sc, args.budget))
     log(out, f"{sc} [1/4] reconstruction budget={args.budget} ({extra})")
     rc = sh(["bash", "pipelines/joint_aware_all_real.sh", args.budget, out], dict(SCENES=sc, EXTRA_ARGS=extra),
             out / "logs" / f"{sc}.1_reconstruction.log")
@@ -155,7 +222,9 @@ def scene(out: Path, sc: str, args) -> dict:
     # ---------------------------------------------------------------- 2. q(t) on the whole recording
     ext = out / "joint_states_extended"
     sel = run / "selection.json"
-    done = [a for a in sorted((ext / sc).glob("authority_v[0-9][0-9][0-9]/authority.json")) if fresh(a, sel)]
+    inp = run_inputs(run)
+    r2 = recorded(out, sc).get("step2") or {}
+    done = [Path(r2["result"])] if r2.get("inputs") == inp and Path(r2.get("result", "")).is_file() else []
     if not done:
         for f in (ext / sc).glob("obs_cam_*.npz"):
             if not npz_ok(f):                                     # killed mid-write (suspend): redo that camera
@@ -165,7 +234,9 @@ def scene(out: Path, sc: str, args) -> dict:
            dict(SCENES=sc, RUNS=str(out / "forceartgs_joint_aware"), DISC_ROOT=str(out / "no_external_archive"),
                 NO_DECLARATION="1", JA_BUDGET=args.budget),
            out / "logs" / f"{sc}.2_extension.log")
-        done = [a for a in sorted((ext / sc).glob("authority_v[0-9][0-9][0-9]/authority.json")) if fresh(a, sel)]
+        done = [a for a in authorities(out, sc) if fresh(a, sel)]    # made by this pass
+        if done:
+            record(out, sc, "step2", inputs=inp, result=str(done[-1]))
     row["extended_authority"] = str(done[-1].parent) if done else None
     if not done:
         log(out, f"{sc} [2/4] no extended authority (see logs/{sc}.2_extension.log): step 3 uses the clip q only")
@@ -176,8 +247,10 @@ def scene(out: Path, sc: str, args) -> dict:
     if stale_bug:
         log(out, f"{sc} [3/4] earlier result has G10 fits that died on a code error: recomputed "
                  f"({next(iter(stale_bug.values()))[:120]})")
-    if (st is None or st.get("status") != "COMPARED" or stale_bug
-            or not fresh(d / "STATUS.json", sel, done[-1] if done else None)):
+    r3 = recorded(out, sc).get("step3") or {}
+    same = (r3.get("inputs") == inp and r3.get("result") == str(d)
+            and r3.get("authority") == (str(done[-1]) if done else None))
+    if st is None or st.get("status") != "COMPARED" or stale_bug or not same:
         log(out, f"{sc} [3/4] rest-to-rest parameter estimation")
         sh(["bash", "pipelines/g9_rest_to_rest_comparison_real.sh", out / "forceartgs_joint_aware"],
            dict(SCENES=sc, OUT_BASE=str(out / "rest_to_rest_compare"), EXT_ROOT=str(ext), PINN_DEVICE=args.pinn_device,
@@ -185,6 +258,8 @@ def scene(out: Path, sc: str, args) -> dict:
                 **(dict(QUICK="1") if args.budget == "smoke" else {})),
            out / "logs" / f"{sc}.3_rest_to_rest.log")
         d, st = latest_status(r2r_root)
+        if d is not None:
+            record(out, sc, "step3", inputs=inp, authority=str(done[-1]) if done else None, result=str(d))
     row["r2r"] = str(d) if d else None
     row["r2r_status"] = None if st is None else f"{st.get('status')}: {st.get('reason')}"
     failed, n_fits = g10_fits(d)
@@ -204,7 +279,7 @@ def scene(out: Path, sc: str, args) -> dict:
     # ---------------------------------------------------------------- 4. URDF + USD with the estimate
     a_root = out / "estimated_assets" / sc
     ad, ast = latest_status(a_root)
-    if ast is None or ast.get("r2r_dir") != str(d):
+    if ast is None or ast.get("r2r_dir") != str(d) or ast.get("schema") != ASSET_SCHEMA:   # older asset: re-export
         log(out, f"{sc} [4/4] URDF + USD (M={b['M']:.4g}, c={b['c']:.4g})")
         sh([PY, "-m", "forceartgs_g9.cli", "estimated-asset", "--run", run, "--r2r", d, "--out-root", a_root], {},
            out / "logs" / f"{sc}.4_asset.log")
@@ -215,7 +290,23 @@ def scene(out: Path, sc: str, args) -> dict:
     return row
 
 
-def summary(out: Path, rows) -> None:
+def save_row(out: Path, row: dict) -> None:
+    d = out / "estimated_assets" / row["scene"]
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / f".row.{os.getpid()}.json"
+    tmp.write_text(json.dumps(row, indent=1, default=str))
+    tmp.replace(d / "row.json")
+
+
+def all_rows(out: Path) -> list:
+    """Every scene's latest row (this job's and the other parallel jobs'), FIRST scenes first."""
+    rows = [json.loads(f.read_text()) for f in (out / "estimated_assets").glob("*/row.json")]
+    return sorted(rows, key=lambda r: (r["scene"] not in FIRST, FIRST.index(r["scene"]) if r["scene"] in FIRST else 0,
+                                       r["scene"]))
+
+
+def summary(out: Path, rows=None) -> None:
+    rows = all_rows(out) if rows is None else rows
     L = ["# Real episode_000000: estimated joint dynamics -> URDF / USD", "",
          f"{time.strftime('%F %T')}. M = inertia about the joint axis [kg m^2] (revolute) or moving mass [kg] "
          "(prismatic); c = viscous joint damping. FIT_TO_DEMONSTRATION, not a validated physical twin.", "",
@@ -227,29 +318,43 @@ def summary(out: Path, rows) -> None:
                  f"{r.get('method', '-')} | {f('rmse_over_sigma', '{:.3g}')} | {r.get('g10_fits', '-')} | "
                  f"{(r.get('asset_status') or r.get('r2r_status') or r.get('step') or '-')[:90]} | {r.get('urdf') or '-'} |")
     (out / "estimated_assets").mkdir(parents=True, exist_ok=True)
-    (out / "estimated_assets" / "SUMMARY.md").write_text("\n".join(L) + "\n")
-    (out / "estimated_assets" / "summary.json").write_text(json.dumps(rows, indent=1, default=str))
+    for name, text in (("SUMMARY.md", "\n".join(L) + "\n"), ("summary.json", json.dumps(rows, indent=1, default=str))):
+        tmp = out / "estimated_assets" / f".{name}.{os.getpid()}"      # parallel jobs: whole files only
+        tmp.write_text(text)
+        tmp.replace(out / "estimated_assets" / name)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--out", default=f"/media/samuelemara/Extreme SSD/Samuele/results_{time.strftime('%d_%m_%y')}")
+    ap.add_argument("--out", default=f"{OUTPUT_ROOT.rstrip('/')}/Samuele/results_{time.strftime('%d_%m_%y')}")
     ap.add_argument("--scenes", nargs="*", default=None)
+    ap.add_argument("--episodes", choices=("first", "all"), default="first",
+                    help="without --scenes: first = every object's episode 000000 (default), all = every episode")
+    ap.add_argument("--list-scenes", action="store_true", help="print the scenes that would run (one per line), exit")
+    ap.add_argument("--summarize-only", action="store_true", help="rebuild SUMMARY.md from every scene's row.json")
     ap.add_argument("--budget", choices=("smoke", "coarse", "full"), default="full")
     ap.add_argument("--pinn-device", choices=("cpu", "cuda"), default="cpu",
                     help="device of the step-3 PINNs (default cpu: faster for these small nets, measured)")
     a = ap.parse_args()
+    pat = re.compile(r"_episode_\d{6}$" if a.episodes == "all" else r"_episode_000000$")
+    allsc = sorted(p.name for p in REAL.iterdir() if p.is_dir() and pat.search(p.name))
+    scenes = a.scenes or ([s for s in FIRST if s in allsc] + [s for s in allsc if s not in FIRST])
+    if a.list_scenes:
+        print("\n".join(scenes))
+        return
     sys.path.insert(0, str(REPO))
     from utils.forceartgs_env import clean_env
     env = clean_env()                         # every child: forceartgs env + this repo, nothing from the login shell
     os.environ.clear()
     os.environ.update(env)
     out = Path(a.out)
-    if not str(out).startswith("/media/samuelemara/Extreme SSD/"):
-        sys.exit(f"refusing: output must be on the Extreme SSD: {out}")
+    if not str(out).startswith(OUTPUT_ROOT.rstrip("/") + "/"):
+        sys.exit(f"refusing: output must be under {OUTPUT_ROOT} (FORCEARTGS_OUTPUT_ROOT): {out}")
     (out / "logs").mkdir(parents=True, exist_ok=True)
-    allsc = sorted(p.name for p in REAL.iterdir() if p.name.endswith("_episode_000000"))
-    scenes = a.scenes or ([s for s in FIRST if s in allsc] + [s for s in allsc if s not in FIRST])
+    if a.summarize_only:
+        summary(out)
+        print(out / "estimated_assets" / "SUMMARY.md")
+        return
     log(out, f"start: {len(scenes)} scenes {scenes}")
     rows = []
     for sc in scenes:
@@ -257,13 +362,15 @@ def main():
             rows.append(scene(out, sc, a))
         except CodeError as e:
             rows.append(dict(scene=sc, step=f"CODE ERROR, batch stopped: {e}"))
-            summary(out, rows)
+            save_row(out, rows[-1])
+            summary(out)
             log(out, f"STOPPED: programming error in the pipeline, not a data problem -- {e}")
             sys.exit(4)
         except Exception as e:                                    # one scene never stops the others
             rows.append(dict(scene=sc, step=f"driver error {type(e).__name__}: {e}"))
             log(out, f"{sc} driver error {type(e).__name__}: {e}")
-        summary(out, rows)
+        save_row(out, rows[-1])
+        summary(out)
     log(out, f"all done: {out / 'estimated_assets' / 'SUMMARY.md'}")
 
 

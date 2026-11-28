@@ -51,7 +51,7 @@ PARTTWIN_PY = os.environ.get("PARTTWIN1D_PYTHON", str(Path.home() / "miniconda3/
 SIM_PY = os.environ.get("PARTTWIN_SIM_PYTHON", str(Path.home() / ".venvs/rigeuler-sim-export/bin/python"))
 BUDGETS = {"smoke": 300, "coarse": 2000, "full": 30000}
 BRANCHES = ("revolute", "prismatic")
-SSD = "/media/samuelemara/Extreme SSD/"
+SSD = os.environ.get("FORCEARTGS_OUTPUT_ROOT", "/media/samuelemara/Extreme SSD/")   # allowed output prefix
 # matched to the vanilla real-scene configs (sh 0, xyzw, camera optimiser off, same loss weights)
 HP = dict(sh_degree=0, quaternion_order="xyzw", fg_mask_lambda=1.0, depth_lambda_parts=10.0, depth_lambda_blend=10.0,
           depth_lambda_art=1.0)
@@ -95,7 +95,9 @@ def seed_model_weights(torch_home: Path) -> None:
     for w in need:
         t = dst / w.name
         if not t.is_file() or t.stat().st_size != w.stat().st_size:
-            shutil.copy2(w, t)
+            tmp = t.with_name(f".{t.name}.{os.getpid()}.part")     # parallel jobs share TORCH_HOME: never expose a
+            shutil.copy2(w, tmp)                                   # half-copied weight file
+            os.replace(tmp, t)
 
 
 def run_cmd(cmd, log_path: Path, env, dry=False):

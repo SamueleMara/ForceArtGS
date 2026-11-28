@@ -51,6 +51,12 @@ def scale_status(episodes):
     return "FORCED_INPUT_PRESENT_OBSERVABILITY_NOT_YET_PROVEN"
 
 
+def warm_start_inside(v, lo, hi):
+    """A DE warm start clipped 1e-9 of the range INSIDE [lo, hi]: scipy rescales x0 to [0, 1] and a start exactly on a
+    bound (a warm start clipped onto it, e.g. rho = its lower bound) can round to -1e-17 -> "x0 outside the bounds"."""
+    return min(max(v, lo + 1e-9 * (hi - lo)), hi - 1e-9 * (hi - lo))
+
+
 def fit_physx(objective: RefinementLoss, config: FitConfiguration, *, logger=None, x0=None):
     """``x0``: optional warm start {name: value} (clipped into the bounds; DE still explores the whole box)."""
     bounds = config.vector_bounds()
@@ -124,7 +130,7 @@ def fit_physx(objective: RefinementLoss, config: FitConfiguration, *, logger=Non
         if config.vectorized:
             kw.update(vectorized=True, updating="deferred")
         if x0 is not None:
-            kw["x0"]=np.r_[[min(max(float(x0[NAMES[i]]),bounds[i][0]),bounds[i][1]) for i in free_idx],
+            kw["x0"]=np.r_[[warm_start_inside(float(x0[NAMES[i]]),*bounds[i]) for i in free_idx],
                            np.zeros(len(v0_eps))]
         result=differential_evolution(f_vec if config.vectorized else f,
                                       [bounds[i] for i in free_idx]+v0_bounds,seed=config.seed,

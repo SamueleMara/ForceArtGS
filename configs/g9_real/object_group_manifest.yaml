@@ -1,0 +1,202 @@
+# Populated from the filesystem scan; operator: set verified_same_physical_object: true per group
+schema: forceartgs.cross_demo.object_groups/v1
+real_root: /media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real
+note: 'candidate grouping by the common prefix before _episode_XXXXXX; set verified_same_physical_object:
+  true only for groups that are the SAME physical object, same fixed base / sensor
+  / tool setup'
+objects:
+- object_id: black_box_20261021_161154
+  episodes:
+  - black_box_20261021_161154_episode_000003
+  n_episodes: 1
+  common_base_frame: base_link
+  expected_joint_type: null
+  verified_same_physical_object: null
+- object_id: black_monitor_20261021_161154
+  episodes:
+  - black_monitor_20261021_161154_episode_000005
+  n_episodes: 1
+  common_base_frame: base_link
+  expected_joint_type: null
+  verified_same_physical_object: null
+- object_id: dog_20261022_185923
+  episodes:
+  - dog_20261022_185923_episode_000000
+  n_episodes: 1
+  common_base_frame: base_link
+  expected_joint_type: null
+  verified_same_physical_object: null
+- object_id: final_black_box
+  episodes:
+  - final_black_box_episode_000000
+  - final_black_box_episode_000001
+  - final_black_box_episode_000002
+  - final_black_box_episode_000003
+  - final_black_box_episode_000004
+  - final_black_box_episode_000005
+  - final_black_box_episode_000006
+  - final_black_box_episode_000007
+  - final_black_box_episode_000008
+  - final_black_box_episode_000009
+  - final_black_box_episode_000010
+  - final_black_box_episode_000011
+  n_episodes: 12
+  common_base_frame: base_link
+  expected_joint_type: null
+  verified_same_physical_object: null
+- object_id: final_black_laptop
+  episodes:
+  - final_black_laptop_episode_000000
+  - final_black_laptop_episode_000001
+  - final_black_laptop_episode_000002
+  - final_black_laptop_episode_000003
+  - final_black_laptop_episode_000004
+  - final_black_laptop_episode_000005
+  - final_black_laptop_episode_000006
+  - final_black_laptop_episode_000007
+  - final_black_laptop_episode_000008
+  - final_black_laptop_episode_000009
+  - final_black_laptop_episode_000010
+  - final_black_laptop_episode_000011
+  n_episodes: 12
+  common_base_frame: base_link
+  expected_joint_type: null
+  verified_same_physical_object: null
+- object_id: final_light_blue_box
+  episodes:
+  - final_light_blue_box_episode_000000
+  - final_light_blue_box_episode_000001
+  - final_light_blue_box_episode_000002
+  - final_light_blue_box_episode_000003
+  - final_light_blue_box_episode_000004
+  - final_light_blue_box_episode_000005
+  - final_light_blue_box_episode_000006
+  - final_light_blue_box_episode_000007
+  - final_light_blue_box_episode_000008
+  - final_light_blue_box_episode_000009
+  - final_light_blue_box_episode_000010
+  - final_light_blue_box_episode_000011
+  n_episodes: 12
+  common_base_frame: base_link
+  expected_joint_type: null
+  verified_same_physical_object: null
+- object_id: final_matchbox
+  episodes:
+  - final_matchbox_episode_000000
+  - final_matchbox_episode_000001
+  - final_matchbox_episode_000002
+  - final_matchbox_episode_000003
+  - final_matchbox_episode_000004
+  - final_matchbox_episode_000005
+  - final_matchbox_episode_000006
+  - final_matchbox_episode_000007
+  - final_matchbox_episode_000008
+  - final_matchbox_episode_000009
+  - final_matchbox_episode_000010
+  - final_matchbox_episode_000011
+  - final_matchbox_episode_000012
+  - final_matchbox_episode_000013
+  - final_matchbox_episode_000014
+  - final_matchbox_episode_000015
+  - final_matchbox_episode_000016
+  n_episodes: 17
+  common_base_frame: base_link
+  expected_joint_type: null
+  verified_same_physical_object: null
+- object_id: final_orange_suitecase
+  episodes:
+  - final_orange_suitecase_episode_000000
+  - final_orange_suitecase_episode_000001
+  - final_orange_suitecase_episode_000002
+  - final_orange_suitecase_episode_000003
+  - final_orange_suitecase_episode_000004
+  - final_orange_suitecase_episode_000005
+  - final_orange_suitecase_episode_000006
+  - final_orange_suitecase_episode_000007
+  - final_orange_suitecase_episode_000008
+  - final_orange_suitecase_episode_000009
+  - final_orange_suitecase_episode_000010
+  - final_orange_suitecase_episode_000011
+  n_episodes: 12
+  common_base_frame: base_link
+  expected_joint_type: null
+  verified_same_physical_object: null
+- object_id: final_red_fridge
+  episodes:
+  - final_red_fridge_episode_000000
+  - final_red_fridge_episode_000001
+  - final_red_fridge_episode_000002
+  - final_red_fridge_episode_000003
+  - final_red_fridge_episode_000004
+  - final_red_fridge_episode_000005
+  - final_red_fridge_episode_000006
+  - final_red_fridge_episode_000007
+  - final_red_fridge_episode_000008
+  - final_red_fridge_episode_000009
+  - final_red_fridge_episode_000010
+  - final_red_fridge_episode_000011
+  - final_red_fridge_episode_000012
+  - final_red_fridge_episode_000013
+  n_episodes: 14
+  common_base_frame: base_link
+  expected_joint_type: null
+  verified_same_physical_object: null
+- object_id: final_robot_dog
+  episodes:
+  - final_robot_dog_episode_000000
+  - final_robot_dog_episode_000001
+  - final_robot_dog_episode_000002
+  - final_robot_dog_episode_000003
+  - final_robot_dog_episode_000004
+  - final_robot_dog_episode_000005
+  - final_robot_dog_episode_000006
+  - final_robot_dog_episode_000007
+  - final_robot_dog_episode_000008
+  - final_robot_dog_episode_000009
+  - final_robot_dog_episode_000010
+  - final_robot_dog_episode_000011
+  - final_robot_dog_episode_000012
+  - final_robot_dog_episode_000013
+  - final_robot_dog_episode_000014
+  - final_robot_dog_episode_000015
+  - final_robot_dog_episode_000016
+  - final_robot_dog_episode_000017
+  - final_robot_dog_episode_000018
+  n_episodes: 19
+  common_base_frame: base_link
+  expected_joint_type: null
+  verified_same_physical_object: null
+- object_id: final_wooden_box
+  episodes:
+  - final_wooden_box_episode_000000
+  - final_wooden_box_episode_000001
+  - final_wooden_box_episode_000002
+  - final_wooden_box_episode_000003
+  - final_wooden_box_episode_000004
+  - final_wooden_box_episode_000005
+  - final_wooden_box_episode_000006
+  - final_wooden_box_episode_000007
+  - final_wooden_box_episode_000008
+  - final_wooden_box_episode_000009
+  - final_wooden_box_episode_000010
+  - final_wooden_box_episode_000011
+  n_episodes: 12
+  common_base_frame: base_link
+  expected_joint_type: null
+  verified_same_physical_object: null
+- object_id: laptop_20261021_161154
+  episodes:
+  - laptop_20261021_161154_episode_000004
+  n_episodes: 1
+  common_base_frame: base_link
+  expected_joint_type: null
+  verified_same_physical_object: null
+- object_id: white_drawer_20261021_161154
+  episodes:
+  - white_drawer_20261021_161154_episode_000000
+  - white_drawer_20261021_161154_episode_000001
+  - white_drawer_20261021_161154_episode_000002
+  n_episodes: 3
+  common_base_frame: base_link
+  expected_joint_type: null
+  verified_same_physical_object: null

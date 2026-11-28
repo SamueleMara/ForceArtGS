@@ -21,13 +21,15 @@
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 BUDGET="${1:-full}"
-OUT="${2:-/media/samuelemara/Extreme SSD/Samuele/results_$(date +%d_%m_%y)}"
-case "$OUT" in "/media/samuelemara/Extreme SSD/"*) ;; *) echo "refusing: output must be on the Extreme SSD: $OUT" >&2; exit 2;; esac
+OUT_ROOT="${FORCEARTGS_OUTPUT_ROOT:-/media/samuelemara/Extreme SSD/}"     # server: export the allowed output prefix
+OUT="${2:-${OUT_ROOT%/}/Samuele/results_$(date +%d_%m_%y)}"
+case "$OUT" in "${OUT_ROOT%/}/"*) ;; *) echo "refusing: output must be under $OUT_ROOT: $OUT" >&2; exit 2;; esac
 PY="${FORCEARTGS_PYTHON:-$HOME/miniconda3/envs/forceartgs/bin/python}"
 eval "$("$PY" "$(dirname "${BASH_SOURCE[0]}")/../utils/forceartgs_env.py")"   # clean env: forceartgs + repo only
-REAL="/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real"
+REAL="${FORCEARTGS_REAL_ROOT:-/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real}"          # server: export the dataset root
+SEGDIR="${FORCEARTGS_CONTACT_DIR:-configs/contact_intervals}"   # server: under the output root
 RUNS="$OUT/forceartgs_joint_aware"
-mkdir -p "$RUNS/.runtime" "$OUT/contact_annotations" "$OUT/contact_audit" configs/contact_intervals
+mkdir -p "$RUNS/.runtime" "$OUT/contact_annotations" "$OUT/contact_audit" "$SEGDIR"
 export MPLCONFIGDIR="$RUNS/.runtime/matplotlib" MPLBACKEND=Agg      # prep tools: no ~/.cache
 mkdir -p "$MPLCONFIGDIR"
 # model weights: joint_aware_reconstruction.py seeds them from the repo's checkpoints/ (scripts/download_checkpoints.sh)
@@ -79,7 +81,7 @@ for ep in "${LIST[@]}"; do
     "$PY" samuele/audit_joint_contact_windows.py --scene "$S" --clip-frames "$CLIP" --cameras cam_001 cam_002 \
         --output "$AU" > "$AU.log" 2>&1 && echo "$CLIP" > "$AU/clip.txt" || log "$ep WARN: visual audit failed (force-only segments)"
   fi
-  SEG="configs/contact_intervals/$ep.yaml"
+  SEG="$SEGDIR/$ep.yaml"
   if [[ -f "$AU/rgbd_rate_timeline.csv" ]] && ! grep -q "^window: \"$CLIP\"" "$SEG" 2>/dev/null; then
     "$PY" samuele/estimate_contact_segments.py --scene "$ep" --frames "$CLIP" --force-csv "$FX/contact_annotations.csv" \
         --visual-csv "$AU/rgbd_rate_timeline.csv" --output "$SEG" --audit-csv "$AU/contact_segments_audit.csv" \

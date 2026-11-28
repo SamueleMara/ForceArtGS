@@ -1,0 +1,27 @@
+# Cross-demonstration PhysX validation (forceartgs_g9/cross_demo). PREDECLARED: fixed before any transfer error is
+# seen; changing a value after looking at held-out errors invalidates the protocol.
+schema: forceartgs.cross_demo.config/v1
+primary_method: B0_G10_BASELINE_STARTS          # the current G10 fit, the same method for every training episode
+secondary_methods:                              # full ablation, each its own matrix; never picked per test cell
+  - B7_G10_SVD_START
+  - B8_G10_CONVOLUTION_START
+  - B9_G10_INTEGRAL_PINN_START
+  - B789_G10_UNION_PROPOSED_STARTS
+  - train_best_predeclared                      # lowest TRAINING objective among the G10 methods, per training episode
+alignment:
+  axis_tol_deg: 10.0                            # same physical joint: axis directions within this angle
+  hinge_tol_m: 0.05                             # revolute: hinge lines within this distance
+scoring:
+  primary_scope: eval_end                       # [t0, T_eval_end]: includes the confirmed stationary tail
+  secondary_scope: stop                         # [t0, T_stop]: the historical train-only window
+  sigma_physx_floor: 0.0                        # added in quadrature to the RGB-D q sigma (0 = none imposed)
+  travel_noise_k: 5.0                           # normalized errors only if travel > k x median q sigma
+engine:
+  backend: sapien_cpu_in_process                # 1-DoF replay; parity with the training GPU engine is checked
+protocols:
+  single_demo_transfer: true                    # primary: N x N ordered matrix
+  pooled_loo: false                             # secondary: not implemented -> POOLED_LOO_NOT_IMPLEMENTED
+bootstrap:
+  draws: 2000
+  seed: 0
+  min_independent_clusters: 5                   # below: CI_NOT_RELIABLE_SMALL_N

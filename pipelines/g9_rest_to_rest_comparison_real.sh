@@ -14,7 +14,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 RUNS="${1:-/media/samuelemara/Extreme SSD/Samuele/results_19_11_26/forceartgs_joint_aware}"
 PY="${FORCEARTGS_PYTHON:-$HOME/miniconda3/envs/forceartgs/bin/python}"
 eval "$("$PY" "$(dirname "${BASH_SOURCE[0]}")/../utils/forceartgs_env.py")"   # clean env: forceartgs + repo only
-REAL="/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real"
+REAL="${FORCEARTGS_REAL_ROOT:-/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real}"
+SEGDIR="${FORCEARTGS_CONTACT_DIR:-configs/contact_intervals}"
 DISC_ROOT="${DISC_ROOT:-/media/samuelemara/Extreme SSD/Samuele/results_17_11_26/overnight_real/joint}"
 SCENES="${SCENES:-final_red_fridge_episode_000000 final_orange_suitecase_episode_000000 final_black_box_episode_000000 final_robot_dog_episode_000000 white_drawer_20261021_161154_episode_000000}"
 R2R_CONFIG="${R2R_CONFIG:-configs/g9_real/rest_to_rest_compare.yaml}"
@@ -29,7 +30,7 @@ for sc in $SCENES; do
   if [[ -f "$DISC_ROOT/$sc/robot_archive.npz" ]]; then a+=(--robot-archive "$DISC_ROOT/$sc/robot_archive.npz")
   elif [[ -f "$run/discovery/robot_archive.npz" ]]; then a+=(--robot-archive "$run/discovery/robot_archive.npz")
   else log "$sc: no robot archive at $DISC_ROOT/$sc (the run's canonical record is tried)"; fi
-  [[ -f "configs/contact_intervals/$sc.yaml" ]] && a+=(--contact-segments "configs/contact_intervals/$sc.yaml")
+  [[ -f "$SEGDIR/$sc.yaml" ]] && a+=(--contact-segments "$SEGDIR/$sc.yaml")
   if [[ -n "${DECLARED:-}" ]]; then a+=(--declared-joint-type "$DECLARED" --declaration-note "operator: declared $DECLARED")
   elif [[ "$sc" == *black_box* && "${NO_DECLARATION:-0}" != 1 ]]; then a+=(--declared-joint-type revolute --declaration-note "operator 2026-11-20: the black box is revolute (declared, not identified)"); fi
   ext=$(ls -d "${EXT_ROOT:-/media/samuelemara/Extreme SSD/Samuele/results_26_11_26/joint_states_extended}/$sc"/authority_v[0-9][0-9][0-9] 2>/dev/null | tail -1)
